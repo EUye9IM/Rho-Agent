@@ -167,17 +167,18 @@ loop {
 
 ```rust
 struct Cancel {
-    epoch: AtomicU64,     // 轮次号，每轮递增；不复位、无覆盖竞态
-    signals: Mutex<Vec<(u64 /*epoch*/, u32 /*第几次 Ctrl-C*/)>>, // 信号回调追加记录
+    epoch:   AtomicU64,  // 轮次号，每轮递增
+    inner:   Mutex<State>, // epoch 读取、记录追加、切轮均在此锁内完成
 }
+struct State { epoch: u64, records: Vec<u32 /*第几次 Ctrl-C*/>, prev_quit: bool }
 ```
 
-- 信号处理回调只追加 `(当前 epoch, 序号)` 记录，不做其他工作；不读改任何标志，不存在清零覆盖并发退出请求的竞态。
-- 主线程查询：取 `epoch` 匹配当前轮的记录——第 1 次为 cancel，第 2 次及以上为 quit；旧轮记录自然作废。
+- 信号回调在锁内取当前 epoch 并追加序号记录；主线程切轮（递增 epoch）也在锁内，切轮时把旧轮的 quit（≥2 次记录）结转为 `prev_quit`。**旧轮尚未消费的 quit 不因切轮失效**：回调与切轮串行化在同一锁内——回调先拿锁则记入旧轮并被结转，切轮先拿锁则回调记入新轮，两种顺序新轮都能看到，不存在交锭丢失。
+- 主线程查询：锁内看 `prev_quit`（则退出）或当前轮记录——第 1 次为 cancel，第 2 次及以上为 quit；旧轮非 quit 记录作废。
 - 消费点：渲染/接收循环（`recv_timeout` 短轮询，超时即查；**成功收到事件也先查再处理**）、工具等待循环（触发进程组升级终止；发现 quit 则终止后退出程序）、agent loop（按占位规则收尾回 REPL；发现 quit 则退出程序）。工具执行/清理期间无 Ui 阻塞点，第二次 Ctrl-C 的退出由当前轮信号记录承接。
 - 流线程取消：主线程 drop Receiver → worker 下一次 `send` 报错即退出循环（无需继续排空 HTTP 流，不主动 close 连接）。channel 为无界 `mpsc`：无界使发送永不阻塞，配合 drop-Receiver 早退语义最简单。
 - 工具执行与进程组终止：`setsid` 建进程组；stdout/stderr 各起一个 drain 线程并行读取，写入有界环形缓冲（超限后丢弃并计数，不停止读取）。采集收尾：`waitpid` 观察到 bash 退出后，继续读取管道中已缓冲的剩余数据，但有界（短超时上限，防止后台进程持续写入永不静默）；收尾结束后 drop 读端、detach drain 线程（读端关闭后，后台进程若继续写，写满或 EPIPE 与本进程无关）。终止升级不依赖 bash 单体退出状态：SIGTERM 发 pgid → 2s → 无论直接子进程状态如何，对 pgid 发 SIGKILL → 回收 bash（直接子进程回收条件与进程组清理条件分离）。
-- quit（当前轮第二次 Ctrl-C）被消费即走退出路径，不存在清零；新轮靠 epoch 递增作废旧轮信号记录。
+- quit（当前轮第二次 Ctrl-C）被消费即走退出路径；切轮时旧轮未消费的 quit 结转为 `prev_quit`，下一轮查询时仍触发退出。
 
 ## 六、错误与退出码
 
