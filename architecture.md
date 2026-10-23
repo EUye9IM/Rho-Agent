@@ -102,14 +102,15 @@ enum ConfirmOutcome {
     Yes,        // 执行
     No,         // 拒绝，喂回模型
     Cancelled,  // Ctrl-C：取消当前回合，剩余调用按占位规则收尾，回 REPL
-               //（确认界面内退出由调用前的取消检查承接，不再承诺确认内二次 Ctrl-C）
 }
 ```
 
-- 退出语义统一走 `UiResult`：`read_line` 的 `Err` 覆盖空闲态/空行 Ctrl-C 与 `/exit`；`ConfirmOutcome::Cancelled` 是确认界面的 Ctrl-C（全局计数器记一次，取消整轮；若此次 Ctrl-C 已是当前轮第二次，调用方在取消收尾时发现 quit 走退出路径）。确认界面不再单独承诺“第二次 Ctrl-C 即退”——退出统一由全局信号计数判定，避免与取消检查双重计数。
+- 退出语义统一走 `UiResult`：`read_line` 的 `Err` 覆盖空闲态/空行 Ctrl-C 与 `/exit`；`ConfirmOutcome::Cancelled` 是确认界面的 Ctrl-C，取消整轮。
+- **Ctrl-C 的唯一记录生产者是专用信号线程**：TermUi 全程保持 `ISIG` 开启（不用关闭 ISIG 的原始模式）——Ctrl-C 一律产生 SIGINT，经 self-pipe/signalfd 由信号线程在锁内追加记录。`confirm` 的可中断读取只需在按键事件中识别“记录已被追加”（或收到 SIGINT 唤醒）即返回 `Cancelled`，不自行追加记录，无双重计数。rustyline 的 `Interrupted` 同理由 SIGINT 驱动，不另立计数。
+- 唯一例外：`read_line` 的空行 Ctrl-C 退出、`/exit` 由 REPL 逻辑判定（基于信号线程的记录），非新增生产者。
 - agent loop 收到 `Err(Quit)` 直接终止回合，不自己判断第几次 Ctrl-C。
 
-- 生产实现 `TermUi`：rustyline 后端；`confirm` 用可中断的终端事件读取（原始模式按键级读取，非阻塞式行读取），使 Ctrl-C 能及时返回 `Cancelled`。`stdin 非 TTY 拒绝启动`的检查在 `TermUi::new` 里做，不进 main 流程。
+- 生产实现 `TermUi`：rustyline 后端；`confirm` 用可中断读取（保持 ISIG，Ctrl-C 产生 SIGINT 唤醒读取并返回 `Cancelled`；配合信号线程记录，无双重计数）。`stdin 非 TTY 拒绝启动`的检查在 `TermUi::new` 里做，不进 main 流程。
 - 测试实现 `ScriptedUi`：预排输入队列 + 预排确认结果 + 收集渲染事件，驱动 `repl → agent loop → tools` 全链路，无网络无 TTY。
 
 - `TurnAcc`（worker 线程的每流累加器）：按 `index` 组装多段 `tool_calls`、累积 text/reasoning；流正常结束时组装为完整 Assistant 消息经 `Final` 交付主线程。取消时主线程 drop Receiver，累加器随 worker 结束一起丢弃。
@@ -175,7 +176,7 @@ struct Cancel {
 struct State { epoch: u64, records: Vec<u32 /*第几次 Ctrl-C*/>, prev_quit: bool }
 ```
 
-- **异步信号安全**：真正的信号处理器只做最小动作（向 self-pipe 写一个字节，或 signalfd 方案），**不在处理器内取锁**——`Mutex` 非可重入，信号投递到持锁线程会自死锁。锁内的 epoch 读取与记录追加由**专用信号线程**完成：消费 self-pipe/signalfd 事件，在普通线程上下文执行。专用线程与主线程切轮在同一锁内串行化——信号线程先拿锁则记入旧轮并被结转，切轮先拿锁则记入新轮，两种顺序新轮都能看到，旧轮尚未消费的 quit 不丢失。
+- **异步信号安全**：真正的信号处理器只做最小动作（向 self-pipe 写一个字节，或 signalfd 方案），**不在处理器内取锁**——`Mutex` 非可重入，信号投递到持锁线程会自死锁。锁内的 epoch 读取与记录追加由**专用信号线程**完成（Ctrl-C 的唯一记录生产者，含 confirm/rustyline 场景——终端保持 ISIG，Ctrl-C 一律产生 SIGINT）：消费 self-pipe/signalfd 事件，在普通线程上下文执行。专用线程与主线程切轮在同一锁内串行化——信号线程先拿锁则记入旧轮并被结转，切轮先拿锁则记入新轮，两种顺序新轮都能看到，旧轮尚未消费的 quit 不丢失。
 - 主线程查询：锁内看 `prev_quit`（则退出）或当前轮记录——第 1 次为 cancel，第 2 次及以上为 quit；旧轮非 quit 记录作废。
 - 消费点：渲染/接收循环（`recv_timeout` 短轮询，超时即查；**成功收到事件也先查再处理**）、工具等待循环（触发进程组升级终止；发现 quit 则终止后退出程序）、agent loop（按占位规则收尾回 REPL；发现 quit 则退出程序）。工具执行/清理期间无 Ui 阻塞点，第二次 Ctrl-C 的退出由当前轮信号记录承接。
 - 流线程取消：主线程 drop Receiver → worker 下一次 `send` 报错即退出循环（无需继续排空 HTTP 流，不主动 close 连接）。channel 为无界 `mpsc`：无界使发送永不阻塞，配合 drop-Receiver 早退语义最简单。
