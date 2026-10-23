@@ -76,7 +76,7 @@ enum StreamEvent {
 }
 trait ProviderAdapter: Send + Sync {
     fn endpoint(&self, p: &Provider) -> String;
-    fn build_body(&self, hist: &[Msg], model: &Model, thinking: Option<&Value>) -> Value;
+    fn build_body(&self, hist: &[Msg], model: &Model, model_id: &str, thinking: Option<&Value>) -> Value;
     fn headers(&self, p: &Provider) -> Vec<(String, String)>;
     fn parse_chunk(&self, chunk: &Value, acc: &mut TurnAcc) -> Vec<StreamEvent>;
 }
@@ -125,7 +125,7 @@ enum ConfirmOutcome {
 ```
 用户输入 → push User msg
 loop {
-    body = adapter.build_body(history, model, thinking)
+    body = adapter.build_body(history, model, model_id, thinking)
     worker 线程发请求并持有 TurnAcc，主线程 recv_timeout 短轮询：
         每次成功收到事件后先查标志再处理（持续有事件也逐块可取消）
         Delta     → 渲染
