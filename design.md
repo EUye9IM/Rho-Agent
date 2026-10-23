@@ -15,7 +15,7 @@
 
 - **语言**：Rust 2021，MSRV 1.75。
 - **并发模型**：阻塞 I/O + 线程，**不使用 async 运行时**。HTTP 流在工作线程读取，经 `mpsc` 交给主线程渲染。
-- **目标平台**：`x86_64` / `aarch64` / `armv7` 的 `-unknown-linux-musl`，静态链接。不支持 Windows / macOS。
+- **目标平台**：`x86_64` / `aarch64` 的 `-unknown-linux-musl` 与 `armv7-unknown-linux-musleabihf`，静态链接。不支持 Windows / macOS。
 - **体积预算**：strip + LTO + `panic=abort` 后 ≤ 10MB；空闲常驻 RSS ≤ 30MB。
 - **依赖**：`serde` / `serde_json` / `toml`（需 `preserve_order`）、`ureq` + `rustls`、`rustyline`、信号处理库。不引 tokio、reqwest、clap。`Cargo.lock` 入库，支持离线构建。
 - **交互模型**：轮次制。流式输出期间不接受新输入。
@@ -41,7 +41,6 @@
 | `--model <id>` | 初始模型（覆盖配置默认） |
 | `--thinking <level>` | 初始思考档位（覆盖配置默认） |
 | `--yes` | 跳过所有确认 |
-| `--no-color` | 关闭颜色（同时尊重 `NO_COLOR`） |
 
 - 配置只认 `--config`，不读环境变量、不做默认路径发现、不做合并。
 - 无 `--cwd`：会话 cwd 恒为进程启动目录，全程不可修改（`working_directory` 工具已移除）。
@@ -50,7 +49,7 @@
 
 ### REPL 命令
 
-`/model [id]`、`/provider [id]`、`/thinking [level]`、`/clear`、`/help`、`/exit`。不带参数时列出可选项并标注当前值。切换只影响后续请求，不重放历史。
+`/model [id]`、`/provider [id]`、`/thinking [level]`、`/clear`、`/help`、`/exit`。不带参数时列出可选项并标注当前值。切换只影响后续请求，不重放历史。三者联动规则：`/provider` 切换后，若当前模型不属于新 provider，模型重置为新 provider 声明顺序第一个，thinking 重置为该模型 `thinking_default`（无档位表则归零）；`/model` 切换后 thinking 同样重置。启动时 `--provider` 与 `--model` 同时指定且模型不属于该 provider，为用法错误（退出码 2）。
 
 ### 退出码
 
@@ -106,9 +105,9 @@ max_output_bytes  = 16384
 - **模型 id 全局唯一且必须带 provider 前缀**（`deepseek/deepseek-v4-pro`）。前缀段必须对应已声明的 provider，否则配置错误。不再有独立的 `provider` 字段。
 - **上游 `model` 字段**：默认取 id 第一个 `/` 之后的部分；需要别名时用可选字段 `api_model` 覆盖。
 - **思考档位**：值是任意 JSON 片段，请求时**顶层合并**进 body。档位名由配置自定义，不做统一枚举。没有 `thinking` 表的模型不显示 `/thinking`。
-- **认证**：一张通用 header 表，值中 `${VAR}` 在启动时展开。变量缺失即硬报错（退出码 2）。不枚举认证类型。配置中出现疑似明文密钥只告警、不阻断。
+- **认证**：一张通用 header 表，值中 `${VAR}` 在选择供应商时逐个 provider 展开。变量缺失不是全局致命错误：该 provider 标记为不可用，不影响其他 provider。不枚举认证类型。配置中出现疑似明文密钥只告警、不阻断。
 - **校验**：未知字段、悬空引用、缺失必填字段一律硬报错，退出码 2，指出位置。`toml` 必须启用 `preserve_order`，否则"声明顺序即优先级"会退化成字母序。
-- **供应商启用**：按声明顺序取第一个 API key 变量齐全的 provider；配置的 `default_provider` 优先；`--provider` 覆盖；都没有时报错并列出缺失的变量。
+- **供应商启用**：按声明顺序取第一个 key 变量齐全的 provider；配置的 `default_provider` 优先；`--provider` 覆盖。显式指定的 provider（`default_provider` 或 `--provider`）若 key 不齐全，报错并列出缺失的变量，不回退到其他 provider。隐式选择时没有任何可用 provider 才报错（列出每个 provider 各缺什么）。
 
 ### 内置默认
 
@@ -168,7 +167,7 @@ v1 只有一个工具：`bash`。不做文件读写工具、不做图像、不�
 - 思考内容：暗淡色实时输出。
 - 正文：原样输出，不渲染 markdown。
 - 工具调用：单行 `→ bash: <命令>`，结果缩进显示，截断处标注省略字节数。
-- 颜色默认开启；`NO_COLOR` 或 `--no-color` 关闭。
+- 不提供颜色开关：不做 `--no-color` 参数，不读 `NO_COLOR` 环境变量。
 
 ## 十一、明确不做
 
@@ -200,4 +199,4 @@ v1 只有一个工具：`bash`。不做文件读写工具、不做图像、不�
 - **M1**：配置解析/校验 + 供应商适配 + REPL 流式对话（无工具）。
 - **M2**：`bash` + allowlist + 确认 + 超时/取消。
 - **M3**：思考档位、斜杠命令、错误展示。
-- **M4**：三目标交叉编译产物 `rho-{x86_64,aarch64,armv7}-unknown-linux-musl.tar.gz` + sha256 + README。
+- **M4**：三目标交叉编译产物 `rho-{x86_64,aarch64}-unknown-linux-musl.tar.gz`、`rho-armv7-unknown-linux-musleabihf.tar.gz` + sha256 + README。
