@@ -169,8 +169,7 @@ loop {
 
 ```rust
 struct Cancel {
-    epoch:   AtomicU64,  // 轮次号，每轮递增
-    inner:   Mutex<State>, // epoch 读取、记录追加、切轮均在此锁内完成
+    inner: Mutex<State>, // epoch、记录追加、切轮均在锁内，无第二个真值源
 }
 struct State { epoch: u64, records: Vec<u32 /*第几次 Ctrl-C*/>, prev_quit: bool }
 ```
@@ -186,7 +185,7 @@ struct State { epoch: u64, records: Vec<u32 /*第几次 Ctrl-C*/>, prev_quit: bo
 
 ```
 exit 2：参数用法错误（含 stdin 非 TTY）、配置解析/校验失败、显式指定的供应商 key 不齐全、隐式选择时无任何可用供应商（含缺失变量列表）
-exit 1：运行中不可恢复的运行时错误（worker/信号线程等内部线程 panic、渲染 I/O 错误等无法继续 REPL 的情况）
+exit 1：REPL 无法继续的内部运行时错误（渲染 I/O 错误等；内部线程 panic 在 panic=abort 下直接 abort，不走此路径）
 exit 0：/exit、空闲态 Ctrl-C
 ```
 
