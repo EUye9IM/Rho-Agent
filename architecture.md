@@ -105,9 +105,9 @@ enum ConfirmOutcome {
 }
 ```
 
-- 退出语义统一走 `UiResult`：`read_line` 的 `Err` 覆盖空闲态/空行 Ctrl-C 与 `/exit`；`ConfirmOutcome::Cancelled` 是确认界面的 Ctrl-C，取消整轮。
-- **Ctrl-C 的唯一记录生产者是专用信号线程**：TermUi 全程保持 `ISIG` 开启（不用关闭 ISIG 的原始模式）——Ctrl-C 一律产生 SIGINT，经 self-pipe/signalfd 由信号线程在锁内追加记录。`confirm` 的可中断读取只需在按键事件中识别“记录已被追加”（或收到 SIGINT 唤醒）即返回 `Cancelled`，不自行追加记录，无双重计数。rustyline 的 `Interrupted` 同理由 SIGINT 驱动，不另立计数。
-- 唯一例外：`read_line` 的空行 Ctrl-C 退出、`/exit` 由 REPL 逻辑判定（基于信号线程的记录），非新增生产者。
+- 退出语义统一走 `UiResult`：`read_line` 的 `Err` 覆盖 `/exit`；空行/编辑中 Ctrl-C 返回 `Interrupted`，由 REPL 层按 `line_empty` 决定退出或清行；`ConfirmOutcome::Cancelled` 是确认界面的 Ctrl-C，取消整轮。
+- **Ctrl-C 的唯一记录生产者是专用信号线程**（confirm 场景）：终端保持 ISIG，Ctrl-C 产生 SIGINT，经 self-pipe/signalfd 由信号线程在锁内追加记录；`confirm` 的可中断读取由 SIGINT 唤醒返回 `Cancelled`，不自行追加，无双重计数。
+- **rustyline 场景的计数豁免**：rustyline 原始模式会清除 ISIG 并安装自己的 SIGINT 处理器，Ctrl-C 不产生 SIGINT 而由 rustyline 返回 `Interrupted`——该路径**不经过**信号线程记录，直接由 REPL 层处理（清行/退出），也不追加记录。即：REPL 输入态的 Ctrl-C 与活动操作（流式/工具/确认）中的 Ctrl-C 是**两套互不干扰的路径**：前者走 rustyline 按键、后者走 SIGINT 计数。两路径不会同时处于活动状态，不产生双重计数。
 - agent loop 收到 `Err(Quit)` 直接终止回合，不自己判断第几次 Ctrl-C。
 
 - 生产实现 `TermUi`：rustyline 后端；`confirm` 用可中断读取（保持 ISIG，Ctrl-C 产生 SIGINT 唤醒读取并返回 `Cancelled`；配合信号线程记录，无双重计数）。`stdin 非 TTY 拒绝启动`的检查在 `TermUi::new` 里做，不进 main 流程。
@@ -165,7 +165,7 @@ loop {
 - **限额逐个前置检查**：在判定每个调用前检查，不执行满批后才停；**所有模型发起的调用都计数**（含参数解析失败/未知工具名/spawn 失败的调用），防止错误调用无限循环。
 - **历史即上下文**：`History` 原样序列化进请求，无预算管理；窗口超限错误原样展示并提示 `/clear`。
 - **reasoning 不回传**：序列化时丢弃 `reasoning`，除非 `echo_reasoning = true`（适配层职责）。
-- **退出由 Ui 统一承载**：`read_line` 返回 `Err(Quit)`（空闲态/空行 Ctrl-C 与 `/exit` 同路径）；`confirm` 的取消返回 `Cancelled`，若该 Ctrl-C 是当前轮第二次则取消收尾后走退出；无 Ui 阻塞点处（工具执行/清理期）由全局信号计数承接。
+- **退出由 Ui 统一承载**：`read_line` 的 `Err(Quit)` 仅对应 `/exit`；空行/编辑中 Ctrl-C 返回 `Interrupted`，REPL 层按 `line_empty` 决定退出（构造 `Err(Quit)`）或清行；`confirm` 的取消返回 `Cancelled`；无 Ui 阻塞点处（工具执行/清理期）由全局信号计数承接。
 
 ## 五、线程与取消（term.rs / repl.rs）
 
@@ -176,7 +176,7 @@ struct Cancel {
 struct State { epoch: u64, records: Vec<u32 /*第几次 Ctrl-C*/>, prev_quit: bool }
 ```
 
-- **异步信号安全**：真正的信号处理器只做最小动作（向 self-pipe 写一个字节，或 signalfd 方案），**不在处理器内取锁**——`Mutex` 非可重入，信号投递到持锁线程会自死锁。锁内的 epoch 读取与记录追加由**专用信号线程**完成（Ctrl-C 的唯一记录生产者，含 confirm/rustyline 场景——终端保持 ISIG，Ctrl-C 一律产生 SIGINT）：消费 self-pipe/signalfd 事件，在普通线程上下文执行。专用线程与主线程切轮在同一锁内串行化——信号线程先拿锁则记入旧轮并被结转，切轮先拿锁则记入新轮，两种顺序新轮都能看到，旧轮尚未消费的 quit 不丢失。
+- **异步信号安全**：真正的信号处理器只做最小动作（向 self-pipe 写一个字节，或 signalfd 方案），**不在处理器内取锁**——`Mutex` 非可重入，信号投递到持锁线程会自死锁。锁内的 epoch 读取与记录追加由**专用信号线程**完成（活动操作——流式/工具/确认——期间 Ctrl-C 的唯一记录生产者；REPL 输入态的 Ctrl-C 走 rustyline 按键路径，不经此记录，见 ui.rs 一节）：消费 self-pipe/signalfd 事件，在普通线程上下文执行。专用线程与主线程切轮在同一锁内串行化——信号线程先拿锁则记入旧轮并被结转，切轮先拿锁则记入新轮，两种顺序新轮都能看到，旧轮尚未消费的 quit 不丢失。
 - 主线程查询：锁内看 `prev_quit`（则退出）或当前轮记录——第 1 次为 cancel，第 2 次及以上为 quit；旧轮非 quit 记录作废。
 - 消费点：渲染/接收循环（`recv_timeout` 短轮询，超时即查；**成功收到事件也先查再处理**）、工具等待循环（触发进程组升级终止；发现 quit 则终止后退出程序）、agent loop（按占位规则收尾回 REPL；发现 quit 则退出程序）。工具执行/清理期间无 Ui 阻塞点，第二次 Ctrl-C 的退出由当前轮信号记录承接。
 - 流线程取消：主线程 drop Receiver → worker 下一次 `send` 报错即退出循环（无需继续排空 HTTP 流，不主动 close 连接）。channel 为无界 `mpsc`：无界使发送永不阻塞，配合 drop-Receiver 早退语义最简单。
