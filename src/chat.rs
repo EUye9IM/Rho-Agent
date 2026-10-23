@@ -5,6 +5,7 @@ use crate::provider::ProviderAdapter;
 use crate::render::RenderEvent;
 use crate::term::Cancel;
 use crate::ui::Ui;
+use std::sync::Arc;
 
 /// 与协议解耦的消息模型（适配层负责映射）。
 #[derive(Debug, Clone)]
@@ -31,10 +32,11 @@ pub struct ToolCall {
 }
 
 /// 会话状态：历史 + 当前选择 + 适配器 + 工具步数。
+/// adapter 为 Arc 共享：每轮传引用进 worker，会话长期持有。
 pub struct Session {
     pub cfg: Config,
     pub selection: Selection,
-    pub adapter: Box<dyn ProviderAdapter>,
+    pub adapter: Arc<dyn ProviderAdapter>,
     pub yes: bool,
     pub thinking: Option<String>,
     pub history: Vec<Msg>,
@@ -64,7 +66,7 @@ impl Session {
     pub fn new(
         cfg: Config,
         selection: Selection,
-        adapter: Box<dyn ProviderAdapter>,
+        adapter: Arc<dyn ProviderAdapter>,
         yes: bool,
         thinking: Option<String>,
     ) -> Self {
@@ -95,10 +97,12 @@ impl Session {
         todo!()
     }
 
-    /// 切换供应商（REPL /provider）：联动重置模型与 thinking。
+    /// 切换供应商（REPL /provider）：联动重置模型与 thinking，并按新 provider
+    /// 重建适配器（compat / protocol 可能不同）。
     pub fn switch_provider(&mut self, id: &str) -> Result<(), String> {
         // TODO: 新 provider 声明顺序第一个模型 + thinking_default；
-        //       key 不齐全 → 拒绝命令列缺失变量，状态不变
+        //       key 不齐全 → 拒绝命令列缺失变量，状态不变；
+        //       成功时 selection 更新 + adapter = provider::adapter_for(new)?
         let _ = id;
         todo!()
     }
@@ -149,6 +153,6 @@ fn emit(ui: &mut dyn Ui, ev: RenderEvent) {
 
 /// 空适配器占位（provider 分发在 provider/mod.rs）。
 #[allow(dead_code)]
-fn adapter_for(_selection: &Selection) -> Result<Box<dyn ProviderAdapter>, String> {
-    crate::provider::adapter_for_protocol(&_selection.provider.protocol)
+fn adapter_for(provider: &crate::config::Provider) -> Result<Arc<dyn ProviderAdapter>, String> {
+    crate::provider::adapter_for(provider)
 }

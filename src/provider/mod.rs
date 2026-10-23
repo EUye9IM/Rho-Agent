@@ -4,6 +4,8 @@ mod openai;
 
 pub use openai::OpenAiChatAdapter;
 
+use std::sync::Arc;
+
 use crate::chat::Msg;
 use crate::config::{Model, Provider};
 use serde_json::Value;
@@ -53,19 +55,19 @@ impl TurnAcc {
     }
 }
 
-/// 适配器需要跨线程进 worker：要求 Send。
-pub trait ProviderAdapter: Send {
-    /// 适配层所需的兼容性开关（如 echo_reasoning）在构造适配器时注入。
+/// 适配器需要跨线程进 worker：Arc 共享，每轮传引用，要求 Send + Sync。
+pub trait ProviderAdapter: Send + Sync {
     fn endpoint(&self, p: &Provider) -> String;
     fn build_body(&self, hist: &[Msg], model: &Model, thinking: Option<&Value>) -> Value;
     fn headers(&self, p: &Provider) -> Vec<(String, String)>;
     fn parse_chunk(&self, chunk: &Value, acc: &mut TurnAcc) -> Vec<StreamEvent>;
 }
 
-/// 按 protocol 分发；v1 只实现 openai_chat，其余报"不支持"（可展示错误，非 panic）。
-pub fn adapter_for_protocol(protocol: &str) -> Result<Box<dyn ProviderAdapter>, String> {
-    match protocol {
-        "openai_chat" => Ok(Box::new(OpenAiChatAdapter::new())),
+/// 按 Provider 构造适配器：compat 开关（echo_reasoning 等）在构造时注入；
+/// protocol 不认识则报"不支持"（可展示错误，非 panic）。v1 只实现 openai_chat。
+pub fn adapter_for(provider: &Provider) -> Result<Arc<dyn ProviderAdapter>, String> {
+    match provider.protocol.as_str() {
+        "openai_chat" => Ok(Arc::new(OpenAiChatAdapter::new(provider.compat.echo_reasoning))),
         // Responses / Anthropic Messages：接口预留，v1 报不支持（exit 2 由调用方映射）
         other => Err(format!("不支持的协议族：{other}（v1 只实现 openai_chat）")),
     }
@@ -75,7 +77,7 @@ pub fn adapter_for_protocol(protocol: &str) -> Result<Box<dyn ProviderAdapter>, 
 /// 契约：任何结束路径必以 Final 或 Error 收尾后才退出（主线程收到
 /// Disconnected 即防御性按 Error 收尾）。
 pub fn stream_request(
-    adapter: Box<dyn ProviderAdapter>,
+    adapter: Arc<dyn ProviderAdapter>,
     provider: Provider,
     body: Value,
     headers: Vec<(String, String)>,

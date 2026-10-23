@@ -63,7 +63,7 @@ fn run(args: Args) -> u8 {
         }
     };
 
-    let adapter = match provider::adapter_for_protocol(&selection.provider.protocol) {
+    let adapter = match provider::adapter_for(&selection.provider) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");

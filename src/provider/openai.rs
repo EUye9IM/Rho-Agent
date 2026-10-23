@@ -11,14 +11,9 @@ pub struct OpenAiChatAdapter {
 }
 
 impl OpenAiChatAdapter {
-    pub fn new() -> Self {
-        Self { echo_reasoning: false }
-    }
-}
-
-impl Default for OpenAiChatAdapter {
-    fn default() -> Self {
-        Self::new()
+    /// compat 开关注入：echo_reasoning=true 时 reasoning_content 随历史回传。
+    pub fn new(echo_reasoning: bool) -> Self {
+        Self { echo_reasoning }
     }
 }
 
