@@ -123,8 +123,9 @@ loop {
     worker 线程发请求并持有 TurnAcc，主线程 recv_timeout 短轮询：
         每次成功收到事件后先查标志再处理（持续有事件也逐块可取消）
         Delta     → 渲染
-        Done      → 流结束（finish_reason=stop|tool_calls|None 才有提交资格）
-        Final     → 持有完整 Assistant 消息，流后处理
+        Done      → 仅记录提交资格（finish_reason=stop|tool_calls|None），不退出接收
+        Final     → 收到完整 Assistant 消息才退出接收、进入流后处理；
+                    Done 后通道断开或缺失 Final（含不合格 finish_reason）按 Error 收尾
         Error     → 展示错误，回合结束（保留已完成历史）
         超时无事件 → 查取消标志，未取消则继续轮询
     流式期间 Ctrl-C → drop Receiver，回合终止，回 REPL（若 quit 则退出）
@@ -166,17 +167,17 @@ loop {
 
 ```rust
 struct Cancel {
-    cancel:   AtomicBool,   // 第一次 Ctrl-C：取消当前操作
-    quit:     AtomicBool,   // 第二次 Ctrl-C：请求退出
+    epoch: AtomicU64,     // 轮次号，每轮递增；不复位、无覆盖竞态
+    signals: Mutex<Vec<(u64 /*epoch*/, u32 /*第几次 Ctrl-C*/)>>, // 信号回调追加记录
 }
 ```
 
-- 信号处理回调只置标志（cancel 置位时后续 Ctrl-C 置 quit），不做复杂工作。
-- 标志生命周期：每轮（每次用户输入触发的回合）开始前，若 quit 已置位则先消费退出（不再清零继续跑）；否则 cancel 与 quit 一并清零后开始新轮。取消回 REPL 接受下一轮输入时同样处理。
-- 消费点：渲染/接收循环（`recv_timeout` 短轮询，超时即查标志；**成功收到事件也先查标志再处理**）、工具等待循环（触发进程组升级终止；发现 quit 则终止后退出程序）、agent loop（按占位规则收尾回 REPL；发现 quit 则退出程序）。工具执行/清理期间无 Ui 阻塞点，第二次 Ctrl-C 的退出由 quit 标志承接。
+- 信号处理回调只追加 `(当前 epoch, 序号)` 记录，不做其他工作；不读改任何标志，不存在清零覆盖并发退出请求的竞态。
+- 主线程查询：取 `epoch` 匹配当前轮的记录——第 1 次为 cancel，第 2 次及以上为 quit；旧轮记录自然作废。
+- 消费点：渲染/接收循环（`recv_timeout` 短轮询，超时即查；**成功收到事件也先查再处理**）、工具等待循环（触发进程组升级终止；发现 quit 则终止后退出程序）、agent loop（按占位规则收尾回 REPL；发现 quit 则退出程序）。工具执行/清理期间无 Ui 阻塞点，第二次 Ctrl-C 的退出由当前轮信号记录承接。
 - 流线程取消：主线程 drop Receiver → worker 下一次 `send` 报错即退出循环（无需继续排空 HTTP 流，不主动 close 连接）。channel 为无界 `mpsc`：无界使发送永不阻塞，配合 drop-Receiver 早退语义最简单。
-- 工具执行与进程组终止：`setsid` 建进程组；stdout/stderr 各起一个 drain 线程并行读取，写入有界环形缓冲（超限后丢弃并计数，不停止读取）。采集结束条件：`waitpid` 观察到 bash 退出后，先继续读取已缓冲在管道中的剩余数据至 drains 静默，再关写端/detach drain 线程（不等待后台进程关闭其继承的写端；后台进程持有写端导致 drain 永不 EOF 时，bash 退出即视为采集完成）。终止升级不依赖 bash 单体退出状态：SIGTERM 发 pgid → 2s → 无论直接子进程状态如何，对 pgid 发 SIGKILL → 回收 bash（直接子进程回收条件与进程组清理条件分离）。
-- quit 标志消费后不再清零（退出路径）；新轮启动前若 quit 已置位，先退出。
+- 工具执行与进程组终止：`setsid` 建进程组；stdout/stderr 各起一个 drain 线程并行读取，写入有界环形缓冲（超限后丢弃并计数，不停止读取）。采集收尾：`waitpid` 观察到 bash 退出后，继续读取管道中已缓冲的剩余数据，但有界（短超时上限，防止后台进程持续写入永不静默）；收尾结束后 drop 读端、detach drain 线程（读端关闭后，后台进程若继续写，写满或 EPIPE 与本进程无关）。终止升级不依赖 bash 单体退出状态：SIGTERM 发 pgid → 2s → 无论直接子进程状态如何，对 pgid 发 SIGKILL → 回收 bash（直接子进程回收条件与进程组清理条件分离）。
+- quit（当前轮第二次 Ctrl-C）被消费即走退出路径，不存在清零；新轮靠 epoch 递增作废旧轮信号记录。
 
 ## 六、错误与退出码
 
