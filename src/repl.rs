@@ -1,10 +1,13 @@
 //! REPL 循环：斜杠命令、Ctrl-C 语义。循环本体依赖 Ui trait。见 design.md 四节。
 
-use crate::chat::{ChatResult, Session};
-use crate::term::Cancel;
+use crate::chat::{ChatResult, Session, TurnEnd};
+use crate::config;
+use crate::render::RenderEvent;
+use crate::term::{Cancel, SignalState};
 use crate::ui::{ReadOutcome, Ui};
 
 /// REPL 层的退出/致命错误（main 据此映射退出码 0/1）。
+#[derive(Debug)]
 pub enum ReplExit {
     /// /exit、空行 Ctrl-C、Ctrl-D（正常退出，exit 0）
     Quit,
@@ -14,17 +17,64 @@ pub enum ReplExit {
 
 /// REPL 主循环。
 pub fn run(ui: &mut dyn Ui, mut session: Session, cancel: &Cancel) -> Result<(), ReplExit> {
-    // TODO: loop {
-    //   let outcome = ui.read_line();
-    //   ReadOutcome::Eof | Interrupted{line_empty:true} → return Ok(ReplExit::Quit)
-    //   Interrupted{line_empty:false} → 清空输入行（rustyline 已处理），continue
-    //   Line(s) → 空行 continue；斜杠命令 → handle_command
-    //            普通输入 → session.turn(...)：
-    //     Ok(TurnEnd) → continue；Err(Quit) → return Quit（占位已由 turn 补齐）
-    //   切轮前 cancel 切轮（prev_quit 结转；已置位则先退出）
-    // }
-    let _ = (ui, session, cancel);
-    todo!()
+    loop {
+        // 上一轮清理期间记录的 quit：不等下一次输入，立即退出。
+        if cancel.state() == SignalState::Quit {
+            return Err(ReplExit::Quit);
+        }
+
+        let outcome = ui.read_line();
+        check_fatal(ui)?;
+        match outcome {
+            ReadOutcome::Eof => return Ok(()),
+            ReadOutcome::Interrupted { line_empty: true } => return Ok(()),
+            ReadOutcome::Interrupted { line_empty: false } => {
+                // rustyline 已清空编辑行；回到提示符。
+                continue;
+            }
+            ReadOutcome::Line(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.starts_with('/') {
+                    let result = match handle_command(ui, &mut session, cancel, trimmed) {
+                        Ok(r) => r,
+                        Err(_) => return Err(ReplExit::Quit),
+                    };
+                    check_fatal(ui)?;
+                    if cancel.state() == SignalState::Quit {
+                        return Err(ReplExit::Quit);
+                    }
+                    match result {
+                        CommandResult::Continue => continue,
+                        CommandResult::Exit => return Ok(()),
+                    }
+                }
+
+                if advance_epoch(cancel) {
+                    return Err(ReplExit::Quit);
+                }
+                let turn = session.turn(ui, cancel, trimmed);
+                check_fatal(ui)?;
+                // turn 内部任何返回路径都不应把 pending quit 丢给下一次输入。
+                if cancel.state() == SignalState::Quit {
+                    return Err(ReplExit::Quit);
+                }
+                match turn {
+                    Ok(TurnEnd::Done) | Ok(TurnEnd::Error(_)) | Ok(TurnEnd::Cancelled) => {}
+                    Err(_) => return Err(ReplExit::Quit),
+                }
+            }
+        }
+    }
+}
+
+fn check_fatal(ui: &mut dyn Ui) -> Result<(), ReplExit> {
+    match ui.take_fatal() {
+        Some(e) => Err(ReplExit::Fatal(e)),
+        None => Ok(()),
+    }
 }
 
 /// 斜杠命令处理：/model /provider /thinking /clear /help /exit。
@@ -32,19 +82,122 @@ pub fn run(ui: &mut dyn Ui, mut session: Session, cancel: &Cancel) -> Result<(),
 fn handle_command(
     ui: &mut dyn Ui,
     session: &mut Session,
-    cancel: &Cancel,
+    _cancel: &Cancel,
     line: &str,
 ) -> ChatResult<CommandResult> {
-    // TODO: 解析命令名与参数 → 分发：
-    //   /exit → CommandResult::Exit
-    //   /clear → session.clear()
-    //   /model [id] / /provider [id] / /thinking [level] →
-    //     有参：session.switch_*（失败则展示错误，状态不变）
-    //     无参：列出可选项并标注当前值
-    //   /help → 用法文本
-    //   未知命令 → 提示
-    let _ = (ui, session, cancel, line);
-    todo!()
+    let mut parts = line.split_whitespace();
+    let command = parts.next().unwrap_or("");
+    let arg = parts.collect::<Vec<_>>().join(" ");
+
+    match command {
+        "/exit" => Ok(CommandResult::Exit),
+        "/clear" => {
+            session.clear();
+            text(ui, "已清空对话历史");
+            Ok(CommandResult::Continue)
+        }
+        "/help" => {
+            let mut lines = vec![
+                "命令：".to_string(),
+                "  /model [id]      切换或列出当前供应商的模型".to_string(),
+                "  /provider [id]  切换或列出供应商".to_string(),
+            ];
+            if !session.selection.model.thinking.is_empty() {
+                lines.push("  /thinking [level] 切换或列出思考档位".to_string());
+            }
+            lines.push("  /clear           清空对话历史".to_string());
+            lines.push("  /help            显示本帮助".to_string());
+            lines.push("  /exit            退出".to_string());
+            text(ui, &lines.join("\n"));
+            Ok(CommandResult::Continue)
+        }
+        "/model" => {
+            if arg.is_empty() {
+                let provider_id = &session.selection.provider_id;
+                let mut lines = vec![format!("供应商 {provider_id} 的可用模型：")];
+                for (id, _) in config::models_in_order(&session.cfg) {
+                    if config::model_provider_prefix(id) != Some(provider_id.as_str()) {
+                        continue;
+                    }
+                    let mark = if id == &session.selection.model_id { "*" } else { " " };
+                    lines.push(format!("  {mark} {id}"));
+                }
+                text(ui, &lines.join("\n"));
+            } else if let Err(e) = session.switch_model(&arg) {
+                emit_error(ui, e);
+            } else {
+                text(ui, &format!("已切换到模型 {}", session.selection.model_id));
+            }
+            Ok(CommandResult::Continue)
+        }
+        "/provider" => {
+            if arg.is_empty() {
+                let mut lines = vec!["可用供应商：".to_string()];
+                for (id, _) in config::providers_in_order(&session.cfg) {
+                    let mark = if id == &session.selection.provider_id { "*" } else { " " };
+                    let status = match config::provider_availability(&session.cfg, id) {
+                        Ok(()) => String::new(),
+                        Err(e) => format!("（不可用：{e}）"),
+                    };
+                    lines.push(format!("  {mark} {id}{status}"));
+                }
+                text(ui, &lines.join("\n"));
+            } else if let Err(e) = session.switch_provider(&arg) {
+                emit_error(ui, e);
+            } else {
+                text(
+                    ui,
+                    &format!(
+                        "已切换到供应商 {}，模型 {}",
+                        session.selection.provider_id, session.selection.model_id
+                    ),
+                );
+            }
+            Ok(CommandResult::Continue)
+        }
+        "/thinking" => {
+            let levels: Vec<String> = session
+                .selection
+                .model
+                .thinking
+                .keys()
+                .cloned()
+                .collect();
+            if arg.is_empty() {
+                if levels.is_empty() {
+                    text(ui, "当前模型未声明思考档位");
+                } else {
+                    let mut lines = vec!["可用思考档位：".to_string()];
+                    for level in &levels {
+                        let mark = if session.selection.thinking.as_deref() == Some(level.as_str()) {
+                            "*"
+                        } else {
+                            " "
+                        };
+                        lines.push(format!("  {mark} {level}"));
+                    }
+                    text(ui, &lines.join("\n"));
+                }
+            } else if let Err(e) = session.switch_thinking(&arg) {
+                emit_error(ui, e);
+            } else {
+                text(ui, &format!("思考档位：{arg}"));
+            }
+            Ok(CommandResult::Continue)
+        }
+        other => {
+            emit_error(ui, format!("未知命令：{other}（输入 /help 查看帮助）"));
+            Ok(CommandResult::Continue)
+        }
+    }
+}
+
+fn text(ui: &mut dyn Ui, message: &str) {
+    ui.print(&RenderEvent::TextDelta(format!("{message}\n")));
+}
+
+fn emit_error(ui: &mut dyn Ui, message: impl Into<String>) {
+    ui.print(&RenderEvent::Error(message.into()));
 }
 
 enum CommandResult {
@@ -55,14 +208,10 @@ enum CommandResult {
 /// 切轮：活动操作开始前调用（流式请求/回合开始）。
 /// prev_quit 已置位 → 退出；否则清空当前轮记录。
 fn advance_epoch(cancel: &Cancel) -> bool {
-    // TODO: cancel.advance_epoch()：锁内 epoch+=1、旧轮 quit 结转 prev_quit、
-    //       清空当前轮 records；返回 prev_quit（true = 应退出）
-    let _ = cancel;
-    todo!()
+    cancel.advance_epoch()
 }
 
 /// 会话 cwd 展示（恒为进程启动目录）。
 pub fn session_cwd() -> String {
-    // TODO: 进程启动时缓存一次 cwd（启动目录，全程不可变）
-    todo!()
+    crate::session_cwd()
 }

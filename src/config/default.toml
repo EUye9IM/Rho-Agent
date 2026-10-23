@@ -1,0 +1,44 @@
+default_provider = "deepseek"
+max_tool_steps = 25
+system_prompt = """
+你是 rho，一个运行在用户本机的轻量命令行运维助手。
+你可以使用 bash 工具执行命令来完成任务；执行前先简短说明目的，结果保持简洁。
+不要执行与用户请求无关或具有破坏性的命令。
+"""
+
+[providers.deepseek]
+protocol = "openai_chat"
+base_url = "https://api.deepseek.com"
+
+[providers.deepseek.auth]
+headers = { Authorization = "Bearer ${DEEPSEEK_API_KEY}" }
+
+[providers.deepseek.compat]
+echo_reasoning = false
+
+[models."deepseek/deepseek-flash"]
+context_window = 1000000
+max_output = 65536
+thinking_default = "high"
+
+[models."deepseek/deepseek-flash".thinking]
+off = { thinking = { type = "disabled" } }
+low = { thinking = { type = "enabled" }, reasoning_effort = "low" }
+high = { thinking = { type = "enabled" }, reasoning_effort = "high" }
+max = { thinking = { type = "enabled" }, reasoning_effort = "max" }
+
+[models."deepseek/deepseek-v4-pro"]
+context_window = 1000000
+max_output = 65536
+thinking_default = "high"
+
+[models."deepseek/deepseek-v4-pro".thinking]
+off = { thinking = { type = "disabled" } }
+low = { thinking = { type = "enabled" }, reasoning_effort = "low" }
+high = { thinking = { type = "enabled" }, reasoning_effort = "high" }
+max = { thinking = { type = "enabled" }, reasoning_effort = "max" }
+
+[tools.bash]
+allow = ["ls", "cat /var/log", "systemctl status"]
+timeout_seconds = 120
+max_output_bytes = 16384

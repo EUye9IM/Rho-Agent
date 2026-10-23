@@ -7,6 +7,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 pub use expand::expand_headers;
+pub use expand::warn_plaintext_secrets;
 pub use validate::{validate, ValidationError};
 
 /// 有序 map：IndexMap 保插入序（与 toml preserve_order 同底座），
@@ -46,17 +47,11 @@ pub struct AuthConfig {
     pub headers: OrderedMap<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompatConfig {
     #[serde(default)]
     pub echo_reasoning: bool,
-}
-
-impl Default for CompatConfig {
-    fn default() -> Self {
-        Self { echo_reasoning: false }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,17 +68,11 @@ pub struct Model {
     pub thinking: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolsConfig {
     #[serde(default)]
     pub bash: BashToolConfig,
-}
-
-impl Default for ToolsConfig {
-    fn default() -> Self {
-        Self { bash: BashToolConfig::default() }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -129,15 +118,144 @@ pub fn load(path: &Option<String>) -> Result<Config, String> {
     }
 }
 
-fn load_file(_path: &str) -> Result<Config, String> {
-    // TODO: 读文件 → toml 解析 → 严格反序列化（deny_unknown_fields + 位置定位）
-    //       → validate() 收集全部错误一次报出
-    todo!()
+fn load_file(path: &str) -> Result<Config, String> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| format!("无法读取配置文件 {path}：{e}"))?;
+    load_source(&source, path)
 }
 
 fn load_builtin() -> Result<Config, String> {
-    // TODO: include_str! 内置默认配置（仅 DeepSeek 两模型）→ 同 load_file 的解析路径
-    todo!()
+    load_source(include_str!("default.toml"), "<内置默认配置>")
+}
+
+fn load_source(source: &str, label: &str) -> Result<Config, String> {
+    let cfg: Config = toml::from_str(source).map_err(|e| {
+        let line = e
+            .span()
+            .and_then(|s| source.get(..s.start))
+            .map(|prefix| prefix.matches('\n').count() + 1);
+        match line {
+            Some(n) => format!("配置解析失败 {label}（第 {n} 行）：{e}"),
+            None => format!("配置解析失败 {label}：{e}"),
+        }
+    })?;
+    // 明文密钥告警在加载时统一扫描一次，选择/切换阶段不再重复打印。
+    for (_, provider) in providers_in_order(&cfg) {
+        let pairs: Vec<(String, String)> = provider
+            .auth
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        warn_plaintext_secrets(&pairs);
+    }
+    match validate(&cfg) {
+        Ok(()) => Ok(cfg),
+        Err(errs) => {
+            let mut msg = format!("配置校验失败 {label}：");
+            for e in errs {
+                msg.push('\n');
+                if let Some(line) = e.line {
+                    msg.push_str(&format!("  - {}（第 {} 行）：{}", e.path, line, e.message));
+                } else {
+                    msg.push_str(&format!("  - {}：{}", e.path, e.message));
+                }
+            }
+            Err(msg)
+        }
+    }
+}
+
+/// 模型 id 的供应商前缀（`deepseek/model` → `deepseek`）。
+pub fn model_provider_prefix(model_id: &str) -> Option<&str> {
+    model_id
+        .split_once('/')
+        .and_then(|(p, m)| (!p.is_empty() && !m.is_empty()).then_some(p))
+}
+
+/// 某供应商声明顺序中的第一个模型。
+pub fn first_model_for<'a>(cfg: &'a Config, provider_id: &str) -> Option<(&'a String, &'a Model)> {
+    cfg.models
+        .iter()
+        .find(|(id, _)| model_provider_prefix(id) == Some(provider_id))
+}
+
+fn expand_provider(provider: &Provider) -> Result<Provider, String> {
+    let pairs: Vec<(String, String)> = provider
+        .auth
+        .headers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let expanded = expand_headers(&pairs)?;
+    let mut out = provider.clone();
+    out.auth.headers = expanded.into_iter().collect();
+    Ok(out)
+}
+
+fn provider_unavailable(id: &str, err: String) -> String {
+    format!("供应商 {id} 不可用：认证变量缺失或无效（{err}）")
+}
+
+/// 供应商是否可用（已声明且认证变量齐全）。REPL /provider 列表标注用。
+pub fn provider_availability(cfg: &Config, provider_id: &str) -> Result<(), String> {
+    let provider = cfg
+        .providers
+        .get(provider_id)
+        .ok_or_else(|| format!("未声明的供应商：{provider_id}"))?;
+    expand_provider(provider)
+        .map(|_| ())
+        .map_err(|e| provider_unavailable(provider_id, e))
+}
+
+/// 按供应商选择：认证 header 在此展开，模型取该供应商声明顺序第一个。
+pub fn selection_for_provider(cfg: &Config, provider_id: &str) -> Result<Selection, String> {
+    let provider = cfg
+        .providers
+        .get(provider_id)
+        .ok_or_else(|| format!("未声明的供应商：{provider_id}"))?;
+    let provider = expand_provider(provider).map_err(|e| provider_unavailable(provider_id, e))?;
+    let (model_id, model) = first_model_for(cfg, provider_id)
+        .ok_or_else(|| format!("供应商 {provider_id} 未声明任何模型"))?;
+    Ok(Selection {
+        provider_id: provider_id.to_string(),
+        provider,
+        model_id: model_id.clone(),
+        model: model.clone(),
+        thinking: model.thinking_default.clone(),
+    })
+}
+
+/// 按模型选择：供应商由 id 前缀决定。
+pub fn selection_for_model(cfg: &Config, model_id: &str) -> Result<Selection, String> {
+    selection_for(cfg, model_id, None)
+}
+
+fn selection_for(
+    cfg: &Config,
+    model_id: &str,
+    required_provider: Option<&str>,
+) -> Result<Selection, String> {
+    let model = find_model(cfg, model_id).ok_or_else(|| format!("未声明的模型：{model_id}"))?;
+    let prefix = model_provider_prefix(model_id)
+        .ok_or_else(|| format!("模型 id 必须带供应商前缀：{model_id}"))?;
+    if let Some(required) = required_provider {
+        if prefix != required {
+            return Err(format!("模型 {model_id} 不属于供应商 {required}"));
+        }
+    }
+    let provider = cfg
+        .providers
+        .get(prefix)
+        .ok_or_else(|| format!("模型 {model_id} 的前缀供应商未声明：{prefix}"))?;
+    let provider = expand_provider(provider).map_err(|e| provider_unavailable(prefix, e))?;
+    Ok(Selection {
+        provider_id: prefix.to_string(),
+        provider,
+        model_id: model_id.to_string(),
+        model: model.clone(),
+        thinking: model.thinking_default.clone(),
+    })
 }
 
 /// 供应商启用与默认值冲突消解（design.md 五节规则）：
@@ -151,11 +269,35 @@ pub fn resolve_selection(
     cli_provider: Option<&str>,
     cli_model: Option<&str>,
 ) -> Result<Selection, String> {
-    // TODO: 展开各 provider 的 auth header（缺变量者标记不可用，非致命）
-    // TODO: 按上述规则组合出 Selection；thinking 取所选模型的 thinking_default
-    // TODO: --provider 与 --model 同给且不属该 provider → 用法错误
-    let _ = (cfg, cli_provider, cli_model);
-    todo!()
+    match (cli_provider, cli_model) {
+        (Some(p), Some(m)) => selection_for(cfg, m, Some(p)),
+        (Some(p), None) => selection_for_provider(cfg, p),
+        (None, Some(m)) => selection_for_model(cfg, m),
+        (None, None) => {
+            if let Some(model) = cfg.default_model.as_deref() {
+                return selection_for_model(cfg, model);
+            }
+            if let Some(provider) = cfg.default_provider.as_deref() {
+                return selection_for_provider(cfg, provider);
+            }
+            let mut unavailable = Vec::new();
+            for (id, provider) in providers_in_order(cfg) {
+                match expand_provider(provider) {
+                    Ok(_) => {
+                        if first_model_for(cfg, id).is_some() {
+                            return selection_for_provider(cfg, id);
+                        }
+                        unavailable.push(format!("{id}：未声明任何模型"));
+                    }
+                    Err(e) => unavailable.push(format!("{id}：{e}")),
+                }
+            }
+            Err(format!(
+                "没有可用的供应商（未找到认证变量齐全者）：\n  {}",
+                unavailable.join("\n  ")
+            ))
+        }
+    }
 }
 
 /// 查找辅助（供 resolve_selection / REPL 切换复用）。
@@ -175,6 +317,3 @@ pub fn providers_in_order(cfg: &Config) -> impl Iterator<Item = (&String, &Provi
 pub fn models_in_order(cfg: &Config) -> impl Iterator<Item = (&String, &Model)> {
     cfg.models.iter()
 }
-
-#[allow(dead_code)]
-fn _unused(_: &BTreeMap<String, String>) {}

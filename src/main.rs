@@ -69,9 +69,13 @@ fn run(args: Args) -> u8 {
 
     let mut term_ui = match ui::TermUi::new() {
         Ok(u) => u,
-        Err(e) => {
+        Err(ui::TermUiInitError::NotTty(e)) => {
             eprintln!("{e}");
             return EXIT_USAGE;
+        }
+        Err(ui::TermUiInitError::Init(e)) => {
+            eprintln!("{e}");
+            return EXIT_INTERNAL;
         }
     };
 
@@ -97,14 +101,32 @@ fn run(args: Args) -> u8 {
 /// 解析 --thinking：None → 保持 selection.thinking（模型 thinking_default）；
 /// Some(档位) → 须属该模型档位表，写入 selection.thinking。
 fn resolve_thinking(
-    cfg: &config::Config,
+    _cfg: &config::Config,
     selection: &mut config::Selection,
     cli: Option<&str>,
 ) -> Result<(), String> {
-    // TODO: 有 cli 时校验属所选模型 thinking 档位（无表的模型拒绝非空 --thinking）；
-    //       合法则 selection.thinking = Some(cli)
-    let _ = (cfg, selection, cli);
-    todo!()
+    let Some(level) = cli else { return Ok(()) };
+    let levels: Vec<&str> = selection
+        .model
+        .thinking
+        .keys()
+        .map(String::as_str)
+        .collect();
+    if levels.is_empty() {
+        return Err(format!(
+            "模型 {} 未声明思考档位，不能使用 --thinking {level}",
+            selection.model_id
+        ));
+    }
+    if !selection.model.thinking.contains_key(level) {
+        return Err(format!(
+            "无效思考档位 `{level}`（模型 {}）；可选：{}",
+            selection.model_id,
+            levels.join(", ")
+        ));
+    }
+    selection.thinking = Some(level.to_string());
+    Ok(())
 }
 
 /// 手写参数解析：支持 `--flag value` 与 `--flag=value`；未知参数/重复 flag/带值的 --yes 报错。

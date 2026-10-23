@@ -1,7 +1,12 @@
 //! 终端信号处理：SIGINT self-pipe、专用信号线程、Cancel（epoch 记录）。
 //! 见 architecture.md 五节。
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// 信号处理器写入端（async-signal-safe 路径只碰这个原子量与 write(2)）。
+static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+static CANCEL: OnceLock<Arc<Cancel>> = OnceLock::new();
 
 /// Ctrl-C 记录中心（活动操作期间的唯一记录消费入口）。
 ///
@@ -23,7 +28,7 @@ struct State {
 }
 
 /// 信号路径查询结果。
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SignalState {
     /// 无 Ctrl-C（或旧轮非 quit 记录已作废）
     None,
@@ -35,46 +40,185 @@ pub enum SignalState {
 
 impl Cancel {
     pub fn new() -> Arc<Self> {
-        // TODO: 由 term::init 创建
-        todo!()
+        Arc::new(Self {
+            inner: Mutex::new(State { epoch: 0, records: Vec::new(), prev_quit: false }),
+        })
     }
 
     /// 主线程查询当前信号状态（渲染循环逐事件查、工具等待循环轮询、agent loop 收尾查）。
     pub fn state(&self) -> SignalState {
-        // TODO: 锁内：prev_quit → Quit；records 空为 None；
-        //       len==1 → Cancel；len>=2 → Quit
-        todo!()
+        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if state.prev_quit {
+            return SignalState::Quit;
+        }
+        match state.records.len() {
+            0 => SignalState::None,
+            1 => SignalState::Cancel,
+            _ => SignalState::Quit,
+        }
     }
 
     /// 切轮（每次用户输入触发的新回合开始前调用）。
     /// 返回 prev_quit：true 表示旧轮遗留退出请求，应退出程序。
     pub fn advance_epoch(&self) -> bool {
-        // TODO: 锁内：epoch+=1；records 长度 >=2 → prev_quit=true；
-        //       清空 records；返回（含原）prev_quit
-        todo!()
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state.epoch = state.epoch.wrapping_add(1);
+        let quit = state.prev_quit || state.records.len() >= 2;
+        state.prev_quit = quit;
+        state.records.clear();
+        quit
     }
 
     /// 测试/集成注入：直接追加一次 Ctrl-C 记录（等效信号线程；tests/ 集成可用，
     /// 非 cfg(test)——单元测试与集成测试都需要它驱动取消/退出路径）。
-    pub fn inject(&self) {
-        // TODO: 锁内 records.push(len+1)
-        todo!()
+    pub fn inject(&self) -> u32 {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let n = state.records.len() as u32 + 1;
+        state.records.push(n);
+        n
     }
+}
+
+/// 信号处理器：只写一个字节，不取锁、不分配。
+extern "C" fn on_sigint(_sig: libc::c_int) {
+    let fd = WRITE_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = [1u8];
+        // SAFETY: fd 在进程生命周期内保持有效；write 是 async-signal-safe 的。
+        unsafe {
+            let _ = libc::write(fd, byte.as_ptr().cast(), 1);
+        }
+    }
+}
+
+fn last_os_error() -> String {
+    std::io::Error::last_os_error().to_string()
 }
 
 /// 启动信号基础设施：装 SIGINT 处理器（self-pipe）+ 起专用信号线程。
 /// 返回 Cancel 的 Arc。失败 = exit 1 级内部错误。
 pub fn init() -> Result<Arc<Cancel>, String> {
-    // TODO: pipe2(O_NONBLOCK)；sigaction SIGINT → 处理器写 1 字节（不取锁）
-    // TODO: spawn 专用线程：阻塞读 self-pipe → 每字节锁内追加一条记录
-    // TODO: 信号线程与 advance_epoch 在同一锁内串行化（结构上已保证）
-    todo!()
+    if let Some(cancel) = CANCEL.get() {
+        return Ok(cancel.clone());
+    }
+
+    let mut fds = [0i32; 2];
+    // SAFETY: fds 指向合法的两个 i32。
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+        return Err(format!("创建信号管道失败：{}", last_os_error()));
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+
+    // 写端非阻塞：管道满时处理器直接丢弃（不能阻塞在信号上下文）。
+    // SAFETY: write_fd 是刚创建的有效 fd。
+    unsafe {
+        let flags = libc::fcntl(write_fd, libc::F_GETFL);
+        if flags == -1 || libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == -1 {
+            libc::close(read_fd);
+            libc::close(write_fd);
+            return Err(format!("设置信号管道非阻塞失败：{}", last_os_error()));
+        }
+    }
+
+    WRITE_FD.store(write_fd, Ordering::SeqCst);
+
+    // SAFETY: 零初始化 sigaction 后逐字段赋值；handler 为 extern "C"。
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_sigint as *const () as libc::sighandler_t;
+        // 不设 SA_RESTART：确认界面的 read 需要被 SIGINT 打断返回 EINTR。
+        action.sa_flags = 0;
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) == -1 {
+            libc::close(read_fd);
+            libc::close(write_fd);
+            WRITE_FD.store(-1, Ordering::SeqCst);
+            return Err(format!("安装 SIGINT 处理器失败：{}", last_os_error()));
+        }
+    }
+
+    let cancel = Cancel::new();
+    let thread_cancel = cancel.clone();
+    std::thread::Builder::new()
+        .name("rho-sigint".into())
+        .spawn(move || {
+            let mut buf = [0u8; 64];
+            loop {
+                // SAFETY: read_fd 有效，buf 是合法可写缓冲区。
+                let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n > 0 {
+                    for _ in 0..n {
+                        thread_cancel.inject();
+                    }
+                } else if n == 0 {
+                    break;
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+            }
+            // SAFETY: 信号线程结束，关闭读端。
+            unsafe {
+                libc::close(read_fd);
+            }
+        })
+        .map_err(|e| format!("启动信号线程失败：{e}"))?;
+
+    match CANCEL.set(cancel.clone()) {
+        Ok(()) => Ok(cancel),
+        Err(_) => Ok(CANCEL.get().expect("signal cancel initialized").clone()),
+    }
 }
 
 /// 对整个进程组发信号的辅助（tools.rs 复用）。
 /// kill 语义：SIGTERM → 2s → 无论直接子进程状态，对 pgid 发 SIGKILL。
 pub fn kill_pg(pgid: i32, sig: libc::c_int) -> Result<(), String> {
-    // TODO: libc::kill(-pgid, sig)
-    let _ = (pgid, sig);
-    todo!()
+    if pgid <= 0 {
+        return Err(format!("非法的进程组 id：{pgid}"));
+    }
+    // SAFETY: 负 pid 表示向进程组发信号。
+    if unsafe { libc::kill(-pgid, sig) } == -1 {
+        let err = std::io::Error::last_os_error();
+        // 进程组已不存在不算错误。
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(format!("向进程组 {pgid} 发信号失败：{err}"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_is_cancel_second_is_quit() {
+        let c = Cancel::new();
+        assert_eq!(c.state(), SignalState::None);
+        c.inject();
+        assert_eq!(c.state(), SignalState::Cancel);
+        c.inject();
+        assert_eq!(c.state(), SignalState::Quit);
+    }
+
+    #[test]
+    fn advance_carries_unconsumed_quit() {
+        let c = Cancel::new();
+        c.inject();
+        c.inject();
+        assert!(c.advance_epoch());
+        assert_eq!(c.state(), SignalState::Quit);
+    }
+
+    #[test]
+    fn advance_discards_single_cancel() {
+        let c = Cancel::new();
+        c.inject();
+        assert!(!c.advance_epoch());
+        assert_eq!(c.state(), SignalState::None);
+    }
 }

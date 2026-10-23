@@ -42,14 +42,14 @@ src/
   sse.rs         SSE 行解析器（纯函数，可夹具测试）
   tools.rs       bash 执行：进程组 spawn、超时升级、双 drain 管道读取、
                  输出截断、allowlist + 元字符判定、确认
-  render.rs      渲染：思考暗淡色、正文原样、工具行、截断标注
+  render.rs      纯格式化函数：思考暗淡色、正文原样、工具行、截断标注
                  （无颜色开关，暗色终端下暗淡色仍可用 ANSI 固定转义）
   repl.rs        斜杠命令、Ctrl-C 语义；循环本体依赖 Ui trait
   term.rs        终端信号处理（SIGINT、进程组信号）
-  ui.rs          Ui trait + 生产实现（rustyline + 终端 y/N）
+  ui.rs          Ui trait + 生产实现（rustyline + 终端 y/N）；负责终端输出
 ```
 
-依赖方向单向向下：`repl → chat → provider → sse`；`Msg`/`ToolCall` 等共享消息类型放在 `chat.rs`，`provider` 只引用不反向输出 `chat` 内部状态（`StreamEvent::Final(Box<Msg>)` 属跨层载荷，作为例外允许 provider → chat 的类型引用；若希望严格无环，可把 `Msg` 提入独立 `msg.rs`，两者等价，实现期定）。`config` 被所有层读，但不反向依赖任何层。`render` 只被 `repl`/`chat` 调用。
+依赖方向单向向下：`repl → chat → provider → sse`；`Msg`/`ToolCall` 等共享消息类型放在 `chat.rs`，`provider` 只引用不反向输出 `chat` 内部状态（`StreamEvent::Final(Box<Msg>)` 属跨层载荷，作为例外允许 provider → chat 的类型引用；若希望严格无环，可把 `Msg` 提入独立 `msg.rs`，两者等价，实现期定）。`config` 被所有层读，但不反向依赖任何层。`render` 只提供不依赖 `ui` 的纯格式化函数，由 `repl`/`chat`/`ui` 调用；`ui` 负责把格式化结果写入终端。
 
 ## 三、关键数据类型
 

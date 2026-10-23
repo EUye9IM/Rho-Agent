@@ -7,6 +7,8 @@ pub enum RenderEvent {
     ReasoningDelta(String),
     /// 正文增量（原样输出，不渲染 markdown）
     TextDelta(String),
+    /// 思考结束、正文开始之间的折行
+    LineBreak,
     /// 工具调用行：`→ bash: <命令>`
     ToolCall(String),
     /// 工具结果（缩进显示，截断处标注省略字节数）
@@ -27,9 +29,14 @@ pub fn tool_call_line(cmd: &str) -> String {
 
 /// 工具结果缩进显示。
 pub fn tool_result_block(content: &str) -> String {
-    // TODO: 逐行缩进两空格
-    let _ = content;
-    todo!()
+    if content.is_empty() {
+        return "  （无输出）".to_string();
+    }
+    content
+        .lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -44,5 +51,10 @@ mod tests {
     #[test]
     fn tool_call_line_format() {
         assert_eq!(tool_call_line("ls"), "→ bash: ls");
+    }
+
+    #[test]
+    fn result_block_indents_each_line() {
+        assert_eq!(tool_result_block("a\nb"), "  a\n  b");
     }
 }
