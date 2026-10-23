@@ -1,10 +1,11 @@
 //! SSE 行解析器（纯函数，可夹具测试）。见 design.md 六节。
 
 /// 有状态的 SSE 组装器：跨网络分片累积行，产出完整 `data:` 载荷。
+/// 字节级缓冲（Vec<u8>）：TCP 分片可能落在 UTF-8 码点/行中间。
 #[derive(Debug, Default)]
 pub struct SseParser {
-    /// 行缓冲（TCP 分片可能把一行拆多次 read）
-    buf: String,
+    /// 行缓冲（原始字节；只在完整行边界做 UTF-8 转换）
+    buf: Vec<u8>,
 }
 
 impl SseParser {
@@ -15,7 +16,8 @@ impl SseParser {
     /// 喂入一段原始字节（可能是半个 UTF-8 字符/半行）。
     /// 返回本次新完成的 `data:` 载荷列表（注释/空行/非 data 行忽略；CRLF 兼容）。
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
-        // TODO: 追加到 buf（注意 UTF-8 边界）；按 \n 切行；行尾 \r 剥离；
+        // TODO: 追加到 buf；按 b'\n' 切行；行尾 b'\r' 剥离；
+        //       完整行才做 UTF-8 转换（非法序列替换字符或按错误收尾）；
         //       "data: X" / "data:X" → 收集；"data: [DONE]" 作为普通载荷返回由上层识别；
         //       多条 data: 属同一事件时拼接（OpenAI 每事件单条 data，可简化）
         let _ = bytes;

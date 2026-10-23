@@ -3,41 +3,53 @@
 mod expand;
 mod validate;
 
+use serde::Deserialize;
 use std::collections::BTreeMap;
 
 pub use expand::expand_headers;
 pub use validate::{validate, ValidationError};
 
-/// 顶层配置（preserve_order 语义靠 Vec 承载声明顺序，HashMap 会退化成字母序）。
-#[derive(Debug, Clone, Default)]
+/// 有序 map：IndexMap 保插入序（与 toml preserve_order 同底座），
+/// 且 serde 原生支持反序列化任意值类型（toml::map::Map 只对 Value 实现 trait）。
+pub type OrderedMap<V> = indexmap::IndexMap<String, V>;
+
+/// 顶层配置。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
     pub system_prompt: Option<String>,
     pub max_tool_steps: Option<u32>,
-    /// (id, provider) — 声明顺序保留
-    pub providers: Vec<(String, Provider)>,
-    /// (id, model) — 声明顺序保留；id 全局唯一且带 provider 前缀
-    pub models: Vec<(String, Model)>,
+    pub providers: OrderedMap<Provider>,
+    pub models: OrderedMap<Model>,
+    #[serde(default)]
     pub tools: ToolsConfig,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Provider {
     pub protocol: String, // v1 只实现 "openai_chat"
     pub base_url: String,
+    #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
     pub compat: CompatConfig,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// header 表（值含 ${VAR}，在选择供应商时展开）
-    pub headers: Vec<(String, String)>,
+    #[serde(default)]
+    pub headers: OrderedMap<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompatConfig {
+    #[serde(default)]
     pub echo_reasoning: bool,
 }
 
@@ -47,19 +59,24 @@ impl Default for CompatConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Model {
     /// 上游 model 字段：默认取 id 第一个 '/' 之后的部分，api_model 可覆盖
     pub api_model: Option<String>,
     pub context_window: u64,
     pub max_output: u64,
+    #[serde(default)]
     pub thinking_default: Option<String>,
     /// (档位名, JSON 片段) — 顶层合并进请求 body
-    pub thinking: Vec<(String, serde_json::Value)>,
+    #[serde(default)]
+    pub thinking: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolsConfig {
+    #[serde(default)]
     pub bash: BashToolConfig,
 }
 
@@ -69,16 +86,28 @@ impl Default for ToolsConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BashToolConfig {
+    #[serde(default)]
     pub allow: Vec<String>,
-    pub timeout_seconds: u64,   // 默认 120
-    pub max_output_bytes: usize, // 默认 16384
+    #[serde(default = "default_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_max_output")]
+    pub max_output_bytes: usize,
+}
+
+fn default_timeout() -> u64 {
+    120
+}
+
+fn default_max_output() -> usize {
+    16384
 }
 
 impl Default for BashToolConfig {
     fn default() -> Self {
-        Self { allow: Vec::new(), timeout_seconds: 120, max_output_bytes: 16384 }
+        Self { allow: Vec::new(), timeout_seconds: default_timeout(), max_output_bytes: default_max_output() }
     }
 }
 
@@ -101,7 +130,7 @@ pub fn load(path: &Option<String>) -> Result<Config, String> {
 }
 
 fn load_file(_path: &str) -> Result<Config, String> {
-    // TODO: 读文件 → toml 解析 → 严格反序列化（未知字段硬报错，带 TOML 位置）
+    // TODO: 读文件 → toml 解析 → 严格反序列化（deny_unknown_fields + 位置定位）
     //       → validate() 收集全部错误一次报出
     todo!()
 }
@@ -129,13 +158,22 @@ pub fn resolve_selection(
     todo!()
 }
 
-// 用于查找的辅助（供 resolve_selection / REPL 切换复用）
+/// 查找辅助（供 resolve_selection / REPL 切换复用）。
 pub fn find_provider<'a>(cfg: &'a Config, id: &str) -> Option<&'a Provider> {
-    cfg.providers.iter().find(|(pid, _)| pid == id).map(|(_, p)| p)
+    cfg.providers.get(id)
 }
 
 pub fn find_model<'a>(cfg: &'a Config, id: &str) -> Option<&'a Model> {
-    cfg.models.iter().find(|(mid, _)| mid == id).map(|(_, m)| m)
+    cfg.models.get(id)
+}
+
+/// 声明顺序迭代（OrderedMap 保序）。
+pub fn providers_in_order(cfg: &Config) -> impl Iterator<Item = (&String, &Provider)> {
+    cfg.providers.iter()
+}
+
+pub fn models_in_order(cfg: &Config) -> impl Iterator<Item = (&String, &Model)> {
+    cfg.models.iter()
 }
 
 #[allow(dead_code)]

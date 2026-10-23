@@ -5,7 +5,22 @@ use crate::chat::Msg;
 use crate::config::{Model, Provider};
 use serde_json::{json, Value};
 
-pub struct OpenAiChatAdapter;
+pub struct OpenAiChatAdapter {
+    /// compat 开关在构造时注入（echo_reasoning 等）
+    pub echo_reasoning: bool,
+}
+
+impl OpenAiChatAdapter {
+    pub fn new() -> Self {
+        Self { echo_reasoning: false }
+    }
+}
+
+impl Default for OpenAiChatAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ProviderAdapter for OpenAiChatAdapter {
     fn endpoint(&self, p: &Provider) -> String {

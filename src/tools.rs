@@ -24,6 +24,9 @@ pub enum BashEnd {
     Cancelled,
     /// spawn 失败（命令不存在属 bash 127，不是这里；此处是 fork/exec 层失败）
     SpawnFailed(String),
+    /// quit 已请求：工具等待循环只终止进程组，把 quit 上报 agent loop，
+    /// 不自行退出（architecture.md 五节）
+    QuitRequested,
 }
 
 /// allowlist + 元字符判定：命令与规则完全相同，或前缀后紧接空格；

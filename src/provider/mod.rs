@@ -53,19 +53,21 @@ impl TurnAcc {
     }
 }
 
-pub trait ProviderAdapter {
+/// 适配器需要跨线程进 worker：要求 Send。
+pub trait ProviderAdapter: Send {
+    /// 适配层所需的兼容性开关（如 echo_reasoning）在构造适配器时注入。
     fn endpoint(&self, p: &Provider) -> String;
     fn build_body(&self, hist: &[Msg], model: &Model, thinking: Option<&Value>) -> Value;
     fn headers(&self, p: &Provider) -> Vec<(String, String)>;
     fn parse_chunk(&self, chunk: &Value, acc: &mut TurnAcc) -> Vec<StreamEvent>;
 }
 
-/// 按 protocol 分发；v1 只实现 openai_chat，其余报"不支持"。
-pub fn adapter_for_protocol(protocol: &str) -> Box<dyn ProviderAdapter> {
+/// 按 protocol 分发；v1 只实现 openai_chat，其余报"不支持"（可展示错误，非 panic）。
+pub fn adapter_for_protocol(protocol: &str) -> Result<Box<dyn ProviderAdapter>, String> {
     match protocol {
-        "openai_chat" => Box::new(OpenAiChatAdapter),
-        // Responses / Anthropic Messages：接口预留，v1 遇到即报不支持
-        other => unimplemented!("不支持的协议族：{other}"),
+        "openai_chat" => Ok(Box::new(OpenAiChatAdapter::new())),
+        // Responses / Anthropic Messages：接口预留，v1 报不支持（exit 2 由调用方映射）
+        other => Err(format!("不支持的协议族：{other}（v1 只实现 openai_chat）")),
     }
 }
 

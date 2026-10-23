@@ -1,18 +1,11 @@
-//! rho — 轻量本地 agent REPL。
-//!
-//! 模块布局见 architecture.md 二节；依赖方向单向向下：
-//! repl → chat → provider → sse；config 被所有层读，不反向依赖。
+//! rho — 轻量本地 agent REPL。库入口见 lib.rs；本文件只做参数解析、退出码、组装启动。
 
-mod chat;
-mod config;
-mod provider;
-mod render;
-mod repl;
-mod sse;
-mod term;
-mod tools;
-mod ui;
-
+use rho::chat::Session;
+use rho::config;
+use rho::provider;
+use rho::repl::{self, ReplExit};
+use rho::term;
+use rho::ui;
 use std::process::ExitCode;
 
 /// CLI 参数（手写解析，不用 clap）。见 design.md 四节。
@@ -61,6 +54,23 @@ fn run(args: Args) -> u8 {
         }
     };
 
+    // --thinking 非法（不属于所选模型档位）在构造 Session 前校验（exit 2）。
+    let thinking = match resolve_thinking(&cfg, &selection, args.thinking.as_deref()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return EXIT_USAGE;
+        }
+    };
+
+    let adapter = match provider::adapter_for_protocol(&selection.provider.protocol) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}");
+            return EXIT_USAGE;
+        }
+    };
+
     let mut term_ui = match ui::TermUi::new() {
         Ok(u) => u,
         Err(e) => {
@@ -78,17 +88,28 @@ fn run(args: Args) -> u8 {
         }
     };
 
-    let session = chat::Session::new(cfg, selection, args.yes, args.thinking);
+    let session = Session::new(cfg, selection, adapter, args.yes, thinking);
     match repl::run(&mut term_ui, session, &cancel) {
-        Ok(()) | Err(repl::ReplExit::Quit) => EXIT_OK,
-        Err(repl::ReplExit::Fatal(e)) => {
+        Ok(()) | Err(ReplExit::Quit) => EXIT_OK,
+        Err(ReplExit::Fatal(e)) => {
             eprintln!("内部错误：{e}");
             EXIT_INTERNAL
         }
     }
 }
 
-/// 手写参数解析：支持 `--flag value` 与 `--flag=value`；未知参数/重复 flag 报错。
+/// 解析 --thinking：None → 所选模型 thinking_default；Some(档位) → 须属该模型档位表。
+fn resolve_thinking(
+    cfg: &config::Config,
+    sel: &config::Selection,
+    cli: Option<&str>,
+) -> Result<Option<String>, String> {
+    // TODO: 有 cli 时校验属所选模型 thinking 档位；无 thinking 表的模型不接受非空 --thinking
+    let _ = (cfg, sel, cli);
+    todo!()
+}
+
+/// 手写参数解析：支持 `--flag value` 与 `--flag=value`；未知参数/重复 flag/带值的 --yes 报错。
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     let mut args = Args { config: None, provider: None, model: None, thinking: None, yes: false };
     let mut it = argv.into_iter().peekable();
@@ -120,6 +141,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                 args.thinking = Some(take_value()?);
             }
             "--yes" => {
+                if inline.is_some() { return Err("--yes 不接受值".into()); }
                 if args.yes { return Err("--yes 重复".into()); }
                 args.yes = true;
             }
@@ -154,5 +176,12 @@ mod tests {
     #[test]
     fn parse_rejects_duplicate() {
         assert!(parse_args(["--yes".into(), "--yes".into()].to_vec()).is_err());
+        assert!(parse_args(["--provider".into(), "a".into(), "--provider".into(), "b".into()].to_vec()).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_yes_with_value() {
+        assert!(parse_args(["--yes=false".into()].to_vec()).is_err());
     }
 }
+

@@ -1,11 +1,10 @@
 //! 内部消息模型与 agent 工具循环。见 architecture.md 三/四节。
 
 use crate::config::{Config, Selection};
-use crate::provider::{ProviderAdapter, StreamEvent};
+use crate::provider::ProviderAdapter;
 use crate::render::RenderEvent;
 use crate::term::Cancel;
-use crate::tools;
-use crate::ui::{ConfirmOutcome, Ui};
+use crate::ui::Ui;
 
 /// 与协议解耦的消息模型（适配层负责映射）。
 #[derive(Debug, Clone)]
@@ -31,10 +30,11 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-/// 会话状态：历史 + 当前选择 + 工具步数。
+/// 会话状态：历史 + 当前选择 + 适配器 + 工具步数。
 pub struct Session {
     pub cfg: Config,
     pub selection: Selection,
+    pub adapter: Box<dyn ProviderAdapter>,
     pub yes: bool,
     pub thinking: Option<String>,
     pub history: Vec<Msg>,
@@ -60,11 +60,15 @@ pub enum TurnEnd {
 }
 
 impl Session {
-    pub fn new(cfg: Config, selection: Selection, yes: bool, cli_thinking: Option<String>) -> Self {
-        // TODO: 校验 cli_thinking 属所选模型档位（非法则由 main 按 exit 2 处理）；
-        //       缺省取 selection.thinking
-        let _ = cli_thinking;
-        Self { cfg, selection, yes, thinking: None, history: Vec::new(), steps: 0 }
+    /// thinking 已在 main 层校验（resolve_thinking，非法 exit 2）。
+    pub fn new(
+        cfg: Config,
+        selection: Selection,
+        adapter: Box<dyn ProviderAdapter>,
+        yes: bool,
+        thinking: Option<String>,
+    ) -> Self {
+        Self { cfg, selection, adapter, yes, thinking, history: Vec::new(), steps: 0 }
     }
 
     /// `/clear`：清空历史（steps 也归零）。
@@ -76,7 +80,7 @@ impl Session {
     /// agent 工具循环（architecture.md 四节）。
     pub fn turn(&mut self, ui: &mut dyn Ui, cancel: &Cancel, input: &str) -> ChatResult<TurnEnd> {
         // TODO: push User msg → loop {
-        //   build_body → worker 线程流式请求（mpsc 事件）
+        //   build_body → worker 线程流式请求（mpsc 事件；adapter 按值传入 worker）
         //   主线程 recv_timeout 短轮询，逐事件先查 cancel 再处理：
         //     Delta → 渲染；Done → 记录提交资格；Final → 退出接收
         //     Error / Disconnected → 展示，回合结束（保留已完成历史）
@@ -145,6 +149,6 @@ fn emit(ui: &mut dyn Ui, ev: RenderEvent) {
 
 /// 空适配器占位（provider 分发在 provider/mod.rs）。
 #[allow(dead_code)]
-fn adapter_for(_selection: &Selection) -> Box<dyn ProviderAdapter> {
-    crate::provider::adapter_for_protocol("openai_chat")
+fn adapter_for(_selection: &Selection) -> Result<Box<dyn ProviderAdapter>, String> {
+    crate::provider::adapter_for_protocol(&_selection.provider.protocol)
 }
