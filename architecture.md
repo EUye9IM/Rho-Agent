@@ -85,7 +85,8 @@ trait ProviderAdapter {
 
 ```rust
 // ui.rs — 用户交互抽象，repl / chat / tools 依赖此接口而非终端
-// Ui 不承载退出语义：退出唯一由 REPL 层判定（解析 /exit、Eof、空行 Ctrl-C）
+// Ui 不承载退出语义：REPL 层的 /exit、Eof、空行 Ctrl-C 映射为退出；
+// 活动操作中信号路径的 quit 由 agent loop 检测（见五）
 
 trait Ui {
     fn read_line(&mut self) -> ReadOutcome;                       // REPL 输入 / 斜杠命令
@@ -107,7 +108,7 @@ enum ConfirmOutcome {
 - 退出语义：`read_line` 只返回 `Line`/`Interrupted`/`Eof`；`/exit` 作为普通 `Line` 由 REPL 层解析为退出（斜杠命令解析归 repl.rs，Ui 不识别命令）。空行/编辑中 Ctrl-C 返回 `Interrupted`，由 REPL 层按 `line_empty` 决定退出或清行；`ConfirmOutcome::Cancelled` 是确认界面的 Ctrl-C，取消整轮（若为当前轮第二次则收尾后退出，见信号计数）。
 - **Ctrl-C 的唯一记录生产者是专用信号线程**（confirm 场景）：终端保持 ISIG，Ctrl-C 产生 SIGINT，经 self-pipe/signalfd 由信号线程在锁内追加记录；`confirm` 的可中断读取由 SIGINT 唤醒返回 `Cancelled`，不自行追加，无双重计数。
 - **rustyline 场景的计数豁免**：rustyline 原始模式会清除 ISIG 并安装自己的 SIGINT 处理器，Ctrl-C 不产生 SIGINT 而由 rustyline 返回 `Interrupted`——该路径**不经过**信号线程记录，直接由 REPL 层处理（清行/退出），也不追加记录。即：REPL 输入态的 Ctrl-C 与活动操作（流式/工具/确认）中的 Ctrl-C 是**两套互不干扰的路径**：前者走 rustyline 按键、后者走 SIGINT 计数。两路径不会同时处于活动状态，不产生双重计数。
-- **Ui trait 不含退出类型**：退出由 REPL 层判定（`/exit`、`Eof`、空行 Ctrl-C），`Err(Quit)` 走 REPL→agent loop 的内部错误通道（`Result<T, Quit>`），不经 Ui 签名；agent loop 不自己判断第几次 Ctrl-C。
+- **Ui trait 不含退出类型**：退出有两条路径——① REPL 层判定（`/exit`、`Eof`、空行 Ctrl-C），以 `Result<T, Quit>` 内部错误通道传给 agent loop，agent loop 按占位规则收尾后上抛退出；② 活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测，同样按占位规则收尾、完成工具进程清理后退出。两条路径殊途同归：终止前必完成剩余调用的占位补齐与进程组清理。
 
 - 生产实现 `TermUi`：rustyline 后端；`confirm` 用可中断读取（保持 ISIG，Ctrl-C 产生 SIGINT 唤醒读取并返回 `Cancelled`；配合信号线程记录，无双重计数）。`stdin 非 TTY 拒绝启动`的检查在 `TermUi::new` 里做，不进 main 流程。
 - 测试实现 `ScriptedUi`：预排输入队列 + 预排确认结果 + 收集渲染事件，驱动 `repl → agent loop → tools` 全链路，无网络无 TTY。
@@ -164,7 +165,7 @@ loop {
 - **限额逐个前置检查**：在判定每个调用前检查，不执行满批后才停；**所有模型发起的调用都计数**（含参数解析失败/未知工具名/spawn 失败的调用），防止错误调用无限循环。
 - **历史即上下文**：`History` 原样序列化进请求，无预算管理；窗口超限错误原样展示并提示 `/clear`。
 - **reasoning 不回传**：序列化时丢弃 `reasoning`，除非 `echo_reasoning = true`（适配层职责）。
-- **退出由 REPL 层承载**：REPL 将 `/exit` 命令、空行 Ctrl-C、`Eof`（Ctrl-D）映射为退出；`confirm` 的取消返回 `Cancelled`；无 Ui 阻塞点处（工具执行/清理期）由全局信号计数承接。
+- **退出由两条路径殊途同归**：REPL 层将 `/exit` 命令、空行 Ctrl-C、`Eof`（Ctrl-D）映射为退出（经内部通道传 agent loop）；活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测。两路径均先完成剩余调用占位补齐与工具进程清理再退出。
 
 ## 五、线程与取消（term.rs / repl.rs）
 
