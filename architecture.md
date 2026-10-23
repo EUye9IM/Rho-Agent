@@ -48,7 +48,7 @@ src/
   ui.rs          Ui trait + 生产实现（rustyline + 终端 y/N）
 ```
 
-依赖方向单向向下：`repl → chat → provider → sse`；`config` 被所有层读，但不反向依赖任何层。`render` 只被 `repl`/`chat` 调用。
+依赖方向单向向下：`repl → chat → provider → sse`；`Msg`/`ToolCall` 等共享消息类型放在 `chat.rs`，`provider` 只引用不反向输出 `chat` 内部状态（`StreamEvent::Final(Box<Msg>)` 属跨层载荷，作为例外允许 provider → chat 的类型引用；若希望严格无环，可把 `Msg` 提入独立 `msg.rs`，两者等价，实现期定）。`config` 被所有层读，但不反向依赖任何层。`render` 只被 `repl`/`chat` 调用。
 
 ## 三、关键数据类型
 
@@ -101,14 +101,15 @@ enum ReadOutcome {
 enum ConfirmOutcome {
     Yes,        // 执行
     No,         // 拒绝，喂回模型
-    Cancelled,  // 第一次 Ctrl-C：取消当前回合（agent loop 丢 TurnAcc，回 REPL）
+    Cancelled,  // Ctrl-C：取消当前回合，剩余调用按占位规则收尾，回 REPL
+               //（确认界面内退出由调用前的取消检查承接，不再承诺确认内二次 Ctrl-C）
 }
 ```
 
-- 退出语义统一走 `UiResult`：`read_line` 的 `Err` 覆盖空闲态/空行 Ctrl-C 与 `/exit`；`confirm` 的 `Err` 是确认界面第二次 Ctrl-C；`ConfirmOutcome::Cancelled` 是确认界面第一次 Ctrl-C，取消整轮。
+- 退出语义统一走 `UiResult`：`read_line` 的 `Err` 覆盖空闲态/空行 Ctrl-C 与 `/exit`；`ConfirmOutcome::Cancelled` 是确认界面的 Ctrl-C（全局计数器记一次，取消整轮；若此次 Ctrl-C 已是当前轮第二次，调用方在取消收尾时发现 quit 走退出路径）。确认界面不再单独承诺“第二次 Ctrl-C 即退”——退出统一由全局信号计数判定，避免与取消检查双重计数。
 - agent loop 收到 `Err(Quit)` 直接终止回合，不自己判断第几次 Ctrl-C。
 
-- 生产实现 `TermUi`：rustyline 后端；`confirm` 用可中断的终端事件读取（原始模式按键级读取，非阻塞式行读取），使 Ctrl-C 能及时返回 `Cancelled`/`Err(Quit)`。`stdin 非 TTY 拒绝启动`的检查在 `TermUi::new` 里做，不进 main 流程。
+- 生产实现 `TermUi`：rustyline 后端；`confirm` 用可中断的终端事件读取（原始模式按键级读取，非阻塞式行读取），使 Ctrl-C 能及时返回 `Cancelled`。`stdin 非 TTY 拒绝启动`的检查在 `TermUi::new` 里做，不进 main 流程。
 - 测试实现 `ScriptedUi`：预排输入队列 + 预排确认结果 + 收集渲染事件，驱动 `repl → agent loop → tools` 全链路，无网络无 TTY。
 
 - `TurnAcc`（worker 线程的每流累加器）：按 `index` 组装多段 `tool_calls`、累积 text/reasoning；流正常结束时组装为完整 Assistant 消息经 `Final` 交付主线程。取消时主线程 drop Receiver，累加器随 worker 结束一起丢弃。
@@ -163,7 +164,7 @@ loop {
 - **限额逐个前置检查**：在判定每个调用前检查，不执行满批后才停；**所有模型发起的调用都计数**（含参数解析失败/未知工具名/spawn 失败的调用），防止错误调用无限循环。
 - **历史即上下文**：`History` 原样序列化进请求，无预算管理；窗口超限错误原样展示并提示 `/clear`。
 - **reasoning 不回传**：序列化时丢弃 `reasoning`，除非 `echo_reasoning = true`（适配层职责）。
-- **退出由 Ui 统一承载**：`read_line`/`confirm` 返回 `Err(Quit)`；空闲态/空行 Ctrl-C 与 `/exit` 同路径；无 Ui 阻塞点处（工具执行/清理期）由 quit 标志承接。
+- **退出由 Ui 统一承载**：`read_line` 返回 `Err(Quit)`（空闲态/空行 Ctrl-C 与 `/exit` 同路径）；`confirm` 的取消返回 `Cancelled`，若该 Ctrl-C 是当前轮第二次则取消收尾后走退出；无 Ui 阻塞点处（工具执行/清理期）由全局信号计数承接。
 
 ## 五、线程与取消（term.rs / repl.rs）
 
@@ -178,7 +179,7 @@ struct State { epoch: u64, records: Vec<u32 /*第几次 Ctrl-C*/>, prev_quit: bo
 - 主线程查询：锁内看 `prev_quit`（则退出）或当前轮记录——第 1 次为 cancel，第 2 次及以上为 quit；旧轮非 quit 记录作废。
 - 消费点：渲染/接收循环（`recv_timeout` 短轮询，超时即查；**成功收到事件也先查再处理**）、工具等待循环（触发进程组升级终止；发现 quit 则终止后退出程序）、agent loop（按占位规则收尾回 REPL；发现 quit 则退出程序）。工具执行/清理期间无 Ui 阻塞点，第二次 Ctrl-C 的退出由当前轮信号记录承接。
 - 流线程取消：主线程 drop Receiver → worker 下一次 `send` 报错即退出循环（无需继续排空 HTTP 流，不主动 close 连接）。channel 为无界 `mpsc`：无界使发送永不阻塞，配合 drop-Receiver 早退语义最简单。
-- 工具执行与进程组终止：`setsid` 建进程组；stdout/stderr 各起一个 drain 线程并行读取。截断缓冲为两段结构：头部前缀（上限前半）+ 滑动尾部窗口（上限后半），中间字节计数丢弃，与 design 的头尾保留语义一致。drain 线程自管理生命周期：`waitpid` 观察到 bash 退出后，drain 进入收尾阶段（短超时上限内继续读取管道中已缓冲的剩余数据，防止后台进程持续写入），超时或 EOF 即退出线程并关闭自己持有的读端——主线程不持有、不 drop 读端，无需 detach 语义（后台进程继续写产生的写满/EPIPE 与本进程无关）。终止升级不依赖 bash 单体退出状态：SIGTERM 发 pgid → 2s → 无论直接子进程状态如何，对 pgid 发 SIGKILL → 回收 bash（直接子进程回收条件与进程组清理条件分离）。
+- 工具执行与进程组终止：`setsid` 建进程组；stdout/stderr 各起一个 drain 线程并行读取。截断缓冲为两段结构：头部前缀（上限前半）+ 滑动尾部窗口（上限后半），中间字节计数丢弃，与 design 的头尾保留语义一致。**主线程是唯一 reaper**：`waitpid` 只由主线程执行，退出状态存入共享标志；drain 线程不调 `waitpid`，只轮询共享退出标志，观察到退出后进入收尾阶段（短超时上限内继续读取管道中已缓冲的剩余数据，防止后台进程持续写入），超时或 EOF 即退出线程并关闭自己持有的读端——主线程不持有读端、不做 detach（后台进程继续写产生的写满/EPIPE 与本进程无关）。终止升级不依赖 bash 单体退出状态：SIGTERM 发 pgid → 2s → 无论直接子进程状态如何，对 pgid 发 SIGKILL → 主线程回收 bash（直接子进程回收条件与进程组清理条件分离）。
 - quit（当前轮第二次 Ctrl-C）被消费即走退出路径；切轮时旧轮未消费的 quit 结转为 `prev_quit`，下一轮查询时仍触发退出。
 
 ## 六、错误与退出码
