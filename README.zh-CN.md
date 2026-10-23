@@ -4,7 +4,7 @@
 
 [English](README.md) | **简体中文**
 
-`rho` 是一个跑在终端里的轻量本地 agent。单 crate、单静态二进制、不引入 async 运行时，面向资源受限的 Linux 设备。你在 REPL 里对话，它从兼容 OpenAI Chat Completions 的供应商（默认 DeepSeek）流式返回结果，并能通过 `bash` 工具执行命令——执行前要过 allowlist 判定和人工确认。
+`rho` 是一个跑在终端里的轻量本地 agent。单 crate、单二进制（分发建议使用 musl 静态构建）、不引入 async 运行时，面向资源受限的 Linux 设备。你在 REPL 里对话，它从兼容 OpenAI Chat Completions 的供应商（默认 DeepSeek）流式返回结果，并能通过 `bash` 工具执行命令——执行前要过 allowlist 判定和人工确认。
 
 设计文档见 [design.md](design.md) 与 [architecture.md](architecture.md)。
 
@@ -15,12 +15,12 @@
 - **流式 + 思考可见** —— 正文逐块输出；`reasoning_content` 以暗淡色实时展示，且**默认不回传**（仅当供应商配置 `compat.echo_reasoning = true` 时随历史回传）。
 - **只有一个工具：`bash`** —— 前台执行 `bash -c <命令>`，无持久 shell，单次超时后按进程组逐级终止。
 - **可控的 Ctrl-C** —— 第一次取消当前流式/工具/确认，第二次退出；对话历史在任何时刻都保持协议合法（工具调用必有对应结果）。
-- **严格配置校验** —— 未知字段、悬空引用、缺失必填字段一律硬报错并指出位置，退出码 2。
+- **严格配置校验** —— 未知字段、悬空引用、缺失必填字段一律硬报错并给出配置路径（TOML 语法错误另带行号），退出码 2。
 
 ## 环境要求
 
 - Linux：`x86_64`、`aarch64` 或 `armv7`（建议分发 musl 静态构建）。不支持 Windows / macOS。
-- 构建需要 Rust 1.75+（MSRV）。
+- 构建需要 Rust 1.75+（MSRV）。CI 会同时测试 1.75 与 stable。
 - 需要交互式 TTY：stdin 非 TTY 时拒绝启动（退出码 2），不提供管道输入模式。
 
 ## 构建
@@ -35,7 +35,13 @@ cargo build --release --locked
 ```sh
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --locked --target x86_64-unknown-linux-musl
-# aarch64-unknown-linux-musl、armv7-unknown-linux-musleabihf 同理
+
+# aarch64 / armv7 需先安装 target 和对应的 cross linker/toolchain
+# （如 aarch64-linux-gnu-gcc、arm-linux-gnueabihf-gcc），然后执行同样的命令：
+rustup target add aarch64-unknown-linux-musl
+cargo build --release --locked --target aarch64-unknown-linux-musl
+rustup target add armv7-unknown-linux-musleabihf
+cargo build --release --locked --target armv7-unknown-linux-musleabihf
 ```
 
 ## 使用
@@ -68,7 +74,7 @@ rho --yes            # 自动放行所有 bash 调用
 | `--thinking <level>` | 初始思考档位（须属于所选模型）。 |
 | `--yes` | 跳过所有 `bash` 确认。 |
 
-配置只认 `--config`：不读环境变量、不做默认路径发现。会话工作目录恒为进程启动目录，全程不可修改。
+用户配置只认 `--config`，未提供时使用内置配置；不读环境变量配置路径、不做默认路径发现。环境变量只用于 `${VAR}` header 展开。会话工作目录恒为进程启动目录，全程不可修改。
 
 ### REPL 命令
 
@@ -76,12 +82,12 @@ rho --yes            # 自动放行所有 bash 调用
 |---|---|
 | `/model [id]` | 切换模型；不带参数时列出当前供应商的模型并标注当前值。 |
 | `/provider [id]` | 切换供应商；不带参数时列出全部供应商（不可用者标注缺失变量）。 |
-| `/thinking [level]` | 切换思考档位；模型未声明档位时不显示该命令。 |
-| `/clear` | 清空对话历史。 |
+| `/thinking [level]` | 切换思考档位；模型未声明档位时从 `/help` 中省略该命令。 |
+| `/clear` | 重置为配置的 `system_prompt`（未配置则为空）。 |
 | `/help` | 显示帮助。 |
 | `/exit` | 退出（Ctrl-D、空行 Ctrl-C 同样正常退出）。 |
 
-切换只影响后续请求，不重放历史。若 `/provider` 切换后当前模型不属于新供应商，模型重置为该供应商声明顺序第一个。
+切换只影响后续请求，不重放历史。若 `/provider` 切换后当前模型不属于新供应商，模型重置为该供应商声明顺序第一个，thinking 重置为新模型的 `thinking_default`。
 
 ## 配置
 
@@ -125,12 +131,12 @@ max_output_bytes = 16384
 
 - 模型 id 全局唯一且必须带供应商前缀（`deepseek/deepseek-v4-pro`），前缀须对应已声明的供应商；上游 `model` 字段默认取第一个 `/` 之后的部分。
 - 认证 header 中的 `${VAR}` 在选择供应商时逐个展开：变量缺失只让该供应商不可用，不影响其他供应商——除非该供应商是被显式指定的。
-- 思考档位的值是任意 JSON 片段，请求时顶层合并进 body；档位名由配置自定义。
-- 校验严格：未知字段、悬空引用、缺失必填字段直接拒绝启动（退出码 2，带 TOML 位置）。
+- 思考档位的值是 JSON 对象片段，请求时顶层合并进 body；档位名由配置自定义。
+- 校验严格：未知字段、悬空引用、缺失必填字段直接拒绝启动（退出码 2，并给出配置路径；TOML 语法错误另带行号）。
 
 ## `bash` 工具与安全模型
 
-`rho` 前台执行 `bash -c <命令>`，两次调用之间没有任何关联（无共享 cwd、无共享环境变量、无后台状态延续）——需要先 `cd` 再执行时，写在同一行命令里。
+`rho` 前台执行 `bash -c <命令>`，两次调用之间没有持久 shell/job 状态（无共享 cwd、无共享环境变量；命令启动的后台进程不会被清理）——需要先 `cd` 再执行时，写在同一行命令里。
 
 命令**同时**满足以下两点才免确认执行：
 
@@ -141,7 +147,7 @@ max_output_bytes = 16384
 
 > **这不是沙箱。** allowlist 是原型阶段的字符串匹配简化方案，不是 shell 语法解析，也不是安全边界。子进程完全继承父进程环境变量，模型用一条 `env` 就能读出 `DEEPSEEK_API_KEY`。请以你愿意让其执行命令的用户身份运行 `rho`，不要指向你不信任其可被读取的主机。
 
-其他限制：每轮对话最多 `max_tool_steps` 次模型发起的工具调用（默认 25，拒绝/失败/参数错误的调用同样计数）；输出上限 `max_output_bytes`，保留头尾两段并标注省略字节数；超时后对整个进程组 SIGTERM，2 秒后 SIGKILL；HTTP 错误不重试；无上下文预算管理，会话过长会在上游失败，此时用 `/clear` 重开。
+其他限制：每轮对话最多 `max_tool_steps` 次模型发起的工具调用（默认 25，拒绝/失败/参数错误的调用同样计数）；stdout 与 stderr 各自上限 `max_output_bytes`，保留头尾两段并标注省略字节数；超时后对整个进程组 SIGTERM，2 秒后 SIGKILL；HTTP 错误不重试；无上下文预算管理，会话过长会在上游失败，此时用 `/clear` 重开。
 
 ## 测试
 
@@ -149,7 +155,7 @@ max_output_bytes = 16384
 cargo test --all-targets --locked
 ```
 
-CI 在每次 push 到 `master` 和每个 PR 上跑同一条命令。测试不访问网络：协议层用 `TcpListener` 手写本地 SSE mock，REPL/agent loop 用脚本化的 `Ui` 实现驱动真实主循环。`term.rs` 的信号→记录一段和真实终端交互靠手工验收。
+CI 在每次 push 到 `master` 和每个 PR 上，用 Rust 1.75（MSRV）与 stable 跑测试。测试不调用外部服务：协议层用 `TcpListener` 手写本地 SSE mock，REPL/agent loop 用脚本化的 `Ui` 实现驱动真实主循环。`term.rs` 的信号→记录一段和真实终端交互靠手工验收。
 
 ## v1 明确不做
 
@@ -157,4 +163,4 @@ CI 在每次 push 到 `master` 和每个 PR 上跑同一条命令。测试不访
 
 ## 许可
 
-MIT
+[MIT](LICENSE)

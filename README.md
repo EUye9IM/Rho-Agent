@@ -4,7 +4,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-`rho` is a small local agent that lives in your terminal. It is a single static binary, has no async runtime, and is built for resource-constrained Linux boxes. You talk to it in a REPL; it streams answers from an OpenAI Chat Completions–compatible provider (DeepSeek by default) and can run shell commands through a `bash` tool gated by an allowlist plus an explicit confirmation.
+`rho` is a small local agent that lives in your terminal. It is a single binary (musl static builds are the intended distribution form), has no async runtime, and is built for resource-constrained Linux boxes. You talk to it in a REPL; it streams answers from an OpenAI Chat Completions–compatible provider (DeepSeek by default) and can run shell commands through a `bash` tool gated by an allowlist plus an explicit confirmation.
 
 Design docs: [design.md](design.md) and [architecture.md](architecture.md) (both in Chinese).
 
@@ -15,12 +15,12 @@ Design docs: [design.md](design.md) and [architecture.md](architecture.md) (both
 - **Streaming with visible reasoning** — text streams as it arrives; `reasoning_content` is rendered dimmed and is **not** sent back to the API unless the provider sets `compat.echo_reasoning = true`.
 - **One tool: `bash`** — executed in the foreground as `bash -c <command>`, no persistent shell, per-call timeout with escalating process-group kill.
 - **Predictable Ctrl-C** — first Ctrl-C cancels the current stream/tool/confirmation, second one exits; the conversation history is always left in a protocol-valid state.
-- **Strict config validation** — unknown fields, dangling references and missing required fields fail loudly with a location, exit code 2.
+- **Strict config validation** — unknown fields, dangling references and missing required fields fail loudly with the config path (TOML syntax errors also include a line number), exit code 2.
 
 ## Requirements
 
 - Linux: `x86_64`, `aarch64` or `armv7` (musl static targets are the intended distribution form). Windows and macOS are not supported.
-- Rust 1.75 or newer (MSRV) to build.
+- Rust 1.75 or newer (MSRV) to build. CI tests both 1.75 and stable.
 - An interactive TTY — `rho` refuses to start when stdin is not a TTY (exit code 2). There is no pipe/stdin mode.
 
 ## Build
@@ -35,7 +35,14 @@ Static musl builds:
 ```sh
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --locked --target x86_64-unknown-linux-musl
-# aarch64-unknown-linux-musl and armv7-unknown-linux-musleabihf work the same way
+
+# aarch64 / armv7 use the same command after installing the target and a
+# suitable cross linker/toolchain, e.g. aarch64-linux-gnu-gcc or
+# arm-linux-gnueabihf-gcc:
+rustup target add aarch64-unknown-linux-musl
+cargo build --release --locked --target aarch64-unknown-linux-musl
+rustup target add armv7-unknown-linux-musleabihf
+cargo build --release --locked --target armv7-unknown-linux-musleabihf
 ```
 
 ## Usage
@@ -68,7 +75,7 @@ rho --yes            # auto-approve every `bash` call
 | `--thinking <level>` | Initial thinking level (must exist for the chosen model). |
 | `--yes` | Skip all `bash` confirmations. |
 
-Config comes only from `--config`: no environment-variable config, no default-path discovery. The working directory is fixed to the directory `rho` was started in.
+User config comes only from `--config`; otherwise the built-in config is used. There are no environment-variable config paths and no default-path discovery. Environment variables are only read for `${VAR}` header expansion. The working directory is fixed to the directory `rho` was started in.
 
 ### REPL commands
 
@@ -76,12 +83,12 @@ Config comes only from `--config`: no environment-variable config, no default-pa
 |---|---|
 | `/model [id]` | Switch model, or list models of the current provider with the active one marked. |
 | `/provider [id]` | Switch provider, or list providers (unavailable ones are annotated with the missing variables). |
-| `/thinking [level]` | Switch thinking level, or list levels for the current model. Hidden when the model declares none. |
-| `/clear` | Drop the conversation history. |
+| `/thinking [level]` | Switch thinking level, or list levels for the current model. Omitted from `/help` when the model declares none. |
+| `/clear` | Reset history to the configured `system_prompt` (or empty if none). |
 | `/help` | Show help. |
 | `/exit` | Quit (Ctrl-D and Ctrl-C on an empty line also exit cleanly). |
 
-Switching only affects subsequent requests; history is never replayed. If a `/provider` switch leaves the current model outside the new provider, the model resets to the first model declared by that provider.
+Switching only affects subsequent requests; history is never replayed. If a `/provider` switch leaves the current model outside the new provider, the model resets to the first model declared by that provider and thinking resets to that model's `thinking_default`.
 
 ## Configuration
 
@@ -125,12 +132,12 @@ Rules worth knowing:
 
 - Model ids are global and must carry a provider prefix (`deepseek/deepseek-v4-pro`); the prefix must match a declared provider. The upstream `model` field defaults to the part after the first `/`.
 - `${VAR}` in auth headers is expanded per provider. A missing variable only marks that provider unavailable; it is not fatal for the rest, unless the provider was explicitly requested.
-- Thinking levels are arbitrary JSON fragments merged into the top level of the request body. Level names are yours to choose.
-- Validation is strict: unknown fields, dangling references and missing required fields abort startup with exit code 2 and a TOML location.
+- Thinking levels are JSON object fragments merged into the top level of the request body. Level names are yours to choose.
+- Validation is strict: unknown fields, dangling references and missing required fields abort startup with exit code 2 and the config path; TOML syntax errors also include a line number.
 
 ## The `bash` tool and its safety model
 
-`rho` runs `bash -c <command>` in the foreground, with no persistent shell between calls (no shared `cwd`, no shared env, no surviving background state — chain `cd` and the command in one line if you need both).
+`rho` runs `bash -c <command>` in the foreground, with no persistent shell or job state between calls (no shared `cwd`, no shared env; background processes started by a command are not cleaned up — chain `cd` and the command in one line if you need both).
 
 A command runs without asking only when **both** hold:
 
@@ -141,7 +148,7 @@ Everything else prompts with the working directory and the full command, default
 
 > **This is not a sandbox.** The allowlist is a temporary string-matching heuristic, not shell parsing or a security boundary. Child processes inherit the full environment, so the model can read `DEEPSEEK_API_KEY` via `env`. Run `rho` as a user you are willing to have commands executed as, and do not point it at hosts you do not trust to be read.
 
-Other limits: at most `max_tool_steps` model-initiated tool calls per turn (default 25, counting rejected/failed calls too); output is capped at `max_output_bytes` with the head and tail kept and the omitted byte count marked; a timeout kills the whole process group (SIGTERM, then SIGKILL after 2s). No retries on HTTP errors, no context-budget management — an over-long conversation fails upstream and you should `/clear`.
+Other limits: at most `max_tool_steps` model-initiated tool calls per turn (default 25, counting rejected/failed calls too); stdout and stderr are each capped at `max_output_bytes` with the head and tail kept and the omitted byte count marked; a timeout kills the whole process group (SIGTERM, then SIGKILL after 2s). No retries on HTTP errors, no context-budget management — an over-long conversation fails upstream and you should `/clear`.
 
 ## Testing
 
@@ -149,7 +156,7 @@ Other limits: at most `max_tool_steps` model-initiated tool calls per turn (defa
 cargo test --all-targets --locked
 ```
 
-CI runs the same command on every push to `master` and every pull request. Tests never touch the network: protocol tests use a hand-written local SSE mock over `TcpListener`, and the REPL/agent-loop tests drive the real loop with a scripted `Ui` implementation. The signal → record path of `term.rs` and live terminal behaviour are verified manually.
+CI runs the tests on Rust 1.75 (MSRV) and stable, on every push to `master` and every pull request. Tests never call external services: protocol tests use a hand-written local SSE mock over `TcpListener`, and the REPL/agent-loop tests drive the real loop with a scripted `Ui` implementation. The signal → record path of `term.rs` and live terminal behaviour are verified manually.
 
 ## Not in v1
 
@@ -157,4 +164,4 @@ No one-shot mode, no stdin piping, no session persistence, no file-editing tools
 
 ## License
 
-MIT
+[MIT](LICENSE)
