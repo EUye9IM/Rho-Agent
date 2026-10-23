@@ -105,10 +105,10 @@ enum ConfirmOutcome {
 }
 ```
 
-- 退出语义统一走 `UiResult`：`read_line` 只返回 `Line`/`Interrupted`/`Eof`，**从不自行返回 `Err(Quit)`**；`/exit` 作为普通 `Line` 由 REPL 层解析后映射为 `Err(Quit)`（斜杠命令解析归 repl.rs，Ui 不识别命令）。空行/编辑中 Ctrl-C 返回 `Interrupted`，由 REPL 层按 `line_empty` 决定退出（构造 `Err(Quit)`）或清行；`ConfirmOutcome::Cancelled` 是确认界面的 Ctrl-C，取消整轮。
+- 退出语义：`read_line` 只返回 `Line`/`Interrupted`/`Eof`，**从不自行返回 `Err(Quit)`**；`/exit` 作为普通 `Line` 由 REPL 层解析后映射为退出（斜杠命令解析归 repl.rs，Ui 不识别命令）。空行/编辑中 Ctrl-C 返回 `Interrupted`，由 REPL 层按 `line_empty` 决定退出或清行；`ConfirmOutcome::Cancelled` 是确认界面的 Ctrl-C，取消整轮（若为当前轮第二次则收尾后退出，见信号计数）。
 - **Ctrl-C 的唯一记录生产者是专用信号线程**（confirm 场景）：终端保持 ISIG，Ctrl-C 产生 SIGINT，经 self-pipe/signalfd 由信号线程在锁内追加记录；`confirm` 的可中断读取由 SIGINT 唤醒返回 `Cancelled`，不自行追加，无双重计数。
 - **rustyline 场景的计数豁免**：rustyline 原始模式会清除 ISIG 并安装自己的 SIGINT 处理器，Ctrl-C 不产生 SIGINT 而由 rustyline 返回 `Interrupted`——该路径**不经过**信号线程记录，直接由 REPL 层处理（清行/退出），也不追加记录。即：REPL 输入态的 Ctrl-C 与活动操作（流式/工具/确认）中的 Ctrl-C 是**两套互不干扰的路径**：前者走 rustyline 按键、后者走 SIGINT 计数。两路径不会同时处于活动状态，不产生双重计数。
-- agent loop 收到 `Err(Quit)` 直接终止回合，不自己判断第几次 Ctrl-C。
+- `Err(Quit)` 的唯一生产者是 REPL 层（解析 `/exit`、`Eof`、空行 Ctrl-C 后构造），经内部错误通道传给 agent loop 终止回合；agent loop 不自己判断第几次 Ctrl-C，也不从 Ui 直接收到 `Err(Quit)`。
 
 - 生产实现 `TermUi`：rustyline 后端；`confirm` 用可中断读取（保持 ISIG，Ctrl-C 产生 SIGINT 唤醒读取并返回 `Cancelled`；配合信号线程记录，无双重计数）。`stdin 非 TTY 拒绝启动`的检查在 `TermUi::new` 里做，不进 main 流程。
 - 测试实现 `ScriptedUi`：预排输入队列 + 预排确认结果 + 收集渲染事件，驱动 `repl → agent loop → tools` 全链路，无网络无 TTY。
@@ -147,7 +147,7 @@ loop {
                 No → “用户拒绝执行”Tool 结果，steps += 1
                 Cancelled → 已执行的保留真实结果，当前及剩余补
                     “用户取消执行”Tool 结果，回 REPL
-                UiResult::Err(Quit) → 同 Cancelled，但退出程序
+                    （若本次 Ctrl-C 是当前轮第二次，信号计数 quit 生效则收尾后退出）
             执行中超时（未被取消）→ “已部分执行（超时）”Tool 结果，
                 steps += 1，继续剩余调用
             执行中被取消 → 当前调用补“已部分执行（被取消，副作用已发生）”
@@ -203,7 +203,7 @@ exit 0：/exit、空闲态 Ctrl-C、Ctrl-D（均正常退出）
 | agent loop + tools | 集成：fake adapter 吐预编排 `StreamEvent` 序列 + `ScriptedUi` 驱动输入/确认，无网络无 TTY |
 | provider + HTTP 层 | 集成：本地 mock SSE 服务（std TcpListener 手写），测协议映射与流读取 |
 | 端到端工具循环 | 集成：mock SSE 服务驱动多轮真实 HTTP 请求，验证占位 Tool 消息的配对/顺序/第二次请求序列化（含 echo_reasoning） |
-| 取消 | 单元/集成：直接置 `Cancel` 标志（等效 Ctrl-C）、置 quit 验证退出路径；Ui 退出路径用 `ScriptedUi` 注入 `Err(Quit)` 验证；信号→标志一段（`term.rs`）手工验收 |
+| 取消/退出 | 集成：`ScriptedUi` 注入 `Line("/exit")`、`Eof`、`Interrupted{line_empty:true}` 验证 REPL 退出路径；直接注入信号记录（第 1 次/第 2 次）验证取消与退出路径；信号→记录一段（`term.rs`）手工验收 |
 | 终端交互 / 真实信号 | 手工验收 |
 
 ## 八、与里程碑对应
