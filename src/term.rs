@@ -54,8 +54,8 @@ impl Cancel {
         todo!()
     }
 
-    /// 测试/集成注入：直接追加一次 Ctrl-C 记录（等效信号线程）。
-    #[cfg(test)]
+    /// 测试/集成注入：直接追加一次 Ctrl-C 记录（等效信号线程；tests/ 集成可用，
+    /// 非 cfg(test)——单元测试与集成测试都需要它驱动取消/退出路径）。
     pub fn inject(&self) {
         // TODO: 锁内 records.push(len+1)
         todo!()

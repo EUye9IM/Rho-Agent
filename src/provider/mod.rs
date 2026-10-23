@@ -1,4 +1,4 @@
-//! 供应商适配层：trait、按 protocol 分发、流式请求工作线程。
+//! 供应商适配层：trait、按 Provider 构造（注入 compat）并分发、流式请求工作线程。
 
 mod openai;
 
@@ -55,7 +55,7 @@ impl TurnAcc {
     }
 }
 
-/// 适配器需要跨线程进 worker：Arc 共享，每轮传引用，要求 Send + Sync。
+/// 适配器需要跨线程进 worker：Arc 共享（每轮 clone 按值传入），要求 Send + Sync。
 pub trait ProviderAdapter: Send + Sync {
     fn endpoint(&self, p: &Provider) -> String;
     fn build_body(&self, hist: &[Msg], model: &Model, thinking: Option<&Value>) -> Value;

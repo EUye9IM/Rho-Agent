@@ -34,7 +34,7 @@ src/
     mod.rs       结构定义、内置默认配置（include_str! + 解析）
     validate.rs  悬空引用 / 前缀对应 / 必填字段校验，错误带位置
     expand.rs    header 值 ${VAR} 展开；明文密钥告警
-  chat.rs        内部消息模型 Msg、会话历史（Vecu003cMsgu003e）、工具循环
+  chat.rs        内部消息模型 Msg、会话历史（Vec<Msg>）、工具循环
   provider/
     mod.rs       ProviderAdapter trait（Send+Sync，Arc 共享）、按 Provider 构造（注入 compat）
     openai.rs    openai_chat：请求体组装、thinking 片段顶层合并、
@@ -81,8 +81,8 @@ trait ProviderAdapter: Send + Sync {
     fn parse_chunk(&self, chunk: &Value, acc: &mut TurnAcc) -> Vec<StreamEvent>;
 }
 // 适配器按 Provider 构造（adapter_for(&Provider) -> Result<Arc<dyn ProviderAdapter>, String>）：
-// compat 开关（echo_reasoning）构造时注入；Session 长期持有 Arc，每轮传引用进 worker；
-// /provider 切换时重建。不支持的协议族返回 Err（可展示错误，非 panic）。
+// compat 开关（echo_reasoning）构造时注入；Session 长期持有 Arc，每轮 clone 一份按值传给 worker
+// （thread::spawn + detach 取消语义需 'static，不能借引用）；/provider 切换时重建。不支持的协议族返回 Err（可展示错误，非 panic）。
 ```
 
 - **`TurnAcc` 归 worker 线程所有**：chunk 解析与累加都在工作线程内完成；channel 传渲染增量（Delta）、终态（Done/Error）与组装完成的完整 Assistant 消息（Final）。主线程不重复累加，提交历史/执行工具只依赖 Final；取消时 drop Receiver，无需跨线程回收累加器。
@@ -167,7 +167,7 @@ loop {
 - **提交资格**：`Done{finish_reason: stop|tool_calls|None}` 才提交 Assistant 消息（工具调用的正常结束原因是 `tool_calls`）；`length`/`content_filter` 等截断原因按 Error 处理，不把被截断的 tool_calls 提交执行。
 - **取消在两个粒度检查**：接收循环逐事件检查（含持续有事件时）；工具序列逐个调用前检查。任一处发现取消即按占位规则收尾，不进入下一调用。
 - **限额逐个前置检查**：在判定每个调用前检查，不执行满批后才停；**所有模型发起的调用都计数**（含参数解析失败/未知工具名/spawn 失败的调用），防止错误调用无限循环。
-- **历史即上下文**：历史（`Vec<Msg>`，文档中弥称 History）原样序列化进请求，无预算管理；窗口超限错误原样展示并提示 `/clear`。
+- **历史即上下文**：历史（`Vec<Msg>`）原样序列化进请求，无预算管理；窗口超限错误原样展示并提示 `/clear`。
 - **reasoning 不回传**：序列化时丢弃 `reasoning`，除非 `echo_reasoning = true`（适配层职责）。
 - **退出由两条路径殊途同归**：REPL 层将 `/exit` 命令、空行 Ctrl-C、`Eof`（Ctrl-D）映射为退出（经内部通道传 agent loop）；活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测。两路径均先完成剩余调用占位补齐与工具进程清理再退出。
 

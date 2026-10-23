@@ -32,7 +32,8 @@ pub struct ToolCall {
 }
 
 /// 会话状态：历史 + 当前选择 + 适配器 + 工具步数。
-/// adapter 为 Arc 共享：每轮传引用进 worker，会话长期持有。
+/// adapter 为 Arc 共享：会话长期持有，每轮 clone 一份按值传给 worker
+/// （thread::spawn + detach 取消语义需 'static，不能借引用）。
 pub struct Session {
     pub cfg: Config,
     pub selection: Selection,
@@ -82,7 +83,7 @@ impl Session {
     /// agent 工具循环（architecture.md 四节）。
     pub fn turn(&mut self, ui: &mut dyn Ui, cancel: &Cancel, input: &str) -> ChatResult<TurnEnd> {
         // TODO: push User msg → loop {
-        //   build_body → worker 线程流式请求（mpsc 事件；adapter 按值传入 worker）
+        //   build_body → worker 线程流式请求（mpsc 事件；adapter clone 按值传入 worker）
         //   主线程 recv_timeout 短轮询，逐事件先查 cancel 再处理：
         //     Delta → 渲染；Done → 记录提交资格；Final → 退出接收
         //     Error / Disconnected → 展示，回合结束（保留已完成历史）
