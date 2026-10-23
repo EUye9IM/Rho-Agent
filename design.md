@@ -60,7 +60,7 @@
 
 ### 退出码
 
-`0` 正常退出；`1` REPL 无法继续的内部运行时错误（渲染 I/O 错误等；轮内网络/协议错误展示后回 REPL，不退 1；`panic=abort` 下 panic 直接 abort，不属于 exit 1）；`2` 配置或用法错误（含 stdin 非 TTY）。
+`0` 正常退出（`/exit`、空闲态 Ctrl-C、Ctrl-D 均视为正常）；`1` REPL 无法继续的内部运行时错误（渲染 I/O 错误等；轮内网络/协议错误展示后回 REPL，不退 1；`panic=abort` 下 panic 直接 abort，不属于 exit 1）；`2` 配置或用法错误（含 stdin 非 TTY）。
 
 ## 五、配置模型
 

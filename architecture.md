@@ -105,7 +105,7 @@ enum ConfirmOutcome {
 }
 ```
 
-- 退出语义统一走 `UiResult`：`read_line` 的 `Err` 覆盖 `/exit`；空行/编辑中 Ctrl-C 返回 `Interrupted`，由 REPL 层按 `line_empty` 决定退出或清行；`ConfirmOutcome::Cancelled` 是确认界面的 Ctrl-C，取消整轮。
+- 退出语义统一走 `UiResult`：`read_line` 只返回 `Line`/`Interrupted`/`Eof`，**从不自行返回 `Err(Quit)`**；`/exit` 作为普通 `Line` 由 REPL 层解析后映射为 `Err(Quit)`（斜杠命令解析归 repl.rs，Ui 不识别命令）。空行/编辑中 Ctrl-C 返回 `Interrupted`，由 REPL 层按 `line_empty` 决定退出（构造 `Err(Quit)`）或清行；`ConfirmOutcome::Cancelled` 是确认界面的 Ctrl-C，取消整轮。
 - **Ctrl-C 的唯一记录生产者是专用信号线程**（confirm 场景）：终端保持 ISIG，Ctrl-C 产生 SIGINT，经 self-pipe/signalfd 由信号线程在锁内追加记录；`confirm` 的可中断读取由 SIGINT 唤醒返回 `Cancelled`，不自行追加，无双重计数。
 - **rustyline 场景的计数豁免**：rustyline 原始模式会清除 ISIG 并安装自己的 SIGINT 处理器，Ctrl-C 不产生 SIGINT 而由 rustyline 返回 `Interrupted`——该路径**不经过**信号线程记录，直接由 REPL 层处理（清行/退出），也不追加记录。即：REPL 输入态的 Ctrl-C 与活动操作（流式/工具/确认）中的 Ctrl-C 是**两套互不干扰的路径**：前者走 rustyline 按键、后者走 SIGINT 计数。两路径不会同时处于活动状态，不产生双重计数。
 - agent loop 收到 `Err(Quit)` 直接终止回合，不自己判断第几次 Ctrl-C。
@@ -165,7 +165,7 @@ loop {
 - **限额逐个前置检查**：在判定每个调用前检查，不执行满批后才停；**所有模型发起的调用都计数**（含参数解析失败/未知工具名/spawn 失败的调用），防止错误调用无限循环。
 - **历史即上下文**：`History` 原样序列化进请求，无预算管理；窗口超限错误原样展示并提示 `/clear`。
 - **reasoning 不回传**：序列化时丢弃 `reasoning`，除非 `echo_reasoning = true`（适配层职责）。
-- **退出由 Ui 统一承载**：`read_line` 的 `Err(Quit)` 仅对应 `/exit`；空行/编辑中 Ctrl-C 返回 `Interrupted`，REPL 层按 `line_empty` 决定退出（构造 `Err(Quit)`）或清行；`confirm` 的取消返回 `Cancelled`；无 Ui 阻塞点处（工具执行/清理期）由全局信号计数承接。
+- **退出由 Ui 与 REPL 分工**：`read_line` 从不返回 `Err(Quit)`；REPL 层将 `/exit` 命令、空行 Ctrl-C 映射为退出，`Eof`（Ctrl-D）同样视为退出请求；`confirm` 的取消返回 `Cancelled`；无 Ui 阻塞点处（工具执行/清理期）由全局信号计数承接。
 
 ## 五、线程与取消（term.rs / repl.rs）
 
@@ -188,7 +188,7 @@ struct State { epoch: u64, records: Vec<u32 /*第几次 Ctrl-C*/>, prev_quit: bo
 ```
 exit 2：参数用法错误（含 stdin 非 TTY）、配置解析/校验失败、显式指定的供应商 key 不齐全、隐式选择时无任何可用供应商（含缺失变量列表）
 exit 1：REPL 无法继续的内部运行时错误（渲染 I/O 错误等；内部线程 panic 在 panic=abort 下直接 abort，不走此路径）
-exit 0：/exit、空闲态 Ctrl-C
+exit 0：/exit、空闲态 Ctrl-C、Ctrl-D（均正常退出）
 ```
 
 - 轮内错误（断流、上游 4xx/5xx）**展示后回到 REPL**，保留已完成历史，不退 1；exit 1 只用于 REPL 本身无法继续的内部错误。
