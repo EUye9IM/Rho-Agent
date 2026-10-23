@@ -32,6 +32,7 @@ libc = "0.2"
 indexmap = { version = "2.7", features = ["serde"] }
 
 [profile.release]
+opt-level = "z"
 strip = true
 lto = true
 panic = "abort"
