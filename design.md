@@ -24,7 +24,8 @@
 
 - 流式请求期间第一次 Ctrl-C 置 `AtomicBool`，渲染循环逐块检查并立即停止显示；丢弃当前未完成的 assistant 响应及其中不完整的工具调用，不执行不完整调用。已完成的 assistant/tool 消息保留在对话历史中。
 - 在途流线程被放弃（detach），不主动关闭 HTTP 连接；线程自然结束或在 socket 空闲读超时后退出。空闲超时不限制持续有数据时的总存活时间。
-- 工具执行期间第一次 Ctrl-C 向整个子进程组发 SIGTERM；等待 2s 后仍未退出则发 SIGKILL，并回收子进程。工具超时也采用同一升级顺序。
+- 工具执行期间第一次 Ctrl-C 向整个子进程组发 SIGTERM；2s 后无论直接子进程状态如何，对整个进程组发 SIGKILL 并回收子进程（不以 bash 单体退出作为终止完成条件）。工具超时也采用同一升级顺序。
+- 工具输出采集：stdout/stderr 各一个 drain 线程并行读取，有界缓冲，超限后丢弃并计数但不停止读取；bash 退出后即停止采集，不等待后台进程关闭继承的管道写端。
 - 当前操作取消后的第二次 Ctrl-C 请求退出程序；先完成工具进程清理，再退出。
 - REPL 空闲且输入行为空时，Ctrl-C 退出；正在编辑输入时，Ctrl-C 清空当前输入行。
 
@@ -49,7 +50,12 @@
 
 ### REPL 命令
 
-`/model [id]`、`/provider [id]`、`/thinking [level]`、`/clear`、`/help`、`/exit`。不带参数时列出可选项并标注当前值。切换只影响后续请求，不重放历史。三者联动规则：`/provider` 切换后，若当前模型不属于新 provider，模型重置为新 provider 声明顺序第一个，thinking 重置为该模型 `thinking_default`（无档位表则归零）；`/model` 切换后 thinking 同样重置。启动时 `--provider` 与 `--model` 同时指定且模型不属于该 provider，为用法错误（退出码 2）。
+`/model [id]`、`/provider [id]`、`/thinking [level]`、`/clear`、`/help`、`/exit`。不带参数时列出可选项并标注当前值。切换只影响后续请求，不重放历史。三者联动规则：
+- `/provider` 切换后，若当前模型不属于新 provider，模型重置为新 provider 声明顺序第一个，thinking 重置为该模型 `thinking_default`（无档位表则归零）；`/model` 切换后 thinking 同样重置。
+- `/model` 切到不属于当前 provider 的模型：拒绝命令（提示先切 provider），状态不变。`/thinking` 切到当前模型不存在的档位：拒绝命令，状态不变。
+- `/provider` 切到 key 变量不齐全的 provider：拒绝命令并列出缺失变量，状态不变（不退出进程）。
+- 启动时：`--provider` 与 `--model` 同时指定且模型不属于该 provider，为用法错误（退出码 2）。只传 `--model`：直接采用（须带 provider 前缀且属于已声明 provider，否则用法错误），覆盖 `default_provider` 为其前缀对应 provider。只传 `--provider`：模型取该 provider 声明顺序第一个，thinking 取其默认档。
+- 隐式选择时跳过缺 key 的 provider：若配置的 `default_model` 前缀指向不可用 provider，则改用被选 provider 的声明顺序第一个模型（thinking 默认档）。
 
 ### 退出码
 
