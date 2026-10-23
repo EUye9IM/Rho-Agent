@@ -34,13 +34,14 @@ pub struct ToolCall {
 /// 会话状态：历史 + 当前选择 + 适配器 + 工具步数。
 /// adapter 为 Arc 共享：会话长期持有，每轮 clone 一份按值传给 worker
 /// （thread::spawn + detach 取消语义需 'static，不能借引用）。
+/// thinking 唯一真值源是 selection.thinking（switch_* 同步更新）。
 pub struct Session {
     pub cfg: Config,
     pub selection: Selection,
     pub adapter: Arc<dyn ProviderAdapter>,
     pub yes: bool,
-    pub thinking: Option<String>,
     pub history: Vec<Msg>,
+    /// 本轮工具步数（design §7：每次用户输入触发的一轮对话计数，turn 开头重置）
     pub steps: u32,
 }
 
@@ -63,36 +64,53 @@ pub enum TurnEnd {
 }
 
 impl Session {
-    /// thinking 已在 main 层校验（resolve_thinking，非法 exit 2）。
+    /// thinking 已在 main 层校验并写入 selection.thinking（resolve_thinking，非法 exit 2）。
+    /// history 以 cfg.system_prompt 播种（Msg::System；省略则不含 system 消息）。
     pub fn new(
         cfg: Config,
         selection: Selection,
         adapter: Arc<dyn ProviderAdapter>,
         yes: bool,
-        thinking: Option<String>,
     ) -> Self {
-        Self { cfg, selection, adapter, yes, thinking, history: Vec::new(), steps: 0 }
+        let history = match &cfg.system_prompt {
+            Some(p) => vec![Msg::System(p.clone())],
+            None => Vec::new(),
+        };
+        Self { cfg, selection, adapter, yes, history, steps: 0 }
     }
 
-    /// `/clear`：清空历史（steps 也归零）。
+    /// `/clear`：历史重置为仅含 system 消息（播种语义同 new）；steps 归零。
     pub fn clear(&mut self) {
-        // TODO
+        // TODO: history = cfg.system_prompt 播种（或空）
         todo!()
     }
 
     /// agent 工具循环（architecture.md 四节）。
     pub fn turn(&mut self, ui: &mut dyn Ui, cancel: &Cancel, input: &str) -> ChatResult<TurnEnd> {
-        // TODO: push User msg → loop {
-        //   build_body → worker 线程流式请求（mpsc 事件；adapter clone 按值传入 worker）
+        // TODO: steps = 0（per-turn 限额，design §7）→ push User msg → loop {
+        //   build_body（history, model, model_id, thinking 片段）→ worker 线程流式请求
+        //   （mpsc 事件；adapter clone 按值传入 worker）
         //   主线程 recv_timeout 短轮询，逐事件先查 cancel 再处理：
         //     Delta → 渲染；Done → 记录提交资格；Final → 退出接收
         //     Error / Disconnected → 展示，回合结束（保留已完成历史）
         //   流式期间 Ctrl-C → drop Receiver，回 REPL（若 quit 则占位补齐后退出）
         //   Final 后：无 tool_calls → 提交，回合结束
         //   有 tool_calls → 提交前校验 tool_call_id 唯一非空（非法整条按 Error）
-        //     → 逐个执行（每调用前查 steps/max_tool_steps 与取消）
-        //     → 各分支产出真实结果 / 真实错误文本 / 占位结果，steps += 1
-        //   全部执行完 → continue
+        //     → 逐个执行（每调用前查 steps < max_tool_steps 与取消）：
+        //       超限 → 当前及剩余调用补“超限未执行”Tool 结果，回合结束
+        //         （后续轮次重新计数）
+        //       参数解析失败/未知工具名/spawn 失败 → 真实错误文本 Tool 结果，
+        //         steps += 1，剩余调用继续逐个判定
+        //       判定（allowlist/元字符/确认/--yes）：
+        //         Yes → 执行 bash（前台，超时升级，Ctrl-C 升级）
+        //         No → “用户拒绝执行”，steps += 1
+        //         Cancelled → 当前及剩余补“用户取消执行”，回 REPL
+        //           （若该 Ctrl-C 为当前轮第二次，收尾后退出）
+        //       执行中超时 → “已部分执行（超时）”，steps += 1，继续剩余调用
+        //       执行中被取消 → 当前补“已部分执行（被取消，副作用已发生）”，
+        //         剩余补“用户取消执行”，清理进程组后回 REPL（若 quit 则退出）
+        //       正常完成 → 真实结果，steps += 1
+        //   全部执行完 → continue（带上 tool 结果再请求）
         // }
         let _ = (ui, cancel, input);
         todo!()
@@ -114,9 +132,10 @@ impl Session {
         todo!()
     }
 
-    /// 切换思考档位（REPL /thinking）：无效档位拒绝。
+    /// 切换思考档位（REPL /thinking）：无效档位拒绝；更新 selection.thinking。
     pub fn switch_thinking(&mut self, level: &str) -> Result<(), String> {
-        // TODO
+        // TODO: 校验属当前模型 thinking 表；selection.thinking = Some(level)
+        let _ = level;
         todo!()
     }
 }
@@ -135,13 +154,15 @@ fn dispatch_tool_call(
     cancel: &Cancel,
     call: &ToolCall,
 ) -> ChatResult<CallOutcome> {
-    // TODO: 参数解析失败/未知工具名 → 真实错误文本 Result（steps += 1，继续剩余）
+    // TODO: 参数解析失败/未知工具名/spawn 失败 → 真实错误文本 Result
+    //       （steps += 1，继续剩余；spawn 失败对应 BashEnd::SpawnFailed）
     // TODO: allowlist/元字符判定（tools::allowed）→ 自动执行或确认：
     //   ConfirmOutcome::Yes → tools::run_bash（超时升级 / Ctrl-C 升级）
     //   No → "用户拒绝执行"
     //   Cancelled → Cancelled（若 quit 则收尾后退出）
     // TODO: 执行中超时 → "已部分执行（超时）"，继续剩余调用
     // TODO: 执行中被取消 → Cancelled("已部分执行（被取消，副作用已发生）")
+    // TODO: 执行中 quit → BashEnd::QuitRequested → 当前补占位，剩余补占位，退出程序
     let _ = (session, ui, cancel, call);
     todo!()
 }

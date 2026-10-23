@@ -58,7 +58,15 @@ impl TurnAcc {
 /// 适配器需要跨线程进 worker：Arc 共享（每轮 clone 按值传入），要求 Send + Sync。
 pub trait ProviderAdapter: Send + Sync {
     fn endpoint(&self, p: &Provider) -> String;
-    fn build_body(&self, hist: &[Msg], model: &Model, thinking: Option<&Value>) -> Value;
+    /// `model_id` 是全局唯一 id（如 deepseek/deepseek-v4-pro）：上游 model 字段
+    /// 默认取其第一个 '/' 之后的部分，`Model::api_model` 可覆盖。
+    fn build_body(
+        &self,
+        hist: &[Msg],
+        model: &Model,
+        model_id: &str,
+        thinking: Option<&Value>,
+    ) -> Value;
     fn headers(&self, p: &Provider) -> Vec<(String, String)>;
     fn parse_chunk(&self, chunk: &Value, acc: &mut TurnAcc) -> Vec<StreamEvent>;
 }
@@ -83,8 +91,12 @@ pub fn stream_request(
     headers: Vec<(String, String)>,
     tx: std::sync::mpsc::Sender<StreamEvent>,
 ) {
-    // TODO: ureq POST（连接 10s / 首字节 60s / 流式空闲 120s；代理环境变量；SSL_CERT_FILE）
-    // TODO: 逐行读 SSE → sse::parse → adapter.parse_chunk(acc) → 事件 send
+    // TODO: ureq Agent：自建 rustls::ClientConfig（webpki-roots + SSL_CERT_FILE 覆盖），
+    //       AgentBuilder::tls_config；代理自行读 HTTP(S)_PROXY/ALL_PROXY（大小写均认）
+    //       并按 NO_PROXY 分流（ureq 无 NO_PROXY 支持，不依赖 proxy-from-env feature）
+    // TODO: 超时：连接 10s（timeout_connect）；首字节 60s 与流式空闲 120s 在读取循环
+    //       自行计时（ureq 只有 connect/per-read 两档，无法直接区分首字节与空闲）
+    // TODO: POST → 逐行读 SSE → sse::parse → adapter.parse_chunk(acc) → 事件 send
     // TODO: [DONE] → finish_reason 合格则 acc.into_msg() 发 Final，否则 Error
     // TODO: 任何 HTTP/解析/断流错误 → Error 收尾后 return（不 panic）
     // TODO: send 报错（主线程已 drop Receiver）→ 直接退出，无需排空

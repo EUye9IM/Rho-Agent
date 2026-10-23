@@ -24,15 +24,21 @@ impl ProviderAdapter for OpenAiChatAdapter {
         todo!()
     }
 
-    fn build_body(&self, hist: &[Msg], model: &Model, thinking: Option<&Value>) -> Value {
+    fn build_body(
+        &self,
+        hist: &[Msg],
+        model: &Model,
+        model_id: &str,
+        thinking: Option<&Value>,
+    ) -> Value {
         // TODO: messages 映射（System/User/Assistant/Tool → 协议字段）
         // TODO: reasoning 默认不回传（丢弃 Assistant.reasoning），
-        //       echo_reasoning=true 才随历史回传（compat 配置经 Provider 传入或闭包捕获）
-        // TODO: 上游 model = api_model 或 id 第一个 '/' 之后
+        //       self.echo_reasoning=true 才随历史回传
+        // TODO: 上游 model = api_model 或 model_id 第一个 '/' 之后
         // TODO: 始终发送 tools 定义（bash）；不设置 tool_choice
         // TODO: thinking 片段顶层合并进 body
         // TODO: stream: true
-        let _ = (hist, model, thinking);
+        let _ = (hist, model, model_id, thinking);
         todo!()
     }
 

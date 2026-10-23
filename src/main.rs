@@ -45,23 +45,19 @@ fn run(args: Args) -> u8 {
         }
     };
 
-    // 供应商启用与默认值冲突消解（design.md 五节）。
-    let selection = match config::resolve_selection(&cfg, args.provider.as_deref(), args.model.as_deref()) {
+    // --thinking 非法（不属于所选模型档位）在构造 Session 前校验（exit 2）；
+    // 合法则写入 selection.thinking（唯一真值源）。
+    let mut selection = match config::resolve_selection(&cfg, args.provider.as_deref(), args.model.as_deref()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");
             return EXIT_USAGE;
         }
     };
-
-    // --thinking 非法（不属于所选模型档位）在构造 Session 前校验（exit 2）。
-    let thinking = match resolve_thinking(&cfg, &selection, args.thinking.as_deref()) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("{e}");
-            return EXIT_USAGE;
-        }
-    };
+    if let Err(e) = resolve_thinking(&cfg, &mut selection, args.thinking.as_deref()) {
+        eprintln!("{e}");
+        return EXIT_USAGE;
+    }
 
     let adapter = match provider::adapter_for(&selection.provider) {
         Ok(a) => a,
@@ -88,7 +84,7 @@ fn run(args: Args) -> u8 {
         }
     };
 
-    let session = Session::new(cfg, selection, adapter, args.yes, thinking);
+    let session = Session::new(cfg, selection, adapter, args.yes);
     match repl::run(&mut term_ui, session, &cancel) {
         Ok(()) | Err(ReplExit::Quit) => EXIT_OK,
         Err(ReplExit::Fatal(e)) => {
@@ -98,14 +94,16 @@ fn run(args: Args) -> u8 {
     }
 }
 
-/// 解析 --thinking：None → 所选模型 thinking_default；Some(档位) → 须属该模型档位表。
+/// 解析 --thinking：None → 保持 selection.thinking（模型 thinking_default）；
+/// Some(档位) → 须属该模型档位表，写入 selection.thinking。
 fn resolve_thinking(
     cfg: &config::Config,
-    sel: &config::Selection,
+    selection: &mut config::Selection,
     cli: Option<&str>,
-) -> Result<Option<String>, String> {
-    // TODO: 有 cli 时校验属所选模型 thinking 档位；无 thinking 表的模型不接受非空 --thinking
-    let _ = (cfg, sel, cli);
+) -> Result<(), String> {
+    // TODO: 有 cli 时校验属所选模型 thinking 档位（无表的模型拒绝非空 --thinking）；
+    //       合法则 selection.thinking = Some(cli)
+    let _ = (cfg, selection, cli);
     todo!()
 }
 
