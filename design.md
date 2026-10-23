@@ -55,7 +55,7 @@
 - `/model` 切到不属于当前 provider 的模型：拒绝命令（提示先切 provider），状态不变。`/thinking` 切到当前模型不存在的档位：拒绝命令，状态不变。
 - `/provider` 切到 key 变量不齐全的 provider：拒绝命令并列出缺失变量，状态不变（不退出进程）。
 - 启动时：`--provider` 与 `--model` 同时指定且模型不属于该 provider，为用法错误（退出码 2）。只传 `--model`：直接采用（须带 provider 前缀且属于已声明 provider，否则用法错误），覆盖 `default_provider` 为其前缀对应 provider。只传 `--provider`：模型取该 provider 声明顺序第一个，thinking 取其默认档。
-- 隐式选择时跳过缺 key 的 provider：若配置的 `default_model` 前缀指向不可用 provider，则改用被选 provider 的声明顺序第一个模型（thinking 默认档）。
+- 隐式选择时跳过缺 key 的 provider：若配置的 `default_model` 前缀指向不可用 provider，则按上文“默认值冲突消解”规则处理——`default_model` 效力高于隐式选择，指向的 provider key 不齐全时报错（不静默改用其他模型）。
 
 ### 退出码
 
@@ -114,6 +114,7 @@ max_output_bytes  = 16384
 - **认证**：一张通用 header 表，值中 `${VAR}` 在选择供应商时逐个 provider 展开。变量缺失不是全局致命错误：该 provider 标记为不可用，不影响其他 provider。不枚举认证类型。配置中出现疑似明文密钥只告警、不阻断。
 - **校验**：未知字段、悬空引用、缺失必填字段一律硬报错，退出码 2，指出位置。`toml` 必须启用 `preserve_order`，否则"声明顺序即优先级"会退化成字母序。
 - **供应商启用**：按声明顺序取第一个 key 变量齐全的 provider；配置的 `default_provider` 优先；`--provider` 覆盖。显式指定的 provider（`default_provider` 或 `--provider`）若 key 不齐全，报错并列出缺失的变量，不回退到其他 provider。隐式选择时没有任何可用 provider 才报错（列出每个 provider 各缺什么）。
+- **默认值冲突消解**：启动时无 CLI 指定时，若配置同时给了 `default_provider` 与 `default_model` 且二者前缀不一致，或未配 `default_provider` 而隐式选中的 provider 与 `default_model` 前缀不一致，一律以**模型为准**：采用 `default_model`，provider 取其前缀对应者（该 provider 须 key 齐全，否则按上文显式指定规则报错）。thinking 取 `default_model` 的 `thinking_default`。即 `default_model` 的效力高于 `default_provider` 与隐式选择。
 
 ### 内置默认
 
@@ -147,7 +148,7 @@ v1 只有一个工具：`bash`。不做文件读写工具、不做图像、不�
 - 否则弹出确认：显示会话 cwd 与完整命令，提示 `[y/N]`，默认 N。
 - 被拒绝时，把"用户拒绝执行"作为工具结果喂回模型。
 - `--yes` 跳过所有确认。
-- 每次用户输入触发的一轮对话最多 `max_tool_steps` 次模型发起的工具调用（默认 25）；被用户拒绝的调用也计数。超限停止并提示。
+- 每次用户输入触发的一轮对话最多 `max_tool_steps` 次模型发起的工具调用（默认 25）；所有模型发起的调用都计数——拒绝、取消、参数解析失败、未知工具名、spawn 失败均同。超限停止并提示。
 
 ### 多工具调用
 
@@ -197,7 +198,7 @@ v1 只有一个工具：`bash`。不做文件读写工具、不做图像、不�
 ### 测试
 
 - 单元：配置解析与严格校验、SSE 解析器（录制 chunk 夹具）、allowlist + 元字符判定、输出截断、思考档位展开、header `${VAR}` 展开。
-- 集成：本地 mock HTTP 服务跑完整工具循环（流式 + 多次 tool call + 拒绝确认）。
+- 集成：本地 mock HTTP 服务跑完整工具循环（流式 + 多次 tool call + 拒绝确认）；mock 的工具调用响应使用真实 `finish_reason: "tool_calls"`。
 - CI 不调用真实 API；真实 DeepSeek 仅用于手工验收。
 
 ### 里程碑
