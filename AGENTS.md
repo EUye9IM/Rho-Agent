@@ -5,7 +5,8 @@
 - `docs/design.md`：产品行为与取舍的定稿
 - `docs/architecture.md`：模块边界、线程模型、测试分层
 - `docs/README.md`：文档索引与维护规则
-- `docs/features.md`：产品范围（已发布 / 候选 / 不做）
+- `docs/features.md`：产品范围（已排期 / 开发中 / 待发布 / 已发布 / 不做）
+- `docs/workflow.md`：issue → dev → 验证 → 发布流程
 - `README.md` / `README.zh-CN.md`：用户可见行为
 
 若代码与文档冲突，先指出冲突并确认，不要默默按其中一方改。
@@ -23,9 +24,10 @@
 
 ## 分支与发布
 
-- 日常开发在 `dev` 分支，不要直接提交/推送到 `master`。
+- 日常开发在 `dev` 分支，不要直接提交/推送到 `master`。功能分支从 `dev` 开，PR 目标也是 `dev`。
 - `master` 作为稳定分支；发布时由用户确认后再合并 `dev` → `master`。
 - 版本发布：更新 `Cargo.toml` / `Cargo.lock` 的版本，打 annotated tag `vX.Y.Z`，推送 tag。CI 会构建并创建 GitHub Release。
+- 发布前确认 `docs/workflow.md` 的检查项；发布后更新 `docs/features.md` 状态。
 - 未经明确要求，不要：
   - `scp` 或安装新二进制到目标机
   - 替换目标机上的 `/usr/local/bin/rho`

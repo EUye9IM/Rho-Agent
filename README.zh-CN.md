@@ -156,7 +156,7 @@ max_output_bytes = 16384
 cargo test --all-targets --locked
 ```
 
-CI 在每次 push 到 `master` 和每个 PR 上，用 Rust 1.75（MSRV）与 stable 跑测试。测试不调用外部服务：协议层用 `TcpListener` 手写本地 SSE mock，REPL/agent loop 用脚本化的 `Ui` 实现驱动真实主循环。`term.rs` 的信号→记录一段和真实终端交互靠手工验收。
+CI 在每次 push 到 `master` 或 `dev` 和每个 PR 上，用 Rust 1.75（MSRV）与 stable 跑测试。测试不调用外部服务：协议层用 `TcpListener` 手写本地 SSE mock，REPL/agent loop 用脚本化的 `Ui` 实现驱动真实主循环。`term.rs` 的信号→记录一段和真实终端交互靠手工验收。
 
 ## v1 明确不做
 
