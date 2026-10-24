@@ -8,7 +8,7 @@ use rho::term;
 use rho::ui;
 use std::process::ExitCode;
 
-/// CLI 参数（手写解析，不用 clap）。见 docs/design.md 四节。
+/// CLI 参数（手写解析）。
 pub struct Args {
     pub config: Option<String>,
     pub provider: Option<String>,

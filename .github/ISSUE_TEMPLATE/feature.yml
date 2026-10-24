@@ -6,9 +6,9 @@ body:
   - type: markdown
     attributes:
       value: |
-        **中文**：先描述问题和场景，不要直接跳到实现。这个 issue 先作为愿望收集；确认进入某个版本后，才会被加入 `docs/features.md`。
+        **中文**：先描述问题和场景，不要直接跳到实现。这个 issue 先作为愿望收集；确认后再安排实现。
 
-        **English**: Start with the problem and the scenario, not the implementation. This issue is a wish-list item first; it enters `docs/features.md` only after it is accepted for a version.
+        **English**: Start with the problem and the scenario, not the implementation. This issue collects the wish first; implementation is scheduled after it is accepted.
 
   - type: textarea
     id: problem
@@ -120,7 +120,7 @@ body:
 
         English: Check all that apply.
       options:
-        - label: 改变用户可见行为或配置语义（需要先更新 docs/design.md） / Changes user-visible behavior or config semantics (update docs/design.md first)
+        - label: 改变用户可见行为或配置语义（需要同步更新 README 和 docs/architecture.md） / Changes user-visible behavior or config semantics (update README and docs/architecture.md)
         - label: 可能增加依赖、体积或常驻内存 / May add dependencies, binary size, or RSS
         - label: 涉及 bash 工具、权限或安全模型 / Touches the bash tool, permissions, or security model
         - label: 需要新增测试或手工终端验收 / Needs new tests or manual terminal validation

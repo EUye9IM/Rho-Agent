@@ -1,5 +1,5 @@
 //! bash 工具执行：进程组 spawn、超时升级、双 drain 管道、两段截断、
-//! allowlist + 元字符判定。见 docs/design.md 七节、docs/architecture.md 五节。
+//! allowlist + 元字符判定。见 docs/architecture.md 四、五节。
 
 use crate::config::BashToolConfig;
 use crate::term::{self, Cancel, SignalState};

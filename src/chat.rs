@@ -47,7 +47,7 @@ pub struct Session {
     pub adapter: Arc<dyn ProviderAdapter>,
     pub yes: bool,
     pub history: Vec<Msg>,
-    /// 本轮工具步数（design §7：每次用户输入触发的一轮对话计数，turn 开头重置）
+    /// 本轮工具步数（每次用户输入触发的一轮对话计数，turn 开头重置）
     pub steps: u32,
 }
 

@@ -1,4 +1,4 @@
-//! 配置模型：加载、严格校验、`${VAR}` 展开、供应商启用。见 docs/design.md 五节。
+//! 配置模型：加载、严格校验、`${VAR}` 展开、供应商启用。
 
 mod expand;
 mod validate;
@@ -258,7 +258,7 @@ fn selection_for(
     })
 }
 
-/// 供应商启用与默认值冲突消解（docs/design.md 五节规则）：
+/// 供应商启用与默认值冲突消解：
 /// - default_model 效力高于 default_provider 与隐式选择（前缀冲突以模型为准）
 /// - 显式指定的 provider key 不齐全 → 报错列缺失变量，不回退
 /// - 隐式选择：声明顺序第一个 key 齐全者；default_provider 优先；--provider 覆盖

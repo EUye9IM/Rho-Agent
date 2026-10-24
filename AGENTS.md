@@ -2,12 +2,8 @@
 
 本文件写给在此仓库工作的编码 agent。开始改动前先读：
 
-- `docs/design.md`：产品行为与取舍的定稿
-- `docs/architecture.md`：模块边界、线程模型、测试分层
-- `docs/README.md`：文档索引与维护规则
-- `docs/features.md`：产品范围（已排期 / 开发中 / 待发布 / 已发布 / 不做）
-- `docs/workflow.md`：issue → dev → 验证 → 发布流程
-- `README.md` / `README.zh-CN.md`：用户可见行为
+- `docs/architecture.md`：当前实现、模块边界、线程模型、测试分层
+- `README.md` / `README.zh-CN.md`：用户可见行为与项目愿景
 
 若代码与文档冲突，先指出冲突并确认，不要默默按其中一方改。
 
@@ -27,7 +23,6 @@
 - 日常开发在 `dev` 分支，不要直接提交/推送到 `master`。功能分支从 `dev` 开，PR 目标也是 `dev`。
 - `master` 作为稳定分支；发布时由用户确认后再合并 `dev` → `master`。
 - 版本发布：更新 `Cargo.toml` / `Cargo.lock` 的版本，打 annotated tag `vX.Y.Z`，推送 tag。CI 会构建并创建 GitHub Release。
-- 发布前确认 `docs/workflow.md` 的检查项；发布后更新 `docs/features.md` 状态。
 - 未经明确要求，不要：
   - `scp` 或安装新二进制到目标机
   - 替换目标机上的 `/usr/local/bin/rho`
@@ -93,7 +88,7 @@ main → config
 - `provider` 每轮请求在工作线程读取 HTTP 流，经 `mpsc` 回主线程；不要引入 tokio/reqwest。
 - `chat::Msg` 是协议无关的内部消息模型；OpenAI 字段映射留在 `provider/openai.rs`。
 - 工具循环必须保证历史协议合法：所有 `tool_calls` 都要有对应 `Tool` 消息占位。
-- 取消语义、进程组清理、确认 gate 的行为以 `docs/design.md` 为准，不要简化成“杀直接子进程”或“只 drop 连接”。
+- 取消语义、进程组清理、确认 gate 的行为以 `docs/architecture.md` 和现有代码为准，不要简化成“杀直接子进程”或“只 drop 连接”。
 
 ## 配置语义
 
@@ -134,13 +129,12 @@ main → config
 - 确认 gate 默认拒绝；`--yes` 只跳过确认，不绕过 allowlist。
 - 工具输出 stdout/stderr 各自有上限，只截断一次并保留省略字节数。
 - 超时和取消都走进程组 SIGTERM → 2s → SIGKILL；不要只杀直接子进程。
-- 不要新增第二个工具，除非设计文档明确要求。
+- 不要新增第二个工具，除非用户明确要求。
 
 ## 提交
 
 - 提交信息用英文、祈使句，保持小而聚焦。
-- 行为改动同步更新 `README.md`、`README.zh-CN.md`、`docs/design.md` 或 `docs/architecture.md` 中受影响的部分。
-- 功能发布、进入版本或明确不做时，同步更新 `docs/features.md`；普通 bugfix/重构不需要动功能清单。
-- 注释和设计文档用中文；用户可见文案目前也是中文。
+- 行为改动同步更新 `README.md`、`README.zh-CN.md` 或 `docs/architecture.md` 中受影响的部分。
+- 注释和文档用中文；用户可见文案目前也是中文。
 - 提交前检查 `git status`，不要提交 `target/`、临时脚本、测试日志或密钥。
 - 不要 force-push `master`。
