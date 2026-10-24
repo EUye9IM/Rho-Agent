@@ -70,7 +70,7 @@ git switch -c feat/123-config-error-line
 - PR 目标分支是 `dev`，不是 `master`
 - PR 描述里写 `Closes #123`，并贴验收条件和测试命令
 
-PR 会触发 CI（测试 + clippy）；`build` job 只在 `master` 和 `v*` tag 上跑。
+PR 会触发 CI（测试 + clippy）；`build` job 只在 `master`、`v*` tag 或手动触发时跑。
 
 ## 5. 验证
 
@@ -92,9 +92,9 @@ cargo +1.75.0 test --all-targets --locked
 - 终端交互、Ctrl-C、确认提示：用真实 TTY 或 `script -qec` 跑
 - 真实 DeepSeek 请求：手工验收，CI 不调用外部 API
 - 发布构建相关：按 AGENTS.md 的 musl 基线命令构建，并用 `qemu-x86_64 -cpu qemu64` 做低指令集检查
-- 目标机验证仅在明确需要时进行；不要默认 scp 或替换系统二进制
+- 只在明确需要时验证目标机；不要默认 scp 或替换系统二进制
 
-验收通过后合并 PR 到 `dev`。此时功能状态从 🚧 变为 🧪 待发布（如果已合并但还没发版）。
+验收通过后合并 PR 到 `dev`，并把功能状态从 🚧 改为 🧪。
 
 ## 6. 发布：dev → master → tag
 
@@ -121,7 +121,7 @@ tag 会触发 CI 构建 musl 产物并创建 GitHub Release。
 
 - CI run 成功
 - Release 资产存在：`rho-x86_64-unknown-linux-musl.tar.gz` + `.sha256`
-- 下载资产校验 sha256，确认是 static-pie
+- 下载资产并校验 sha256，确认产物是 static-pie
 - 必要时用 `qemu-x86_64 -cpu qemu64` 跑一次 HTTPS 路径
 - 更新 `docs/features.md`：🧪 → ✅，写清版本号
 - 关闭 milestone 和对应 issue
