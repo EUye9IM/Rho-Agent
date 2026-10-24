@@ -1,6 +1,8 @@
 # Rho-agent 架构设计
 
-对应 `design.md` 定稿。目标：单 crate、单二进制、模块边界少而清晰，阻塞 I/O + 线程。
+> 状态：现行架构文档（v0.1.0）。不是历史归档；实现变化时同步更新。末节里程碑为已完成历史记录。
+
+对应 [design.md](design.md) 定稿。目标：单 crate、单二进制、模块边界少而清晰，阻塞 I/O + 线程。
 
 ## 一、总体结构
 
@@ -210,7 +212,7 @@ exit 0：/exit、空闲态 Ctrl-C、Ctrl-D（均正常退出）
 | 取消/退出 | 集成：`ScriptedUi` 注入 `Line("/exit")`、`Eof`、`Interrupted{line_empty:true}` 验证 REPL 退出路径；直接注入信号记录（第 1 次/第 2 次）验证取消与退出路径；信号→记录一段（`term.rs`）手工验收 |
 | 终端交互 / 真实信号 | 手工验收 |
 
-## 八、与里程碑对应
+## 八、与里程碑对应（v0.1.0 已完成，历史记录）
 
 - M1 = `main` + `config` + `provider` + `sse` + `repl`（无工具路径）
 - M2 = `tools` + `term`（确认、超时、取消）

@@ -1,5 +1,5 @@
 //! 终端信号处理：SIGINT self-pipe、专用信号线程、Cancel（epoch 记录）。
-//! 见 architecture.md 五节。
+//! 见 docs/architecture.md 五节。
 
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};

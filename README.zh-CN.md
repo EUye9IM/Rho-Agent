@@ -6,7 +6,7 @@
 
 `rho` 是一个跑在终端里的轻量本地 agent。单 crate、单二进制（分发建议使用 musl 静态构建）、不引入 async 运行时，面向资源受限的 Linux 设备。你在 REPL 里对话，它从兼容 OpenAI Chat Completions 的供应商（默认 DeepSeek）流式返回结果，并能通过 `bash` 工具执行命令——执行前要过 allowlist 判定和人工确认。
 
-设计文档见 [design.md](design.md) 与 [architecture.md](architecture.md)。
+设计文档见 [docs/design.md](docs/design.md) 与 [docs/architecture.md](docs/architecture.md)。
 
 ## 特性
 

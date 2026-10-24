@@ -1,5 +1,5 @@
 //! 用户交互抽象：Ui trait + 生产实现 TermUi + 测试实现 ScriptedUi。
-//! Ui 不承载退出语义（退出由 REPL 层判定）。见 architecture.md 三节。
+//! Ui 不承载退出语义（退出由 REPL 层判定）。见 docs/architecture.md 三节。
 
 use crate::render::{self, RenderEvent};
 use std::collections::VecDeque;

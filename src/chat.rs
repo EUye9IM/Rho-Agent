@@ -1,4 +1,4 @@
-//! 内部消息模型与 agent 工具循环。见 architecture.md 三/四节。
+//! 内部消息模型与 agent 工具循环。见 docs/architecture.md 三/四节。
 
 use crate::config::{self, Config, Selection};
 use crate::provider::{self, ProviderAdapter, StreamEvent};
@@ -108,7 +108,7 @@ impl Session {
         )
     }
 
-    /// agent 工具循环（architecture.md 四节）。
+    /// agent 工具循环（docs/architecture.md 四节）。
     pub fn turn(&mut self, ui: &mut dyn Ui, cancel: &Cancel, input: &str) -> ChatResult<TurnEnd> {
         self.steps = 0;
         self.history.push(Msg::User(input.to_string()));

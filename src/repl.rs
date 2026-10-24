@@ -1,4 +1,4 @@
-//! REPL 循环：斜杠命令、Ctrl-C 语义。循环本体依赖 Ui trait。见 design.md 四节。
+//! REPL 循环：斜杠命令、Ctrl-C 语义。循环本体依赖 Ui trait。见 docs/design.md 四节。
 
 use crate::chat::{ChatResult, Session, TurnEnd};
 use crate::config;

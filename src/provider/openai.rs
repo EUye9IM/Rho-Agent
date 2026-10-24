@@ -1,4 +1,4 @@
-//! OpenAI Chat Completions 适配器。见 design.md 六节。
+//! OpenAI Chat Completions 适配器。见 docs/design.md 六节。
 
 use super::{ProviderAdapter, StreamEvent, TurnAcc};
 use crate::chat::Msg;

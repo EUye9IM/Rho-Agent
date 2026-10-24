@@ -2,8 +2,9 @@
 
 本文件写给在此仓库工作的编码 agent。开始改动前先读：
 
-- `design.md`：产品行为与取舍的定稿
-- `architecture.md`：模块边界、线程模型、测试分层
+- `docs/design.md`：产品行为与取舍的定稿
+- `docs/architecture.md`：模块边界、线程模型、测试分层
+- `docs/README.md`：文档索引与维护规则
 - `README.md` / `README.zh-CN.md`：用户可见行为
 
 若代码与文档冲突，先指出冲突并确认，不要默默按其中一方改。
@@ -89,7 +90,7 @@ main → config
 - `provider` 每轮请求在工作线程读取 HTTP 流，经 `mpsc` 回主线程；不要引入 tokio/reqwest。
 - `chat::Msg` 是协议无关的内部消息模型；OpenAI 字段映射留在 `provider/openai.rs`。
 - 工具循环必须保证历史协议合法：所有 `tool_calls` 都要有对应 `Tool` 消息占位。
-- 取消语义、进程组清理、确认 gate 的行为以 `design.md` 为准，不要简化成“杀直接子进程”或“只 drop 连接”。
+- 取消语义、进程组清理、确认 gate 的行为以 `docs/design.md` 为准，不要简化成“杀直接子进程”或“只 drop 连接”。
 
 ## 配置语义
 
@@ -135,7 +136,7 @@ main → config
 ## 提交
 
 - 提交信息用英文、祈使句，保持小而聚焦。
-- 行为改动同步更新 `README.md`、`README.zh-CN.md`、`design.md` 或 `architecture.md` 中受影响的部分。
+- 行为改动同步更新 `README.md`、`README.zh-CN.md`、`docs/design.md` 或 `docs/architecture.md` 中受影响的部分。
 - 注释和设计文档用中文；用户可见文案目前也是中文。
 - 提交前检查 `git status`，不要提交 `target/`、临时脚本、测试日志或密钥。
 - 不要 force-push `master`。
