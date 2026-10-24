@@ -1,0 +1,86 @@
+name: Feature request
+description: 提出一个功能愿望或改进想法
+title: "[Feature] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        先描述问题和场景，不要直接跳到实现。这个 issue 先作为愿望收集；确认进入某个版本后，才会被加入 `docs/features.md`。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 用户问题
+      description: 现在哪里不方便？谁在什么场景下遇到？
+      placeholder: 例如：在目标机上排查网络时，需要反复手输完整命令……
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望行为
+      description: 你希望 rho 表现成什么样？描述用户可见结果，不必先定实现。
+      placeholder: 例如：`rho --config x.toml` 时，如果配置里的模型不存在，启动前直接指出具体行号……
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收条件
+      description: 怎样算完成？尽量写成可验证的条目。
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: 边界与非目标
+      description: 这次明确不做什么？避免范围悄悄扩大。
+      placeholder: 例如：只支持 OpenAI Chat Completions；不改 bash 工具；不引入新依赖。
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 影响范围
+      multiple: true
+      options:
+        - CLI / REPL
+        - 配置
+        - provider / 协议
+        - bash 工具 / 安全
+        - 渲染 / 终端
+        - 构建 / 发布
+        - 文档
+        - 不确定
+
+  - type: dropdown
+    id: release
+    attributes:
+      label: 版本意向
+      options:
+        - 未排期（候选）
+        - 下一个 minor
+        - 下一个 patch
+        - 不确定
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: impact
+    attributes:
+      label: 影响检查
+      options:
+        - label: 改变用户可见行为或配置语义（需要先更新 docs/design.md）
+        - label: 可能增加依赖、体积或常驻内存
+        - label: 涉及 bash 工具、权限或安全模型
+        - label: 需要新增测试或手工终端验收
+
+  - type: textarea
+    id: context
+    attributes:
+      label: 补充信息
+      description: 链接、截图、类似工具的做法等。
