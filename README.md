@@ -18,7 +18,7 @@ Implementation: [docs/architecture.md](docs/architecture.md).
 - **Config-driven providers** — providers, models and thinking levels are declared as data. Same protocol family means configuration only.
 - **Streaming with visible reasoning** — text streams as it arrives; `reasoning_content` is rendered dimmed and stays local unless the provider sets `compat.echo_reasoning = true`.
 - **One tool: `bash`** — executed in the foreground as `bash -c <command>`, with a fresh shell per call and a per-call timeout that escalates to a process-group kill.
-- **Predictable Ctrl-C** — first Ctrl-C cancels the current stream/tool/confirmation, second one exits; the conversation history is always left in a protocol-valid state.
+- **Predictable Ctrl-C** — first Ctrl-C cancels the current stream/tool/confirmation, second one exits; at the idle prompt two empty-line Ctrl-C within two seconds exit (the first shows a gray hint). The conversation history is always left in a protocol-valid state.
 - **Strict config validation** — unknown fields, dangling references and missing required fields fail loudly with the config path (TOML syntax errors also include a line number), exit code 2.
 
 ## Requirements
@@ -90,7 +90,7 @@ User config comes only from `--config`; otherwise the built-in config is used. E
 | `/thinking [level]` | Switch thinking level, or list levels for the current model. Omitted from `/help` when the model declares none. |
 | `/clear` | Reset history to the configured `system_prompt` (or empty if none). |
 | `/help` | Show help. |
-| `/exit` | Quit (Ctrl-D and Ctrl-C on an empty line also exit cleanly). |
+| `/exit` | Quit (Ctrl-D also exits; at the prompt press Ctrl-C twice within two seconds — the first shows a gray hint). |
 
 Switching only affects subsequent requests; earlier history stays as recorded. If a `/provider` switch leaves the current model outside the new provider, the model resets to the first model declared by that provider and thinking resets to that model's `thinking_default`.
 

@@ -4,12 +4,13 @@ use crate::chat::{ChatResult, Session, TurnEnd};
 use crate::config;
 use crate::render::RenderEvent;
 use crate::term::{Cancel, SignalState};
-use crate::ui::{ReadOutcome, Ui};
+use crate::ui::{ReadOutcome, Ui, CTRL_C_WINDOW};
+use std::time::Instant;
 
 /// REPL 层的退出/致命错误（main 据此映射退出码 0/1）。
 #[derive(Debug)]
 pub enum ReplExit {
-    /// /exit、空行 Ctrl-C、Ctrl-D（正常退出，exit 0）
+    /// /exit、空行 Ctrl-C 双按、Ctrl-D（正常退出，exit 0）
     Quit,
     /// REPL 无法继续的内部错误（exit 1）
     Fatal(String),
@@ -17,6 +18,8 @@ pub enum ReplExit {
 
 /// REPL 主循环。
 pub fn run(ui: &mut dyn Ui, mut session: Session, cancel: &Cancel) -> Result<(), ReplExit> {
+    // 上一次空行 Ctrl-C 的时刻；仅在本窗口内再按一次才退出。
+    let mut ctrl_c_armed: Option<Instant> = None;
     loop {
         // 上一轮清理期间记录的 quit：不等下一次输入，立即退出。
         if cancel.state() == SignalState::Quit {
@@ -26,13 +29,30 @@ pub fn run(ui: &mut dyn Ui, mut session: Session, cancel: &Cancel) -> Result<(),
         let outcome = ui.read_line();
         check_fatal(ui)?;
         match outcome {
-            ReadOutcome::Eof => return Ok(()),
-            ReadOutcome::Interrupted { line_empty: true } => return Ok(()),
+            ReadOutcome::Eof => {
+                ui.set_ctrl_c_hint(false);
+                return Ok(());
+            }
             ReadOutcome::Interrupted { line_empty: false } => {
-                // rustyline 已清空编辑行；回到提示符。
+                // rustyline 已清空编辑行；用户还在输入，撤销武装。
+                ctrl_c_armed = None;
+                ui.set_ctrl_c_hint(false);
+                continue;
+            }
+            ReadOutcome::Interrupted { line_empty: true } => {
+                let now = Instant::now();
+                if ctrl_c_armed.is_some_and(|armed| within_window(armed, now)) {
+                    ui.set_ctrl_c_hint(false);
+                    return Ok(());
+                }
+                // 第一次：武装并在提示符行尾显示灰提示，等第二次。
+                ctrl_c_armed = Some(now);
+                ui.set_ctrl_c_hint(true);
                 continue;
             }
             ReadOutcome::Line(line) => {
+                ctrl_c_armed = None;
+                ui.set_ctrl_c_hint(false);
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -81,6 +101,11 @@ fn check_fatal(ui: &mut dyn Ui) -> Result<(), ReplExit> {
         Some(e) => Err(ReplExit::Fatal(e)),
         None => Ok(()),
     }
+}
+
+/// 两次空行 Ctrl-C 的间隔是否仍在双按窗口内。
+fn within_window(armed: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(armed) < CTRL_C_WINDOW
 }
 
 /// 斜杠命令处理：/model /provider /thinking /clear /help /exit。
@@ -220,4 +245,19 @@ fn advance_epoch(cancel: &Cancel) -> bool {
 /// 会话 cwd 展示（恒为进程启动目录）。
 pub fn session_cwd() -> String {
     crate::session_cwd()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn window_covers_exactly_two_seconds() {
+        let armed = Instant::now();
+        assert!(within_window(armed, armed));
+        assert!(within_window(armed, armed + CTRL_C_WINDOW - Duration::from_millis(1)));
+        assert!(!within_window(armed, armed + CTRL_C_WINDOW));
+        assert!(!within_window(armed, armed + Duration::from_secs(30)));
+    }
 }
