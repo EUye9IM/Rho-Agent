@@ -42,7 +42,7 @@ src/
   sse.rs         SSE 行解析器（纯函数，可夹具测试）
   tools.rs       bash 执行：进程组 spawn、超时升级、双 drain 管道读取、
                  输出截断、allowlist + 元字符判定、确认
-  render.rs      纯格式化函数：思考暗淡色、正文原样、工具行、截断标注
+  render.rs      纯格式化函数：思考暗淡色、正文原样、工具行、带左边栏的工具结果、截断标注
                  （颜色固定使用 ANSI 转义，暗色终端下仍可用）
   repl.rs        斜杠命令、Ctrl-C 语义；循环本体依赖 Ui trait
   term.rs        终端信号处理（SIGINT、进程组信号）
