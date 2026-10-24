@@ -5,6 +5,7 @@
 - `docs/design.md`：产品行为与取舍的定稿
 - `docs/architecture.md`：模块边界、线程模型、测试分层
 - `docs/README.md`：文档索引与维护规则
+- `docs/features.md`：产品范围（已发布 / 候选 / 不做）
 - `README.md` / `README.zh-CN.md`：用户可见行为
 
 若代码与文档冲突，先指出冲突并确认，不要默默按其中一方改。
@@ -137,6 +138,7 @@ main → config
 
 - 提交信息用英文、祈使句，保持小而聚焦。
 - 行为改动同步更新 `README.md`、`README.zh-CN.md`、`docs/design.md` 或 `docs/architecture.md` 中受影响的部分。
+- 功能发布、进入版本或明确不做时，同步更新 `docs/features.md`；普通 bugfix/重构不需要动功能清单。
 - 注释和设计文档用中文；用户可见文案目前也是中文。
 - 提交前检查 `git status`，不要提交 `target/`、临时脚本、测试日志或密钥。
 - 不要 force-push `master`。
