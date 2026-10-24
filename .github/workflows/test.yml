@@ -3,6 +3,7 @@ name: test
 on:
   push:
     branches: [master]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -70,7 +71,7 @@ jobs:
 
   build:
     name: build (x86_64-musl)
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v') }}
     needs: [test, clippy]
     runs-on: ubuntu-latest
     permissions:
@@ -148,4 +149,26 @@ jobs:
               --prerelease \
               --title "Nightly" \
               --notes "Rolling nightly build from ${GITHUB_SHA:0:7}"
+          fi
+
+      - name: Publish versioned release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          asset=rho-x86_64-unknown-linux-musl.tar.gz
+          checksum=${asset}.sha256
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "dist/$asset" "dist/$checksum" --clobber
+            gh release edit "$tag" \
+              --title "$tag" \
+              --notes "Release $tag"
+          else
+            gh release create "$tag" "dist/$asset" "dist/$checksum" \
+              --target "$GITHUB_SHA" \
+              --title "$tag" \
+              --generate-notes
           fi
