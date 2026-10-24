@@ -14,7 +14,7 @@ feature branch ──PR──► dev ──PR──► master ──tag vX.Y.Z�
 
 ## 1. 愿望：开 issue
 
-在 GitHub 选择 **New issue → Feature request**。模板会要求：
+在 GitHub 选择 **New issue → Feature request / 功能建议**。模板默认标题前缀 `[Feature] `，并自动加 `enhancement` 标签。模板会要求：
 
 - 用户问题：现在哪里不方便，谁在什么场景下遇到
 - 期望行为：用户可见结果，不先规定实现
