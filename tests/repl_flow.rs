@@ -305,23 +305,74 @@ fn ui_io_error_maps_to_exit_1() {
 }
 
 #[test]
-fn eof_and_empty_interrupt_exit_normally() {
+fn eof_exits_normally() {
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![ReadOutcome::Eof], vec![]);
     assert!(repl::run(&mut ui, session(), &cancel).is_ok());
+}
 
-    let mut ui = ScriptedUi::new(
-        vec![ReadOutcome::Interrupted { line_empty: true }],
-        vec![],
-    );
-    assert!(repl::run(&mut ui, session(), &cancel).is_ok());
-
+#[test]
+fn single_empty_interrupt_only_arms() {
+    let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(
         vec![
-            ReadOutcome::Interrupted { line_empty: false },
-            ReadOutcome::Line("/exit".into()),
+            ReadOutcome::Interrupted { line_empty: true },
+            ReadOutcome::Line("/help".into()),
         ],
         vec![],
     );
     assert!(repl::run(&mut ui, session(), &cancel).is_ok());
+    // 没退出：/help 确实执行了。
+    assert!(!ui.rendered.is_empty());
+}
+
+#[test]
+fn double_empty_interrupt_exits() {
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(
+        vec![
+            ReadOutcome::Interrupted { line_empty: true },
+            ReadOutcome::Interrupted { line_empty: true },
+            ReadOutcome::Line("/help".into()),
+        ],
+        vec![],
+    );
+    assert!(repl::run(&mut ui, session(), &cancel).is_ok());
+    // 第二次空行 Ctrl-C 已退出：后面的 /help 不该被执行。
+    assert!(ui.rendered.is_empty());
+}
+
+#[test]
+fn editing_interrupt_disarms_before_exit() {
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(
+        vec![
+            ReadOutcome::Interrupted { line_empty: true },
+            // 编辑中（行非空）Ctrl-C：清行并撤销武装，回提示符。
+            ReadOutcome::Interrupted { line_empty: false },
+            ReadOutcome::Interrupted { line_empty: true },
+            ReadOutcome::Line("/help".into()),
+        ],
+        vec![],
+    );
+    assert!(repl::run(&mut ui, session(), &cancel).is_ok());
+    // 第三次 Ctrl-C 只是重新武装，不该退出。
+    assert!(!ui.rendered.is_empty());
+}
+
+#[test]
+fn submitted_line_clears_arm() {
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(
+        vec![
+            ReadOutcome::Interrupted { line_empty: true },
+            // 空行回车清掉武装。
+            ReadOutcome::Line(String::new()),
+            ReadOutcome::Interrupted { line_empty: true },
+            ReadOutcome::Line("/help".into()),
+        ],
+        vec![],
+    );
+    assert!(repl::run(&mut ui, session(), &cancel).is_ok());
+    assert!(!ui.rendered.is_empty());
 }

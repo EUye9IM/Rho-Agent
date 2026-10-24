@@ -27,6 +27,7 @@ rustls-pemfile = "2"
 webpki-roots = "0.26"
 rustyline = { version = "14", default-features = false, features = ["custom-bindings"] }
 libc = "0.2"
+unicode-width = "0.1"
 
 [dev-dependencies]
 indexmap = { version = "2.7", features = ["serde"] }

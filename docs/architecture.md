@@ -21,6 +21,7 @@
 
 - **主线程**：REPL、agent loop、渲染、确认交互、工具执行（阻塞在前台，Ctrl-C 由信号处理转取消）。
 - **工作线程**：每轮请求一个，阻塞读 HTTP 流，把增量事件经 `mpsc` 发回主线程；主线程收到取消标志后放弃该线程（detach）。
+- **信号线程 / 提示期限线程**：`rho-sigint` 消费 self-pipe 记录 Ctrl-C；`rho-hint` 在双按窗口到期后撤掉提示符行尾的灰提示（见五）。
 
 ## 二、Crate 与模块布局
 
@@ -89,17 +90,18 @@ trait ProviderAdapter: Send + Sync {
 
 ```rust
 // ui.rs — 用户交互抽象，repl / chat / tools 通过此接口访问终端
-// 退出语义由 REPL 层负责：/exit、Eof、空行 Ctrl-C 映射为退出；
+// 退出语义由 REPL 层负责：/exit、Eof、空行 Ctrl-C 双按映射为退出；
 // 活动操作中信号路径的 quit 由 agent loop 检测（见五）
 
 trait Ui {
     fn read_line(&mut self) -> ReadOutcome;                       // REPL 输入 / 斜杠命令
     fn confirm(&mut self, cwd: &str, cmd: &str) -> ConfirmOutcome; // bash 确认
     fn print(&mut self, ev: &RenderEvent);                        // 渲染输出
+    fn set_ctrl_c_hint(&mut self, armed: bool) {}                 // 双按灰提示开关
 }
 enum ReadOutcome {
     Line(String),                     // 普通输入或斜杠命令
-    Interrupted { line_empty: bool }, // Ctrl-C：编辑中（false）清空输入；空行（true）退出
+    Interrupted { line_empty: bool }, // Ctrl-C：编辑中（false）清空输入；空行（true）进入双按窗口
     Eof,                              // Ctrl-D
 }
 enum ConfirmOutcome {
@@ -109,12 +111,14 @@ enum ConfirmOutcome {
 }
 ```
 
-- 退出语义：`read_line` 只返回 `Line`/`Interrupted`/`Eof`；`/exit` 作为普通 `Line` 由 REPL 层解析为退出（斜杠命令由 repl.rs 解析）。空行/编辑中 Ctrl-C 返回 `Interrupted`，由 REPL 层按 `line_empty` 决定退出或清行；`ConfirmOutcome::Cancelled` 是确认界面的 Ctrl-C，取消整轮（若为当前轮第二次则收尾后退出，见信号计数）。
+- 退出语义：`read_line` 只返回 `Line`/`Interrupted`/`Eof`；`/exit` 作为普通 `Line` 由 REPL 层解析为退出（斜杠命令由 repl.rs 解析）。空行 Ctrl-C 返回 `Interrupted`；REPL 层按 2 秒双按窗口判定——窗口内第二次才退出，第一次只武装并在提示符行尾显示灰提示，编辑中（`line_empty: false`）按 Ctrl-C 清行并撤销武装，任何提交的行（含空行）都清掉武装。`ConfirmOutcome::Cancelled` 是确认界面的 Ctrl-C，取消整轮（若为当前轮第二次则收尾后退出，见信号计数）。
 - **Ctrl-C 的唯一记录生产者是专用信号线程**（confirm 场景）：终端保持 ISIG，Ctrl-C 产生 SIGINT，经 self-pipe/signalfd 由信号线程在锁内追加记录；`confirm` 的可中断读取由 SIGINT 唤醒返回 `Cancelled`；记录只由信号线程追加，计数只有一份。
 - **rustyline 输入路径**：rustyline 原始模式会接管 SIGINT，Ctrl-C 由 rustyline 返回 `Interrupted`，REPL 层直接处理（清行/退出）。这条路径属于按键输入；信号线程只处理活动操作（流式/工具/确认）的 SIGINT。两套路径在时间上互斥，计数保持唯一。
-- **Ui trait 只负责输入、确认和输出**：退出有两条路径——① REPL 层判定（`/exit`、`Eof`、空行 Ctrl-C），以 `Result<T, Quit>` 内部错误通道传给 agent loop，agent loop 按占位规则收尾后向上返回退出；② 活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测，同样按占位规则收尾、完成工具进程清理后退出。两条路径最终都会先完成剩余调用的占位补齐与进程组清理，再退出。
+- **Ui trait 只负责输入、确认和输出**：退出有两条路径——① REPL 层判定（`/exit`、`Eof`、空行 Ctrl-C 双按），以 `Result<T, Quit>` 内部错误通道传给 agent loop，agent loop 按占位规则收尾后向上返回退出；② 活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测，同样按占位规则收尾、完成工具进程清理后退出。两条路径最终都会先完成剩余调用的占位补齐与进程组清理，再退出。
 
 - 生产实现 `TermUi`：rustyline 后端；`confirm` 用可中断读取（保持 ISIG，Ctrl-C 产生 SIGINT 唤醒读取并返回 `Cancelled`；记录由信号线程统一维护）。stdin 是否为 TTY 的检查在 `TermUi::new` 里做，`main` 只接收检查结果。
+- 双按提示：`TermUi` 用 `Helper` 实现 `Hinter`/`Highlighter`，武装时在空行上返回暗淡色提示（`render::dim`），由下一次 `readline` 的重绘显示；`CTRL_C_WINDOW` 常量由 `ui.rs` 提供，`repl` 用同一常量判定退出。到期由 `rho-hint` 线程撤掉提示：它只向 stdout 写一个“擦光标到行尾”的序列（`\x1b[K`），不移动光标，因此 rustyline 的位置模型（提示符末尾、输入行空）保持不变，也不会把提示符顶到下一行。动手前提由 `HintArm` 里的三个原子标志控制——处于 `readline` 期间、提示行当前为空（`Hinter` 每次重绘时更新）、stdout 是 TTY，否则只撤销武装不碰终端。
+- 被 Ctrl-C 中断的输入不提交，而 rustyline 每次 `readline` 结束都会补一个换行（`Editor::readline_with` 的 `term.writeln()`），于是会在回滚区留下提示符 + 已输入内容组成的块。`CtrlCHandler` 在中断时记下输入行的显示宽度（`unicode-width`），`TermUi` 结合 `TIOCGWINSZ` 的列数算出这块占几行，下一次 `read_line` 开始时用“上移 N 行 + `\x1b[J` 擦到屏幕末尾”把它收回重用（提示符永远是最后一段输出）；双按退出时在 `Drop` 里同样收回。这样打字后按 Ctrl-C 是原地清空，不多占行。stdout 不是 TTY 时不动光标。
 - 测试实现 `ScriptedUi`：预排输入队列 + 预排确认结果 + 收集渲染事件，驱动 `repl → agent loop → tools` 全链路。
 
 - `TurnAcc`（worker 线程的每流累加器）：按 `index` 组装多段 `tool_calls`、累积 text/reasoning；流正常结束时组装为完整 Assistant 消息经 `Final` 交付主线程。取消时主线程 drop Receiver，累加器随 worker 结束一起丢弃。
@@ -169,7 +173,7 @@ loop {
 - **限额逐个前置检查**：每个调用执行前先检查限额；**所有模型发起的调用都计数**（含参数解析失败/未知工具名/spawn 失败的调用），防止错误调用无限循环。
 - **历史即上下文**：历史（`Vec<Msg>`）原样序列化进请求；窗口超限时展示错误并提示 `/clear`。
 - **reasoning 默认留在本地**：`echo_reasoning = true` 时随历史回传，其余情况序列化时丢弃（适配层职责）。
-- **两条退出路径最终汇合**：REPL 层将 `/exit` 命令、空行 Ctrl-C、`Eof`（Ctrl-D）映射为退出（经内部通道传 agent loop）；活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测。两路径均先完成剩余调用占位补齐与工具进程清理再退出。
+- **两条退出路径最终汇合**：REPL 层将 `/exit` 命令、空行 Ctrl-C 双按、`Eof`（Ctrl-D）映射为退出（经内部通道传 agent loop）；活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测。两路径均先完成剩余调用占位补齐与工具进程清理再退出。
 
 ## 五、线程与取消（term.rs / repl.rs）
 
@@ -185,6 +189,7 @@ struct State { epoch: u64, records: Vec<u32 /*第几次 Ctrl-C*/>, prev_quit: bo
 - 消费点：渲染/接收循环（`recv_timeout` 短轮询，超时即查；**成功收到事件也先查再处理**）、工具等待循环（触发进程组升级终止；发现 quit 只终止进程组并**返回“quit 已请求”给 agent loop**，由 agent loop 收尾）、agent loop（按占位规则补齐当前及剩余调用后回 REPL 或统一退出程序）。工具执行/清理期间由当前轮信号记录承接第二次 Ctrl-C。
 - 流线程取消：主线程 drop Receiver → worker 下一次 `send` 报错即退出循环；HTTP 连接保持到线程结束。channel 为无界 `mpsc`：无界使发送永不阻塞，配合 drop-Receiver 早退语义最简单。
 - 工具执行与进程组终止：`setsid` 建进程组；stdout/stderr 各起一个 drain 线程并行读取。截断缓冲为两段结构：头部前缀（上限前半）+ 滑动尾部窗口（上限后半），中间字节计数丢弃，按头尾保留语义处理。**主线程是唯一 reaper**：`waitpid` 只由主线程执行，退出状态存入共享标志；drain 线程只轮询共享退出标志，观察到退出后进入收尾阶段（短超时上限内继续读取管道中已缓冲的剩余数据，防止后台进程持续写入），超时或 EOF 即退出线程并关闭自己持有的读端；主线程只负责 `waitpid`，读端由 drain 线程持有。终止升级以进程组为准：SIGTERM 发 pgid → 2s → 对 pgid 发 SIGKILL → 主线程回收 bash（直接子进程回收条件与进程组清理条件分离）。
+- **Ctrl-C 的两套记录互不复用**：活动操作（流式/工具/确认）的计数归 `Cancel`（信号线程写入，只看次数和 epoch，没有时间概念）；提示符态的双按武装归 `repl` 的一个 `Option<Instant>`，窗口常量 `CTRL_C_WINDOW` 与 `ui.rs` 共用，从不写入 `Cancel`。rustyline 在 `readline` 期间清掉 ISIG，两套记录在时间上互斥。
 - quit（当前轮第二次 Ctrl-C）被消费即走退出路径；切轮时旧轮未消费的 quit 结转为 `prev_quit`，下一轮查询时仍触发退出。
 
 ## 六、错误与退出码
@@ -192,7 +197,7 @@ struct State { epoch: u64, records: Vec<u32 /*第几次 Ctrl-C*/>, prev_quit: bo
 ```
 exit 2：参数用法错误（含 stdin 非 TTY）、配置解析/校验失败、显式指定的供应商 key 不齐全、隐式选择时无任何可用供应商（含缺失变量列表）
 exit 1：REPL 无法继续的内部运行时错误（渲染 I/O 错误等）；panic=abort 下 panic 直接 abort，exit 1 用于其他 REPL 内部错误
-exit 0：/exit、空闲态 Ctrl-C、Ctrl-D（均正常退出）
+exit 0：/exit、空闲态 Ctrl-C 双按、Ctrl-D（均正常退出）
 ```
 
 - 轮内错误（断流、上游 4xx/5xx）**展示后回到 REPL**，保留已完成历史；exit 1 用于 REPL 本身无法继续的内部错误。
