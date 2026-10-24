@@ -4,7 +4,7 @@
 
 它是产品范围索引，不是任务看板：
 
-- **愿望先写 issue，不直接写进本文件。** 只有 triage 通过、确认进入版本的功能才出现在下面。
+- **愿望先写 issue，不直接写进本文件。** 只有经过 triage、确认进入版本的功能才出现在下面。
 - 行为细节以 [design.md](design.md) 和 [README](../README.md) 为准。
 - 具体开发任务用 GitHub Issue 跟踪。
 - 版本范围用 milestone 跟踪。
