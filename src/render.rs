@@ -1,4 +1,4 @@
-//! 渲染：思考暗淡色、正文原样、工具行、截断标注。无颜色开关。
+//! 渲染：思考暗淡色、正文原样、工具行、带左边栏的工具结果、截断标注。颜色固定。
 
 /// 渲染事件（agent loop → ui.print 的载荷；具体形态实现期定）。
 #[derive(Debug)]
@@ -11,7 +11,7 @@ pub enum RenderEvent {
     LineBreak,
     /// 工具调用行：`→ bash: <命令>`
     ToolCall(String),
-    /// 工具结果（缩进显示，截断处标注省略字节数）
+    /// 工具结果（带左边栏显示，截断处标注省略字节数）
     ToolResult(String),
     /// 错误展示（轮内错误，回 REPL）
     Error(String),
@@ -27,14 +27,20 @@ pub fn tool_call_line(cmd: &str) -> String {
     format!("→ bash: {cmd}")
 }
 
-/// 工具结果缩进显示。
+/// 工具结果带左边栏显示，空白行不补尾随空格。
 pub fn tool_result_block(content: &str) -> String {
     if content.is_empty() {
-        return "  （无输出）".to_string();
+        return "  │ （无输出）".to_string();
     }
     content
         .lines()
-        .map(|line| format!("  {line}"))
+        .map(|line| {
+            if line.is_empty() {
+                "  │".to_string()
+            } else {
+                format!("  │ {line}")
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -54,7 +60,17 @@ mod tests {
     }
 
     #[test]
-    fn result_block_indents_each_line() {
-        assert_eq!(tool_result_block("a\nb"), "  a\n  b");
+    fn result_block_uses_left_rail() {
+        assert_eq!(tool_result_block("a\nb"), "  │ a\n  │ b");
+    }
+
+    #[test]
+    fn result_block_handles_empty_output() {
+        assert_eq!(tool_result_block(""), "  │ （无输出）");
+    }
+
+    #[test]
+    fn result_block_keeps_blank_lines() {
+        assert_eq!(tool_result_block("a\n\nb"), "  │ a\n  │\n  │ b");
     }
 }
