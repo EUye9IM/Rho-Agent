@@ -73,6 +73,8 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}
     needs: [test, clippy]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -117,3 +119,30 @@ jobs:
             dist/rho-x86_64-unknown-linux-musl.tar.gz.sha256
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish rolling nightly
+        if: github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=nightly
+          asset=rho-x86_64-unknown-linux-musl.tar.gz
+          checksum=${asset}.sha256
+
+          # 让 nightly tag 始终指向最新 master commit。
+          git tag -f "$tag" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$tag"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "dist/$asset" "dist/$checksum" --clobber
+            gh release edit "$tag" \
+              --title "Nightly" \
+              --notes "Rolling nightly build from ${GITHUB_SHA:0:7}"
+          else
+            gh release create "$tag" "dist/$asset" "dist/$checksum" \
+              --target "$GITHUB_SHA" \
+              --prerelease \
+              --title "Nightly" \
+              --notes "Rolling nightly build from ${GITHUB_SHA:0:7}"
+          fi
