@@ -6,7 +6,7 @@
 
 `rho` is a small local agent that lives in your terminal. It is a single binary (musl static builds are the intended distribution form), has no async runtime, and is built for resource-constrained Linux boxes. You talk to it in a REPL; it streams answers from an OpenAI Chat Completions–compatible provider (DeepSeek by default) and can run shell commands through a `bash` tool gated by an allowlist plus an explicit confirmation.
 
-Design docs: [design.md](design.md) and [architecture.md](architecture.md) (both in Chinese).
+Design docs: [docs/design.md](docs/design.md) and [docs/architecture.md](docs/architecture.md) (both in Chinese).
 
 ## Features
 
