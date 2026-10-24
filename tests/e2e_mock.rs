@@ -6,7 +6,8 @@ use rho::provider;
 use rho::term::Cancel;
 use rho::tools;
 use rho::render::RenderEvent;
-use rho::ui::{ConfirmOutcome, ScriptedUi};
+use rho::repl;
+use rho::ui::{ConfirmOutcome, ReadOutcome, ScriptedUi};
 
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -581,6 +582,37 @@ fn bash_large_output_is_truncated_once_with_accurate_count() {
         .parse()
         .unwrap();
     assert!(omitted > 99_000, "omitted was {omitted}");
+}
+
+#[test]
+fn repl_adds_line_break_after_done_response() {
+    let (base_url, _bodies) = start_server(vec![text_response("one line")]);
+    let path = write_config(&base_url);
+    let cfg = config::load(&Some(path.clone())).unwrap();
+    let _ = std::fs::remove_file(path);
+    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
+    let adapter = provider::adapter_for(&selection.provider).unwrap();
+    let session = Session::new(cfg, selection, adapter, false);
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(
+        vec![ReadOutcome::Line("go".into()), ReadOutcome::Line("/exit".into())],
+        vec![],
+    );
+
+    repl::run(&mut ui, session, &cancel).unwrap();
+
+    let text = ui
+        .rendered
+        .iter()
+        .position(|e| matches!(e, RenderEvent::TextDelta(s) if s == "one line"))
+        .unwrap();
+    let line_break = ui
+        .rendered
+        .iter()
+        .position(|e| matches!(e, RenderEvent::LineBreak))
+        .unwrap();
+    assert!(text < line_break);
+    assert!(matches!(ui.rendered.last(), Some(RenderEvent::LineBreak)));
 }
 
 #[test]

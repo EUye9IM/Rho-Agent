@@ -62,7 +62,13 @@ pub fn run(ui: &mut dyn Ui, mut session: Session, cancel: &Cancel) -> Result<(),
                     return Err(ReplExit::Quit);
                 }
                 match turn {
-                    Ok(TurnEnd::Done) | Ok(TurnEnd::Error(_)) | Ok(TurnEnd::Cancelled) => {}
+                    // 正常回复最后一段通常不带换行；补一个 LineBreak，避免下一次
+                    // rustyline 刷新提示符时用 `\r\x1b[K` 擦掉最后一行。
+                    Ok(TurnEnd::Done) => {
+                        ui.print(&RenderEvent::LineBreak);
+                        check_fatal(ui)?;
+                    }
+                    Ok(TurnEnd::Error(_)) | Ok(TurnEnd::Cancelled) => {}
                     Err(_) => return Err(ReplExit::Quit),
                 }
             }
