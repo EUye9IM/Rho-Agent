@@ -324,6 +324,8 @@ fn single_empty_interrupt_only_arms() {
     assert!(repl::run(&mut ui, session(), &cancel).is_ok());
     // 没退出：/help 确实执行了。
     assert!(!ui.rendered.is_empty());
+    // 第一次空行 Ctrl-C 武装，提交行撤销；队列耗尽后的 Eof 也撤销。
+    assert_eq!(ui.hints, vec![true, false, false]);
 }
 
 #[test]
@@ -340,6 +342,7 @@ fn double_empty_interrupt_exits() {
     assert!(repl::run(&mut ui, session(), &cancel).is_ok());
     // 第二次空行 Ctrl-C 已退出：后面的 /help 不该被执行。
     assert!(ui.rendered.is_empty());
+    assert_eq!(ui.hints, vec![true, false]);
 }
 
 #[test]
@@ -358,6 +361,8 @@ fn editing_interrupt_disarms_before_exit() {
     assert!(repl::run(&mut ui, session(), &cancel).is_ok());
     // 第三次 Ctrl-C 只是重新武装，不该退出。
     assert!(!ui.rendered.is_empty());
+    // 武装 → 编辑中按 Ctrl-C 撤销 → 再次武装 → 提交行撤销 → Eof 撤销。
+    assert_eq!(ui.hints, vec![true, false, true, false, false]);
 }
 
 #[test]
@@ -375,4 +380,6 @@ fn submitted_line_clears_arm() {
     );
     assert!(repl::run(&mut ui, session(), &cancel).is_ok());
     assert!(!ui.rendered.is_empty());
+    // 空行回车也清掉武装，所以第三个 Ctrl-C 只能重新武装。
+    assert_eq!(ui.hints, vec![true, false, true, false, false]);
 }
