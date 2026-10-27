@@ -10,13 +10,10 @@ use rho::tools::{BashEnd, BashOutput};
 use rho::ui::{ConfirmOutcome, ReadOutcome, ScriptedUi, Ui};
 
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-/// 测试用临时文件名的进程内序号：`SystemTime` 分辨率不足以保证并行测试不撞名。
-static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 const CONFIG_TOML: &str = r#"
 [providers.mock]
@@ -30,14 +27,7 @@ max_output = 100
 
 /// launcher 不发真实请求，base_url 仅需通过校验。
 fn session() -> Session {
-    let path = std::env::temp_dir().join(format!(
-        "rho-agentloop-{}-{}.toml",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::SeqCst)
-    ));
-    std::fs::write(&path, CONFIG_TOML).unwrap();
-    let cfg = config::load(&Some(path.display().to_string())).unwrap();
-    let _ = std::fs::remove_file(path);
+    let cfg = config::load_str(CONFIG_TOML, "<测试配置>").unwrap();
     let selection = config::resolve_selection(&cfg, None, None).unwrap();
     let adapter = provider::adapter_for(&selection.provider).unwrap();
     Session::new(cfg, selection, adapter, false)

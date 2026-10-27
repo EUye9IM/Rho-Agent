@@ -121,14 +121,21 @@ pub fn load(path: &Option<String>) -> Result<Config, String> {
 fn load_file(path: &str) -> Result<Config, String> {
     let source = std::fs::read_to_string(path)
         .map_err(|e| format!("无法读取配置文件 {path}：{e}"))?;
-    load_source(&source, path)
+    // 报错文案带文件路径而非通用标签。
+    parse_and_validate(&source, path)
 }
 
 fn load_builtin() -> Result<Config, String> {
-    load_source(include_str!("default.toml"), "<内置默认配置>")
+    parse_and_validate(include_str!("default.toml"), "<内置默认配置>")
 }
 
-fn load_source(source: &str, label: &str) -> Result<Config, String> {
+/// 从 TOML 字符串构建已验证的 Config（测试入口：无需临时文件）。
+/// `label` 仅用于报错文案。
+pub fn load_str(source: &str, label: &str) -> Result<Config, String> {
+    parse_and_validate(source, label)
+}
+
+fn parse_and_validate(source: &str, label: &str) -> Result<Config, String> {
     let cfg: Config = toml::from_str(source).map_err(|e| {
         let line = e
             .span()

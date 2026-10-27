@@ -227,28 +227,9 @@ fn text_response(text: &str) -> String {
     out
 }
 
-fn write_config(base_url: &str) -> String {
-    write_config_extra(base_url, "")
-}
-
-fn write_config_extra(base_url: &str, extra: &str) -> String {
-    write_config_full(base_url, extra, "")
-}
-
-/// 测试用临时文件名的进程内序号：`SystemTime` 分辨率不足以保证并行测试不撞名。
-static TMP_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-fn tmp_path(tag: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "rho-{tag}-{}-{}.toml",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    ))
-}
-
-fn write_config_full(base_url: &str, top_extra: &str, provider_extra: &str) -> String {
-    let path = tmp_path("integration");
-    let toml = format!(
+/// 由 mock 服务器 base_url 组装完整 TOML（测试用，不再落盘）。
+fn config_toml(base_url: &str, top_extra: &str, provider_extra: &str) -> String {
+    format!(
         r#"
 {top_extra}
 [providers.mock]
@@ -265,20 +246,34 @@ allow = []
 timeout_seconds = 5
 max_output_bytes = 1024
 "#
-    );
-    std::fs::write(&path, toml).unwrap();
-    path.display().to_string()
+    )
+}
+
+/// 保留一个真实文件加载路径的护栏：报错文案带文件路径。
+#[test]
+fn file_load_error_mentions_path() {
+    let path = std::env::temp_dir().join(format!(
+        "rho-e2e-fileload-{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(&path, "not valid toml =").unwrap();
+    let err = config::load(&Some(path.display().to_string())).unwrap_err();
+    let _ = std::fs::remove_file(&path);
+    assert!(err.contains(&path.display().to_string()), "error was {err}");
+}
+
+/// 按配置文本构建会话（mock 服务器 base_url 注入）。
+fn session_for(base_url: &str, top_extra: &str, provider_extra: &str) -> Session {
+    let cfg = config::load_str(&config_toml(base_url, top_extra, provider_extra), "<测试配置>").unwrap();
+    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
+    let adapter = provider::adapter_for(&selection.provider).unwrap();
+    Session::new(cfg, selection, adapter, false)
 }
 
 #[test]
 fn full_tool_loop_with_mock_sse() {
     let server = start_server(vec![tool_call_response(), text_response("done")]);
-    let path = write_config(server.base_url());
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::No]);
 
@@ -352,12 +347,7 @@ fn slow_response_headers_are_not_an_error() {
         let _ = stream.shutdown(Shutdown::Both);
     });
 
-    let cfg_path = write_config(server.base_url());
-    let cfg = config::load(&Some(cfg_path.clone())).unwrap();
-    let _ = std::fs::remove_file(&cfg_path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![]);
 
@@ -386,12 +376,7 @@ fn slow_stream_between_chunks_is_not_an_error() {
         let _ = stream.shutdown(Shutdown::Both);
     });
 
-    let cfg_path = write_config(server.base_url());
-    let cfg = config::load(&Some(cfg_path.clone())).unwrap();
-    let _ = std::fs::remove_file(&cfg_path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![]);
 
@@ -405,7 +390,6 @@ fn slow_stream_between_chunks_is_not_an_error() {
 
 #[test]
 fn config_errors_are_collected() {
-    let path = tmp_path("bad");
     let toml = r#"
 default_provider = "missing"
 default_model = "noprefix"
@@ -419,9 +403,7 @@ thinking_default = "high"
 [models.bad.thinking]
 low = { thinking = { type = "enabled" } }
 "#;
-    std::fs::write(&path, toml).unwrap();
-    let err = config::load(&Some(path.display().to_string())).unwrap_err();
-    let _ = std::fs::remove_file(path);
+    let err = config::load_str(toml, "<测试配置>").unwrap_err();
     assert!(err.contains("default_provider"));
     assert!(err.contains("default_model"));
     assert!(err.contains("thinking_default"));
@@ -530,12 +512,7 @@ fn ctrl_c_during_stream_cancels_and_discards_partial() {
         let _ = stream.flush();
         let _ = stream.shutdown(Shutdown::Both);
     });
-    let path = write_config(server.base_url());
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let injector = cancel.clone();
     std::thread::spawn(move || {
@@ -600,12 +577,7 @@ fn two_tool_calls_response() -> String {
 #[test]
 fn multiple_tool_calls_are_paired_in_order() {
     let server = start_server(vec![two_tool_calls_response(), text_response("ok")]);
-    let path = write_config(server.base_url());
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(
         vec![],
@@ -636,12 +608,7 @@ fn multiple_tool_calls_are_paired_in_order() {
 #[test]
 fn max_tool_steps_placeholders_remaining_calls() {
     let server = start_server(vec![two_tool_calls_response()]);
-    let path = write_config_extra(server.base_url(), "max_tool_steps = 1");
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let mut session = session_for(server.base_url(), "max_tool_steps = 1", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::No]);
 
@@ -691,12 +658,7 @@ fn echo_reasoning_is_serialized_on_next_request() {
         tool_call_response_with_reasoning(),
         text_response("ok"),
     ]);
-    let path = write_config_full(server.base_url(), "", "[providers.mock.compat]\necho_reasoning = true");
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let mut session = session_for(server.base_url(), "", "[providers.mock.compat]\necho_reasoning = true");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::No]);
 
@@ -714,12 +676,7 @@ fn top_level_error_chunk_is_surfaced() {
         "data: [DONE]\n\n"
     );
     let server = start_server(vec![response]);
-    let path = write_config(server.base_url());
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![]);
 
@@ -738,12 +695,7 @@ fn truncated_finish_reason_is_error() {
     })));
     response.push_str("data: [DONE]\n\n");
     let server = start_server(vec![response]);
-    let path = write_config(server.base_url());
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![]);
 
@@ -761,12 +713,7 @@ fn done_without_trailing_newline_is_accepted() {
         sse(&json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] }))
     );
     let server = start_server(vec![response]);
-    let path = write_config(server.base_url());
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![]);
 
@@ -797,12 +744,7 @@ fn unknown_tool_response() -> String {
 #[test]
 fn unknown_tool_result_is_rendered() {
     let server = start_server(vec![unknown_tool_response(), text_response("ok")]);
-    let path = write_config(server.base_url());
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![]);
 
@@ -841,12 +783,7 @@ fn bash_large_output_is_truncated_once_with_accurate_count() {
 #[test]
 fn repl_adds_line_break_after_done_response() {
     let server = start_server(vec![text_response("one line")]);
-    let path = write_config(server.base_url());
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let session = Session::new(cfg, selection, adapter, false);
+    let session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(
         vec![ReadOutcome::Line("go".into()), ReadOutcome::Line("/exit".into())],
@@ -884,12 +821,7 @@ fn line_break_is_rendered_between_reasoning_and_text() {
     response.push_str("data: [DONE]\n\n");
 
     let server = start_server(vec![response]);
-    let path = write_config(server.base_url());
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![]);
 

@@ -10,21 +10,28 @@ use rho::ui::{ConfirmOutcome, ReadOutcome, ScriptedUi, Ui};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// 测试用临时文件名的进程内序号：`SystemTime` 分辨率不足以保证并行测试不撞名。
+/// 测试用临时文件序号：仅用于需要验证真实文件加载的测试。
 static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 fn session_from(toml: &str) -> Session {
+    let cfg = config::load_str(toml, "<测试配置>").unwrap();
+    let selection = config::resolve_selection(&cfg, None, None).unwrap();
+    let adapter = provider::adapter_for(&selection.provider).unwrap();
+    Session::new(cfg, selection, adapter, false)
+}
+
+/// 保留一个真实文件加载路径的护栏：报错文案带文件路径。
+#[test]
+fn file_load_error_mentions_path() {
     let path = std::env::temp_dir().join(format!(
         "rho-repl-{}-{}.toml",
         std::process::id(),
         TMP_SEQ.fetch_add(1, Ordering::SeqCst)
     ));
-    std::fs::write(&path, toml).unwrap();
-    let cfg = config::load(&Some(path.display().to_string())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, None, None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    Session::new(cfg, selection, adapter, false)
+    std::fs::write(&path, "not valid toml =").unwrap();
+    let err = config::load(&Some(path.display().to_string())).unwrap_err();
+    let _ = std::fs::remove_file(&path);
+    assert!(err.contains(&path.display().to_string()), "error was {err}");
 }
 
 fn session() -> Session {
