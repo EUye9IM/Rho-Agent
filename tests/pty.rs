@@ -197,6 +197,7 @@ max_output_bytes = 4096
 struct PtyRho {
     child: Box<dyn Child + Send + Sync>,
     _master: Box<dyn MasterPty + Send>,
+    raw: Arc<Mutex<Vec<u8>>>,
     writer: Box<dyn std::io::Write + Send>,
     /// 读线程持续推进 vt100 解析器（屏幕网格即最终状态断言依据）。
     screen: Arc<Mutex<Parser>>,
@@ -212,6 +213,9 @@ impl PtyRho {
         let mut cmd = CommandBuilder::new(RHO_BIN);
         cmd.arg("--config");
         cmd.arg(config_path);
+        if std::env::var("RHO_PTY_TRACE").is_ok() {
+            cmd.env("RHO_PTY_TRACE", "1");
+        }
         cmd.cwd(env!("CARGO_MANIFEST_DIR"));
         let child = pty.slave.spawn_command(cmd).unwrap();
         // 关键：测试进程持有的 slave 必须关掉，rho 退出后 EOF 才能传到 master。
@@ -224,6 +228,8 @@ impl PtyRho {
             std::num::NonZeroU16::new(COLS).unwrap(),
             0,
         )));
+        let raw: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let raw_thread = raw.clone();
         let screen_thread = screen.clone();
         let killed = Arc::new(AtomicBool::new(false));
         let killed_thread = killed.clone();
@@ -236,6 +242,7 @@ impl PtyRho {
                         if killed_thread.load(Ordering::SeqCst) {
                             break;
                         }
+                        raw_thread.lock().unwrap().extend_from_slice(&buf[..n]);
                         screen_thread.lock().unwrap().process(&buf[..n]);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -243,7 +250,7 @@ impl PtyRho {
                 }
             }
         });
-        PtyRho { child, _master: pty.master, writer, screen, killed }
+        PtyRho { child, _master: pty.master, writer, screen, raw, killed }
     }
 
     fn send(&mut self, bytes: &[u8]) {
@@ -268,6 +275,16 @@ impl PtyRho {
             .join("\n")
     }
 
+    /// 诊断：最近输出的原始字节（可读转义形式）。
+    fn raw_tail(&self, n: usize) -> String {
+        let raw = self.raw.lock().unwrap();
+        let start = raw.len().saturating_sub(n);
+        String::from_utf8_lossy(&raw[start..])
+            .replace('\x1b', "<ESC>")
+            .replace('\r', "<CR>")
+            .replace('\n', "<LF>\n")
+    }
+
     /// 轮询等待屏幕包含 `needle`（vt100 网格，不受 ANSI 重绘影响）。
     fn expect_screen(&self, needle: &str, timeout: Duration) {
         let deadline = Instant::now() + timeout;
@@ -277,7 +294,11 @@ impl PtyRho {
                 return;
             }
             if Instant::now() > deadline {
-                panic!("屏幕未见 `{needle}`，超时 {timeout:?}。当前屏幕：\n{text}");
+                panic!(
+                    "屏幕未见 `{needle}`，超时 {timeout:?}。当前屏幕：\n{}\n原始输出尾部：\n{}",
+                    text,
+                    self.raw_tail(1500)
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -292,7 +313,11 @@ impl PtyRho {
                 return;
             }
             if Instant::now() > deadline {
-                panic!("屏幕仍含 `{needle}`，超时 {timeout:?}。当前屏幕：\n{text}");
+                panic!(
+                    "屏幕仍含 `{needle}`，超时 {timeout:?}。当前屏幕：\n{}\n原始输出尾部：\n{}",
+                    text,
+                    self.raw_tail(1500)
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -387,8 +412,6 @@ fn ctrl_c_after_typing_reclaims_prompt_rows() {
     let mut rho = PtyRho::spawn(&config);
 
     rho.expect_screen("rho>", SCREEN_TIMEOUT);
-    // 打长文本后 Ctrl-C：块被收回，下一次提示符复用同一行——
-    // 断言回收后旧文本不再可见。
     rho.send(b"long input that certainly wraps across the 80 column terminal width xxxxx");
     rho.send(b"\x03");
     rho.expect_screen_absent("certainly wraps", SCREEN_TIMEOUT);

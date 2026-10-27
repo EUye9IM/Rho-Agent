@@ -179,15 +179,15 @@
 
 ## 四、后续发现（PTY 测试落地时）
 
-### 16. 行回收后新提示符的毫秒级输入丢失窗口（macOS 实测）
+### 16. 行回收后新提示符的毫秒级输入丢失窗口（macOS 实测，已根因定位）
 
 - [ ] 审阅
-- **位置**：`src/ui/mod.rs` 的 `reclaim_prompt_rows` + rustyline `enable_raw_mode`（TCSADRAIN）；`tests/pty.rs` 的 `SETTLE` 注释。
-- **现象**：打字 → Ctrl-C → 行回收 → 新提示符出现后**立即**写入的首个字节可能丢失（无回显、无输入）；2ms 后的字节存活。窗口毫秒级且随调度浮动；全保真裸 rustyline 探针不复现（差异仅 repl 循环内容）。人类敲键延迟（~100ms）撞不上；程序化极速输入/粘贴可触发。
-- **已排除**：rustyline 版本/feature、helper/hint 线程/自定义绑定（二分开关）、SIGINT 基础设施、termios 状态错乱（macOS 位常量曾误读）、FIONREAD 诊断不可靠、cooked→raw 切换丢 canonical 缓冲（实验证明字节存活）。
-- **待验证假设**：reclaim 输出（待 drain）+ `enable_raw_mode` 的 TCSADRAIN 构成阻塞窗口，期间到达的输入字节被 macOS 丢弃。实验 v3 已设计（TCSADRAIN 阻塞期间写入测试字节，验证是否丢失）。
-- **临时缓解**：PTY 测试在提示符后统一稳定 50ms 再发输入（`SETTLE`）。
-- **影响面**：仅程序化输入场景；Linux 行为未验证。
+- **位置**：rho 侧 `src/ui/mod.rs` 的 read_line 循环（reclaim → rustyline readline：enable_raw → refresh → read）；harness 侧 `tests/pty.rs` 的 `SETTLE` 注释。
+- **现象**：打字 → Ctrl-C → 行回收 → 新提示符出现后**立即**写入的首个字节可能丢失；毫秒级窗口且随调度浮动。人类敲键延迟（~100ms）撞不上；程序化极速输入可触发。
+- **根因定位（2024-10 排查）**：字节丢失发生在**内核 PTY 层**——rho 侧插桩证明 round-2 的 `read()` 已阻塞等待、`` 正常收到并触发中断返回，但期间写入的测试字节从未出现在 fd 0 的输入队列（readline 返回后非阻塞窥探为空）。排除链（全部实验验证）：cooked→raw 的 tcsetattr 切换不丢 canonical 缓冲字节（tcgetattr→tcsetattr 窗口内写入存活）；纯 PTY 双端写入不丢（无 rho 进程时字节存活）；rustyline `check_cursor_position=false`（`[6n` 光标查询吞输入的路径未启用）；buffer-redux 未启用（无跨轮 BufReader 预读吞字节）。结论：**macOS PTY 在 slave 的 tcsetattr(TCSADRAIN) 与对端 master 写入并发时存在丢字节的内核竞态**（rho 的 reclaim 输出使 TCSADRAIN 有待 drain 数据，扩大了竞态窗口；裸探针因时序差异未复现）。
+- **缓解（已实施）**：PTY 测试在提示符后稳定 50ms 再发输入（`SETTLE`）；harness 保留 raw 流捕获，断言失败时 dump 原始输出辅助诊断。
+- **可选修复方向（未实施）**：确认根因后可考虑减少 reclaim 与 enable_raw 的间隔（如把回收序列写入合并进 readline 前的一次 write），或上报 rustyline/macOS。影响面仅程序化输入场景。
+- **影响面**：仅程序化输入场景；Linux 行为未验证（CI 观察中）。
 - **处理意见**：
 
 ## 暂不建议的方向
