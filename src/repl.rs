@@ -87,6 +87,7 @@ pub fn run(ui: &mut dyn Ui, mut session: Session, cancel: &Cancel) -> Result<(),
                         check_fatal(ui)?;
                     }
                     Ok(TurnEnd::Error(_)) | Ok(TurnEnd::Cancelled) => {}
+                    Ok(TurnEnd::Fatal(e)) => return Err(ReplExit::Fatal(e)),
                     Err(_) => return Err(ReplExit::Quit),
                 }
             }

@@ -7,7 +7,7 @@ use rho::config::{self, BashToolConfig, Provider};
 use rho::provider::{self, ProviderAdapter, StreamEvent};
 use rho::term::Cancel;
 use rho::tools::{BashEnd, BashOutput};
-use rho::ui::{ConfirmOutcome, ScriptedUi};
+use rho::ui::{ConfirmOutcome, ReadOutcome, ScriptedUi, Ui};
 
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -140,6 +140,17 @@ impl StreamLauncher for ParkingLauncher {
     }
 }
 
+/// 预设结果 runner：固定输出，不启动任何进程。
+struct PresetRunner {
+    output: String,
+}
+
+impl ToolRunner for PresetRunner {
+    fn run(&self, _command: &str, _cfg: &BashToolConfig, _cancel: &Cancel) -> BashOutput {
+        BashOutput { content: self.output.clone(), end: BashEnd::Exited(0) }
+    }
+}
+
 /// 预设结果 runner：run 期间注入指定次数的 Ctrl-C（模拟执行中被取消/升级 quit）。
 struct InjectingRunner {
     injects: usize,
@@ -174,6 +185,41 @@ fn injector_after_ready(
 }
 
 const CMD: &str = r#"{"command":"echo hi"}"#;
+
+/// 前 N 次 print 正常，之后每次 print 都置位 fatal（模拟渲染 I/O 失败，如 EPIPE）。
+struct FailingUi {
+    prints_left: usize,
+    confirms: std::collections::VecDeque<ConfirmOutcome>,
+    fatal: Option<String>,
+}
+
+impl FailingUi {
+    fn new(prints_left: usize, confirms: Vec<ConfirmOutcome>) -> Self {
+        Self { prints_left, confirms: confirms.into(), fatal: None }
+    }
+}
+
+impl Ui for FailingUi {
+    fn read_line(&mut self) -> ReadOutcome {
+        ReadOutcome::Eof
+    }
+
+    fn confirm(&mut self, _cwd: &str, _cmd: &str) -> ConfirmOutcome {
+        self.confirms.pop_front().unwrap_or(ConfirmOutcome::No)
+    }
+
+    fn print(&mut self, _ev: &rho::render::RenderEvent) {
+        if self.prints_left == 0 {
+            self.fatal = Some("渲染输出失败：模拟 EPIPE".into());
+        } else {
+            self.prints_left -= 1;
+        }
+    }
+
+    fn take_fatal(&mut self) -> Option<String> {
+        self.fatal.take()
+    }
+}
 
 #[test]
 fn first_call_failures_do_not_block_rest() {
@@ -316,6 +362,50 @@ fn disconnect_without_terminal_is_error() {
         TurnEnd::Error(e) => assert!(e.contains("异常断开"), "error was {e}"),
         other => panic!("unexpected {other:?}"),
     }
+}
+
+#[test]
+fn render_failure_during_stream_aborts_before_commit() {
+    let mut session = session();
+    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![
+        StreamEvent::Delta { text: Some("partial".into()), reasoning: None },
+        text_final("done"),
+    ]]));
+    // 首个 Delta 渲染即失败：流收尾后不提交 Assistant，不执行工具。
+    let mut ui = FailingUi::new(0, vec![]);
+    let cancel = Cancel::new();
+
+    match session.turn(&mut ui, &cancel, "go").unwrap() {
+        rho::chat::TurnEnd::Fatal(e) => assert!(e.contains("EPIPE"), "error was {e}"),
+        other => panic!("unexpected {other:?}"),
+    }
+    assert_eq!(session.history.len(), 1);
+}
+
+#[test]
+fn render_failure_mid_batch_placeholders_remaining_then_fatal() {
+    let mut session = session();
+    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![
+        StreamEvent::Final(Box::new(assistant_with_calls(vec![
+            call("c1", "bash", CMD),
+            call("c2", "bash", CMD),
+        ]))),
+    ]]));
+    // 第一次 print（ToolCall 行）成功，第二个调用的结果渲染开始失败。
+    let mut ui = FailingUi::new(1, vec![ConfirmOutcome::Yes]);
+    session.tool_runner = Arc::new(PresetRunner {
+        output: "hi\n[Command finished with exit code 0]".into(),
+    });
+    let cancel = Cancel::new();
+
+    match session.turn(&mut ui, &cancel, "go").unwrap() {
+        rho::chat::TurnEnd::Fatal(e) => assert!(e.contains("EPIPE"), "error was {e}"),
+        other => panic!("unexpected {other:?}"),
+    }
+    // 配对不变式：Assistant 提交后每个调用都有 Tool 结果。
+    assert_eq!(session.history.len(), 4);
+    assert!(tool_result_content(&session.history, 2).contains("hi"));
+    assert_eq!(tool_result_content(&session.history, 3), "终端输出失败，未执行");
 }
 
 #[test]

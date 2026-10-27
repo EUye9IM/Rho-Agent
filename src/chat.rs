@@ -19,6 +19,8 @@ const DEFAULT_MAX_TOOL_STEPS: u32 = 25;
 const CANCELLED_PLACEHOLDER: &str = "用户取消执行";
 /// 步数超限时未执行调用的占位文本。
 const LIMIT_PLACEHOLDER: &str = "工具调用次数已达上限，未执行";
+/// 终端输出失败时未执行调用的占位文本（exit 1 路径）。
+const FATAL_PLACEHOLDER: &str = "终端输出失败，未执行";
 /// 流式接收被取消时展示的提示。
 const TURN_CANCELLED_MSG: &str = "已取消本轮响应";
 
@@ -135,6 +137,8 @@ pub enum TurnEnd {
     Error(String),
     /// 用户取消（占位已补齐，回 REPL）
     Cancelled,
+    /// 终端 I/O 失败（REPL 无法继续，exit 1；占位已补齐）
+    Fatal(String),
 }
 
 /// 一次流式请求的接收结果（`Session::receive_stream` 的返回值）。
@@ -151,7 +155,7 @@ enum StreamOutcome {
 }
 
 /// 一批 tool_calls 的执行阶段结果（`Session::run_tool_calls` 的返回值）。
-/// Cancelled/Quit/Limit 的占位补齐已在 run_tool_calls 内完成。
+/// Cancelled/Quit/Limit/Fatal 的占位补齐已在 run_tool_calls 内完成。
 #[derive(Debug)]
 enum ToolPhase {
     /// 全部执行完（继续请求）
@@ -162,6 +166,8 @@ enum ToolPhase {
     Quit,
     /// 步数超限，携带上限值
     Limit(u32),
+    /// 终端 I/O 失败（携带错误文本，exit 1）
+    Fatal(String),
 }
 
 impl Session {
@@ -229,6 +235,11 @@ impl Session {
                 StreamOutcome::Quit => return Err(Quit),
             };
 
+            // 流接收/渲染期间终端写失败：不再提交与执行，直接上抛（exit 1）。
+            if let Some(e) = ui.take_fatal() {
+                return Ok(TurnEnd::Fatal(e));
+            }
+
             if msg.tool_calls.is_empty() {
                 self.history.push(Msg::Assistant(msg));
                 // 若恰在此窗口收到第二次 Ctrl-C，直接走退出，不等下一次输入。
@@ -269,6 +280,7 @@ impl Session {
                     emit(ui, RenderEvent::Error(e.clone()));
                     return Ok(TurnEnd::Error(e));
                 }
+                ToolPhase::Fatal(e) => return Ok(TurnEnd::Fatal(e)),
             }
         }
     }
@@ -379,6 +391,13 @@ impl Session {
                 } else {
                     ToolPhase::Cancelled
                 };
+            }
+
+            // 终端写失败：剩余调用补占位后上抛（exit 1；占位写入可能同样失败，
+            // 但历史配对仍由本函数保证）。
+            if let Some(e) = ui.take_fatal() {
+                self.placeholders(ui, &tool_calls[i..], FATAL_PLACEHOLDER);
+                return ToolPhase::Fatal(e);
             }
 
             let outcome = dispatch_tool_call(
