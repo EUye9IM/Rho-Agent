@@ -12,8 +12,9 @@ use rho::ui::{ConfirmOutcome, ReadOutcome, ScriptedUi};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 fn read_request(stream: &mut TcpStream) -> Vec<u8> {
     let mut data = Vec::new();
@@ -44,29 +45,147 @@ fn read_request(stream: &mut TcpStream) -> Vec<u8> {
     data[header_end..(header_end + content_len).min(data.len())].to_vec()
 }
 
-fn start_server(responses: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+/// mock 服务器共享状态：请求体收集、已服务连接计数、停止标志。
+#[derive(Default)]
+struct ServerShared {
+    bodies: Mutex<Vec<String>>,
+    served: Mutex<usize>,
+    ready: Condvar,
+    stop: AtomicBool,
+}
+
+impl ServerShared {
+    fn push_body(&self, body: Vec<u8>) {
+        self.bodies
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(&body).into_owned());
+    }
+
+    fn finish_connection(&self) {
+        let mut served = self.served.lock().unwrap();
+        *served += 1;
+        drop(served);
+        self.ready.notify_all();
+    }
+}
+
+/// 本地 mock SSE 服务器句柄：可等待已服务连接数、按需读取捕获的请求体；
+/// Drop 时停止（accept 轮询线程随后退出，之后连接被拒绝），
+/// 请求数不足时测试也能结束服务线程。
+struct MockServer {
+    base_url: String,
+    shared: Arc<ServerShared>,
+}
+
+impl MockServer {
+    fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// 第 i 个请求体（clone）。
+    fn body(&self, i: usize) -> String {
+        self.shared.bodies.lock().unwrap()[i].clone()
+    }
+
+    fn request_count(&self) -> usize {
+        self.shared.bodies.lock().unwrap().len()
+    }
+
+    /// 有界等待至少 n 个连接服务完成。
+    fn wait_served(&self, n: usize, timeout: Duration) -> bool {
+        let mut served = self.shared.served.lock().unwrap();
+        let deadline = Instant::now() + timeout;
+        while *served < n {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (guard, _) = self
+                .shared
+                .ready
+                .wait_timeout(served, deadline - now)
+                .unwrap();
+            served = guard;
+        }
+        true
+    }
+
+    /// 停止服务器：轮询线程在下个间隔退出，后续连接被拒绝。
+    fn stop(&self) {
+        self.shared.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// 等待一个新连接；停止标志置位或 listener 失效时返回 None。
+/// listener 保持非阻塞，靠短间隔轮询让 stop 能及时生效。
+fn accept_next(listener: &TcpListener, shared: &ServerShared) -> Option<TcpStream> {
+    loop {
+        if shared.stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => return Some(stream),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// 读请求、捕获请求体、执行自定义响应、计数并广播。
+fn serve_one(stream: &mut TcpStream, shared: &ServerShared, respond: impl FnOnce(&mut TcpStream)) {
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    let body = read_request(stream);
+    shared.push_body(body);
+    respond(stream);
+    shared.finish_connection();
+}
+
+fn start_server(responses: Vec<String>) -> MockServer {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let bodies = Arc::new(Mutex::new(Vec::new()));
-    let captured = bodies.clone();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    // macOS 上 accept 出的 socket 会继承 O_NONBLOCK，显式恢复阻塞再读写。
+    listener.set_nonblocking(true).unwrap();
+    let shared: Arc<ServerShared> = Arc::new(Default::default());
+    let thread_shared = shared.clone();
     std::thread::spawn(move || {
         for response in responses {
-            let Ok((mut stream, _)) = listener.accept() else { return };
-            stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-            let body = read_request(&mut stream);
-            captured
-                .lock()
-                .unwrap()
-                .push(String::from_utf8_lossy(&body).into_owned());
-            let _ = stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-            );
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
-            let _ = stream.shutdown(Shutdown::Both);
+            let Some(mut stream) = accept_next(&listener, &thread_shared) else { return };
+            stream.set_nonblocking(false).ok();
+            serve_one(&mut stream, &thread_shared, |s| {
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                );
+                let _ = s.write_all(response.as_bytes());
+                let _ = s.flush();
+                let _ = s.shutdown(Shutdown::Both);
+            });
         }
     });
-    (format!("http://{addr}"), bodies)
+    MockServer { base_url, shared }
+}
+
+/// 单连接自定义响应（时序类测试用：慢响应头、分片中停顿等）。
+fn start_custom(respond: impl Fn(&mut TcpStream) + Send + 'static) -> MockServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let shared: Arc<ServerShared> = Arc::new(Default::default());
+    let thread_shared = shared.clone();
+    std::thread::spawn(move || {
+        let Some(mut stream) = accept_next(&listener, &thread_shared) else { return };
+        stream.set_nonblocking(false).ok();
+        serve_one(&mut stream, &thread_shared, respond);
+    });
+    MockServer { base_url, shared }
 }
 
 fn sse(value: &Value) -> String {
@@ -153,8 +272,8 @@ max_output_bytes = 1024
 
 #[test]
 fn full_tool_loop_with_mock_sse() {
-    let (base_url, bodies) = start_server(vec![tool_call_response(), text_response("done")]);
-    let path = write_config(&base_url);
+    let server = start_server(vec![tool_call_response(), text_response("done")]);
+    let path = write_config(server.base_url());
     let cfg = config::load(&Some(path.clone())).unwrap();
     let _ = std::fs::remove_file(path);
     let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
@@ -165,6 +284,7 @@ fn full_tool_loop_with_mock_sse() {
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done));
+    assert!(server.wait_served(2, Duration::from_secs(5)));
 
     assert_eq!(session.history.len(), 4);
     assert!(matches!(&session.history[0], Msg::User(u) if u == "go"));
@@ -199,9 +319,9 @@ fn full_tool_loop_with_mock_sse() {
         .iter()
         .any(|e| matches!(e, RenderEvent::TextDelta(t) if t == "done")));
 
-    let bodies = bodies.lock().unwrap();
-    assert_eq!(bodies.len(), 2);
-    let second: Value = serde_json::from_str(&bodies[1]).unwrap();
+    let bodies = server.request_count();
+    assert_eq!(bodies, 2);
+    let second: Value = serde_json::from_str(&server.body(1)).unwrap();
     let messages = second["messages"].as_array().unwrap();
     assert_eq!(messages[0]["role"], "user");
     assert_eq!(messages[1]["role"], "assistant");
@@ -217,12 +337,7 @@ fn full_tool_loop_with_mock_sse() {
 /// 把它调到秒级以下会让正常请求报 “timed out reading response”。
 #[test]
 fn slow_response_headers_are_not_an_error() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else { return };
-        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-        let _ = read_request(&mut stream);
+    let server = start_custom(|stream| {
         // 先“思考” 1.5s 再发响应头。
         std::thread::sleep(Duration::from_millis(1500));
         let _ = stream.write_all(
@@ -237,7 +352,7 @@ fn slow_response_headers_are_not_an_error() {
         let _ = stream.shutdown(Shutdown::Both);
     });
 
-    let cfg_path = write_config(&format!("http://{addr}"));
+    let cfg_path = write_config(server.base_url());
     let cfg = config::load(&Some(cfg_path.clone())).unwrap();
     let _ = std::fs::remove_file(&cfg_path);
     let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
@@ -253,12 +368,7 @@ fn slow_response_headers_are_not_an_error() {
 /// 流中间停顿跨越预期的读粒度时，流必须继续而不是被判失败。
 #[test]
 fn slow_stream_between_chunks_is_not_an_error() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else { return };
-        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-        let _ = read_request(&mut stream);
+    let server = start_custom(|stream| {
         let _ = stream.write_all(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
         );
@@ -276,7 +386,7 @@ fn slow_stream_between_chunks_is_not_an_error() {
         let _ = stream.shutdown(Shutdown::Both);
     });
 
-    let cfg_path = write_config(&format!("http://{addr}"));
+    let cfg_path = write_config(server.base_url());
     let cfg = config::load(&Some(cfg_path.clone())).unwrap();
     let _ = std::fs::remove_file(&cfg_path);
     let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
@@ -347,26 +457,6 @@ fn bash_timeout_terminates_group() {
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 
-fn start_partial_server(first: String, rest: String) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else { return };
-        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-        let _ = read_request(&mut stream);
-        let _ = stream.write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-        );
-        let _ = stream.write_all(first.as_bytes());
-        let _ = stream.flush();
-        std::thread::sleep(Duration::from_secs(1));
-        let _ = stream.write_all(rest.as_bytes());
-        let _ = stream.flush();
-        let _ = stream.shutdown(Shutdown::Both);
-    });
-    format!("http://{addr}")
-}
-
 #[test]
 fn ctrl_c_during_stream_cancels_and_discards_partial() {
     let first = sse(&json!({
@@ -377,8 +467,19 @@ fn ctrl_c_during_stream_cancels_and_discards_partial() {
         sse(&json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] })),
         sse(&json!({ "choices": [{ "delta": { "content": "late" } }] }))
     );
-    let base_url = start_partial_server(first, rest);
-    let path = write_config(&base_url);
+    // 服务端在首块后停顿 1s 再发剩余，保证取消注入落在流式期间。
+    let server = start_custom(move |stream| {
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        );
+        let _ = stream.write_all(first.as_bytes());
+        let _ = stream.flush();
+        std::thread::sleep(Duration::from_secs(1));
+        let _ = stream.write_all(rest.as_bytes());
+        let _ = stream.flush();
+        let _ = stream.shutdown(Shutdown::Both);
+    });
+    let path = write_config(server.base_url());
     let cfg = config::load(&Some(path.clone())).unwrap();
     let _ = std::fs::remove_file(path);
     let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
@@ -398,6 +499,23 @@ fn ctrl_c_during_stream_cancels_and_discards_partial() {
     // 未完成的 assistant 响应不进入历史，只保留用户输入。
     assert_eq!(session.history.len(), 1);
     assert!(matches!(&session.history[0], Msg::User(u) if u == "go"));
+}
+
+/// mock 服务器生命周期：stop 后不再接受连接（测试提前失败时也能结束服务线程）。
+#[test]
+fn mock_server_stop_closes_listener() {
+    let server = start_server(vec![text_response("x")]);
+    server.stop();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match TcpStream::connect(server.base_url()) {
+            Err(_) => break,
+            Ok(_) if Instant::now() >= deadline => {
+                panic!("server still accepting connections after stop")
+            }
+            Ok(_) => {}
+        }
+    }
 }
 
 
@@ -430,8 +548,8 @@ fn two_tool_calls_response() -> String {
 
 #[test]
 fn multiple_tool_calls_are_paired_in_order() {
-    let (base_url, bodies) = start_server(vec![two_tool_calls_response(), text_response("ok")]);
-    let path = write_config(&base_url);
+    let server = start_server(vec![two_tool_calls_response(), text_response("ok")]);
+    let path = write_config(server.base_url());
     let cfg = config::load(&Some(path.clone())).unwrap();
     let _ = std::fs::remove_file(path);
     let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
@@ -458,7 +576,7 @@ fn multiple_tool_calls_are_paired_in_order() {
         }
         other => panic!("unexpected {other:?}"),
     }
-    let second: Value = serde_json::from_str(&bodies.lock().unwrap()[1]).unwrap();
+    let second: Value = serde_json::from_str(&server.body(1)).unwrap();
     let messages = second["messages"].as_array().unwrap();
     assert_eq!(messages[2]["tool_call_id"], "call_a");
     assert_eq!(messages[3]["tool_call_id"], "call_b");
@@ -466,8 +584,8 @@ fn multiple_tool_calls_are_paired_in_order() {
 
 #[test]
 fn max_tool_steps_placeholders_remaining_calls() {
-    let (base_url, bodies) = start_server(vec![two_tool_calls_response()]);
-    let path = write_config_extra(&base_url, "max_tool_steps = 1");
+    let server = start_server(vec![two_tool_calls_response()]);
+    let path = write_config_extra(server.base_url(), "max_tool_steps = 1");
     let cfg = config::load(&Some(path.clone())).unwrap();
     let _ = std::fs::remove_file(path);
     let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
@@ -491,7 +609,7 @@ fn max_tool_steps_placeholders_remaining_calls() {
         }
         other => panic!("unexpected {other:?}"),
     }
-    assert_eq!(bodies.lock().unwrap().len(), 1);
+    assert_eq!(server.request_count(), 1);
 }
 
 
@@ -518,11 +636,11 @@ fn tool_call_response_with_reasoning() -> String {
 
 #[test]
 fn echo_reasoning_is_serialized_on_next_request() {
-    let (base_url, bodies) = start_server(vec![
+    let server = start_server(vec![
         tool_call_response_with_reasoning(),
         text_response("ok"),
     ]);
-    let path = write_config_full(&base_url, "", "[providers.mock.compat]\necho_reasoning = true");
+    let path = write_config_full(server.base_url(), "", "[providers.mock.compat]\necho_reasoning = true");
     let cfg = config::load(&Some(path.clone())).unwrap();
     let _ = std::fs::remove_file(path);
     let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
@@ -533,7 +651,7 @@ fn echo_reasoning_is_serialized_on_next_request() {
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done));
-    let second: Value = serde_json::from_str(&bodies.lock().unwrap()[1]).unwrap();
+    let second: Value = serde_json::from_str(&server.body(1)).unwrap();
     assert_eq!(second["messages"][1]["reasoning_content"], "think");
 }
 
@@ -544,8 +662,8 @@ fn top_level_error_chunk_is_surfaced() {
         sse(&json!({ "error": { "message": "boom" } })),
         "data: [DONE]\n\n"
     );
-    let (base_url, _bodies) = start_server(vec![response]);
-    let path = write_config(&base_url);
+    let server = start_server(vec![response]);
+    let path = write_config(server.base_url());
     let cfg = config::load(&Some(path.clone())).unwrap();
     let _ = std::fs::remove_file(path);
     let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
@@ -568,8 +686,8 @@ fn truncated_finish_reason_is_error() {
         "choices": [{ "delta": {}, "finish_reason": "length" }]
     })));
     response.push_str("data: [DONE]\n\n");
-    let (base_url, _bodies) = start_server(vec![response]);
-    let path = write_config(&base_url);
+    let server = start_server(vec![response]);
+    let path = write_config(server.base_url());
     let cfg = config::load(&Some(path.clone())).unwrap();
     let _ = std::fs::remove_file(path);
     let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
@@ -591,8 +709,8 @@ fn done_without_trailing_newline_is_accepted() {
         sse(&json!({ "choices": [{ "delta": { "content": "ok" } }] })),
         sse(&json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] }))
     );
-    let (base_url, _bodies) = start_server(vec![response]);
-    let path = write_config(&base_url);
+    let server = start_server(vec![response]);
+    let path = write_config(server.base_url());
     let cfg = config::load(&Some(path.clone())).unwrap();
     let _ = std::fs::remove_file(path);
     let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
@@ -627,8 +745,8 @@ fn unknown_tool_response() -> String {
 
 #[test]
 fn unknown_tool_result_is_rendered() {
-    let (base_url, _bodies) = start_server(vec![unknown_tool_response(), text_response("ok")]);
-    let path = write_config(&base_url);
+    let server = start_server(vec![unknown_tool_response(), text_response("ok")]);
+    let path = write_config(server.base_url());
     let cfg = config::load(&Some(path.clone())).unwrap();
     let _ = std::fs::remove_file(path);
     let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
@@ -671,8 +789,8 @@ fn bash_large_output_is_truncated_once_with_accurate_count() {
 
 #[test]
 fn repl_adds_line_break_after_done_response() {
-    let (base_url, _bodies) = start_server(vec![text_response("one line")]);
-    let path = write_config(&base_url);
+    let server = start_server(vec![text_response("one line")]);
+    let path = write_config(server.base_url());
     let cfg = config::load(&Some(path.clone())).unwrap();
     let _ = std::fs::remove_file(path);
     let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
@@ -714,8 +832,8 @@ fn line_break_is_rendered_between_reasoning_and_text() {
     })));
     response.push_str("data: [DONE]\n\n");
 
-    let (base_url, _bodies) = start_server(vec![response]);
-    let path = write_config(&base_url);
+    let server = start_server(vec![response]);
+    let path = write_config(server.base_url());
     let cfg = config::load(&Some(path.clone())).unwrap();
     let _ = std::fs::remove_file(path);
     let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
