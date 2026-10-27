@@ -251,11 +251,15 @@ impl Ui for TermUi {
     }
 
     fn confirm(&mut self, cwd: &str, cmd: &str) -> ConfirmOutcome {
-        print!(
-            "\n当前目录：{cwd}\n将执行 bash：\n  {cmd}\n执行？[y/N] "
-        );
-        let mut out = std::io::stdout();
-        if let Err(e) = out.flush() {
+        let result = (|| -> std::io::Result<()> {
+            let mut out = std::io::stdout().lock();
+            write!(
+                out,
+                "\n当前目录：{cwd}\n将执行 bash：\n  {cmd}\n执行？[y/N] "
+            )?;
+            out.flush()
+        })();
+        if let Err(e) = result {
             self.set_fatal(format!("渲染输出失败：{e}"));
             return ConfirmOutcome::No;
         }
@@ -288,7 +292,11 @@ impl Ui for TermUi {
                 }
                 RenderEvent::Error(msg) => {
                     out.flush()?;
-                    eprintln!("错误：{msg}");
+                    // 错误走 stderr（与渲染流分离）；写失败与渲染同路径进 fatal，
+                    // 不用可能 panic 的 eprintln!。
+                    let mut err = std::io::stderr().lock();
+                    writeln!(err, "错误：{msg}")?;
+                    err.flush()?;
                 }
             }
             out.flush()
