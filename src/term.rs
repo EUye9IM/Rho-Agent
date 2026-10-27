@@ -17,7 +17,7 @@ static CANCEL: OnceLock<Arc<Cancel>> = OnceLock::new();
 ///
 /// 并发模型：
 /// - 真正的信号处理器只向 self-pipe 写一个字节（async-signal-safe，不取锁）
-/// - 专用信号线程消费 self-pipe，在锁内做 epoch 读取 + 记录追加
+/// - 专用信号线程消费 self-pipe，在锁内追加记录
 /// - 主线程切轮（advance_epoch）也在锁内；旧轮未消费的 quit 结转 prev_quit
 /// - REPL 输入态的 Ctrl-C 走 rustyline 按键路径，不经此记录
 pub struct Cancel {
@@ -25,9 +25,8 @@ pub struct Cancel {
 }
 
 struct State {
-    epoch: u64,
-    /// 当前轮的第几次 Ctrl-C（1 = cancel，≥2 = quit）
-    records: Vec<u32>,
+    /// 当前轮的 Ctrl-C 次数（1 = cancel，≥2 = quit）；只读次数，不存内容
+    count: u32,
     /// 旧轮未消费的 quit 结转；查询时先看它
     prev_quit: bool,
 }
@@ -46,7 +45,7 @@ pub enum SignalState {
 impl Cancel {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(State { epoch: 0, records: Vec::new(), prev_quit: false }),
+            inner: Mutex::new(State { count: 0, prev_quit: false }),
         })
     }
 
@@ -56,7 +55,7 @@ impl Cancel {
         if state.prev_quit {
             return SignalState::Quit;
         }
-        match state.records.len() {
+        match state.count {
             0 => SignalState::None,
             1 => SignalState::Cancel,
             _ => SignalState::Quit,
@@ -81,10 +80,9 @@ impl Cancel {
     /// 返回 prev_quit：true 表示旧轮遗留退出请求，应退出程序。
     pub fn advance_epoch(&self) -> bool {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        state.epoch = state.epoch.wrapping_add(1);
-        let quit = state.prev_quit || state.records.len() >= 2;
+        let quit = state.prev_quit || state.count >= 2;
         state.prev_quit = quit;
-        state.records.clear();
+        state.count = 0;
         quit
     }
 
@@ -92,9 +90,8 @@ impl Cancel {
     /// 非 cfg(test)——单元测试与集成测试都需要它驱动取消/退出路径）。
     pub fn inject(&self) -> u32 {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let n = state.records.len() as u32 + 1;
-        state.records.push(n);
-        n
+        state.count += 1;
+        state.count
     }
 }
 
