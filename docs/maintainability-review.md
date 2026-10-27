@@ -23,7 +23,7 @@
 
 ### 1. 为 agent loop 提供可注入的测试边界
 
-- [ ] 审阅
+- [x] 审阅
 - **位置**：`src/chat.rs` 的 `Session::receive_stream`、`dispatch_tool_call`；`tests/e2e_mock.rs`。
 - **问题**：`ProviderAdapter` 抽象协议映射，但 `receive_stream` 直接创建线程并调用 HTTP。测试工具循环分支基本仍需经过本地 HTTP/SSE mock。
 - **建议**：在发起流请求处提供小型可注入接口，测试可直接提供事件序列；工具执行也提供窄接口，用预设结果测试编排。保留真实 HTTP/SSE 与进程集成测试，分别保护协议和系统行为。无需建立通用 mock 框架。
@@ -39,7 +39,7 @@
 
 ### 2. 集中管理工具批次的历史配对与收尾
 
-- [ ] 审阅
+- [x] 审阅
 - **位置**：`src/chat.rs` 的 `turn`、`run_tool_calls`、`dispatch_tool_call`、`placeholders`。
 - **问题**：提交 Assistant、写 Tool、计数、结果渲染、补齐剩余调用分别发生在不同函数与分支。新增返回路径时容易遗漏其中一项。
 - **建议**：引入局部的工具批次状态，集中记录当前结果、计数以及结束批次时补齐剩余调用。单次分发返回结果内容及是否停止，结果渲染与历史写入尽量共用出口。
@@ -50,7 +50,7 @@
 
 ### 3. 简化流事件契约与请求生命周期
 
-- [ ] 审阅
+- [x] 审阅
 - **位置**：`src/provider/mod.rs` 的 `StreamEvent`、`TurnAcc`、`stream_request`；`src/chat.rs` 的 `receive_stream`。
 - **问题**：`Done` 不携带数据且主线程忽略它；`Final(Box<Msg>)` 允许携带非 Assistant 消息；工具片段使用三元组；worker 与首字节看门狗均可发送终止错误。
 - **建议**：
@@ -64,7 +64,7 @@
 
 ### 4. 将 UI 错误纳入显式控制流
 
-- [ ] 审阅
+- [x] 审阅
 - **位置**：`src/ui/mod.rs` 的 `Ui`、`TermUi::confirm`、`TermUi::print`；`src/repl.rs` 的 `check_fatal`。
 - **问题**：`Ui::print` 无返回值，通过 `take_fatal` 延迟取错；REPL 通常等整轮 `turn` 返回才检查，因此输出失败后仍可能继续请求或执行工具。确认提示与错误输出仍使用可能因写失败而 panic 的宏，与其余 `Write` 错误处理不一致。
 - **建议**：先统一为可捕获失败的终端写入，再选择返回 `Result` 或在流/工具阶段边界及时检查 fatal。错误仍经统一配对与资源清理路径收尾。
@@ -74,7 +74,7 @@
 
 ### 5. 显式管理工具进程、管道与 drain 线程的收尾
 
-- [ ] 审阅
+- [x] 审阅
 - **位置**：`src/tools.rs` 的 `run_bash`、`terminate_group`、`drain_stream`。
 - **问题**：非阻塞 `fcntl` 设置失败被忽略，而有界读取依赖它成功；channel 接收超时后仍然 `join`，不保证整体等待有界；`try_wait` 错误被折叠为 `Exited(-1)`；进程组信号错误多数被忽略。
 - **建议**：明确区分进程启动、等待与升级终止、输出捕获三个职责。分别保存直接子进程回收、进程组终止、管道收尾的结果及错误，显式检查关键前提；必要时再拆 `tools/process.rs`、`tools/capture.rs`。
@@ -91,7 +91,7 @@
 
 ### 6. 简化取消状态的冗余表示
 
-- [ ] 审阅
+- [x] 审阅
 - **位置**：`src/term.rs` 的 `State`、`Cancel`。
 - **观察**：`records` 的元素未参与判断，实际只读取长度；`epoch` 当前仅递增，未参与记录归属判断。
 - **建议**：用计数表达记录，明确 epoch 的实际用途或去掉无效字段。保留记录与切轮共用同一把锁，以及旧轮 quit 结转语义。
@@ -100,7 +100,7 @@
 
 ### 7. 共用 thinking 档位校验
 
-- [ ] 审阅
+- [x] 审阅
 - **位置**：`src/main.rs` 的 `resolve_thinking`；`src/chat.rs` 的 `switch_thinking`。
 - **建议**：共用档位合法性判定，CLI/REPL 保留各自文案和退出处理，避免规则逐渐分叉。
 - **验证要点**：无档位、非法档位、合法档位与默认值保持现有语义。
@@ -108,7 +108,7 @@
 
 ### 8. 分离配置字符串解析与文件读取
 
-- [ ] 审阅
+- [x] 审阅
 - **位置**：`src/config/mod.rs` 的 `load_source`；两个集成测试文件的配置构造辅助。
 - **建议**：提供可供测试使用的字符串解析入口；加载文件只负责读取和传入标签。保留文件路径/行号诊断及外部配置完全替换的行为。
 - **验证要点**：多数配置与会话测试可直接从字符串构建；保留少量真实文件加载测试。
@@ -116,7 +116,7 @@
 
 ### 9. 分离环境读取与纯规则
 
-- [ ] 审阅
+- [x] 审阅
 - **位置**：`src/config/expand.rs`；`src/provider/http.rs` 的代理选择与 `NO_PROXY` 匹配。
 - **建议**：展开函数接收环境查询函数；代理匹配接收显式值。生产入口读取环境，规则测试传入固定数据，避免依赖或修改进程环境。
 - **验证要点**：header 展开、缺失变量、畸形模板、代理优先级与域名匹配的现有语义；避免无意改变 HTTP Agent 缓存下环境生效时机。
@@ -124,7 +124,7 @@
 
 ### 10. 为 mock server 提供明确的生命周期
 
-- [ ] 审阅
+- [x] 审阅
 - **位置**：`tests/e2e_mock.rs` 的 `start_server` 等辅助。
 - **问题**：后台线程缺少可等待的完成结果，请求数不足时可能一直阻塞在 `accept`。
 - **建议**：提供有界等待、显式退出及服务端结果收集。与第 1 项的确定性时序控制配合。
@@ -137,15 +137,15 @@
 
 ### 11. 流式取消的时限表述
 
-- [ ] 审阅
+- [x] 审阅
 - **位置**：两份 README；`src/chat.rs`、`src/provider/mod.rs`、`src/provider/http.rs`。
 - **偏差**：README 表述读取线程约半秒停止；实现是主线程每 100ms 轮询取消并返回，后台阻塞读取可能滞留到 120s 空闲超时。
 - **需确认**：产品保证是交互快速返回，还是底层网络资源也必须在短时限内释放。后者需要额外设计，不能简单缩短共用于响应头的读超时。
-- **处理意见**：快速返回
+- **处理意见**：快速返回（已落地：README 表述修正，commit e1a4e64）
 
 ### 12. 架构文档中的测试层与退出路径
 
-- [ ] 审阅
+- [x] 审阅
 - **位置**：`docs/architecture.md`；`tests/e2e_mock.rs`、`tests/repl_flow.rs`；`src/repl.rs`、`src/chat.rs`。
 - **偏差**：文档描述了 fake adapter 驱动的 agent-loop 测试层，当前测试实现中未找到；文档还描述 REPL 退出经内部通道进入 agent loop，但当前 `/exit`、Eof 仅由 REPL 输入阶段处理，活动工具循环不会读取它们。
 - **需确认**：按实际实现校正文档；若要新增测试层，按第 1 项独立实施，不将未实现的测试保障写成现状。
@@ -153,15 +153,15 @@
 
 ### 13. 配置错误聚合的范围
 
-- [ ] 审阅
+- [x] 审阅
 - **位置**：`src/config/mod.rs` 的 `load_source`；`src/config/validate.rs`；配置文档。
 - **偏差**：语义校验会收集多个错误；TOML 反序列化遇到未知字段或缺失必填字段时先返回一个错误，并非所有配置错误都能一次收集。
 - **需确认**：将文档精确限定为语义错误聚合，还是确实要求结构错误也聚合；后者需要调整解析/校验流程。
-- **处理意见**：前者吧
+- **处理意见**：前者吧（已落地：文档限定为语义聚合，commit 011eef9）
 
 ### 14. SSE 单行上限与分片方式有关
 
-- [ ] 审阅
+- [x] 审阅
 - **位置**：`src/sse.rs` 的 `SseParser::feed`。
 - **观察**：长度检查只针对消费完整行后的残留缓冲。超限行若在本次 feed 中带换行，会先被解析而绕过该检查。
 - **建议**：作为独立 bug 修复评估；完整行与残留行都按同一长度契约检查。
@@ -170,25 +170,25 @@
 
 ### 15. musl 构建示例的 CPU 基线
 
-- [ ] 审阅
+- [x] 审阅
 - **位置**：两份 README 的静态构建示例；`AGENTS.md`；`.github/workflows/test.yml`。
 - **偏差**：README 的 x86_64-musl 示例未包含项目要求的 CPU 基线 flags，CI 已配置。
 - **建议**：确认后统一示例，包含 `CC_x86_64_unknown_linux_musl=musl-gcc`、C/C++ 的 `-march=x86-64 -mtune=generic` 和 Rust 的 `-C target-cpu=x86-64`。
 - **验证要点**：示例与 CI 一致；发布前检查 static-pie，并在低基线 CPU 模拟环境验证 HTTPS 路径。
-- **处理意见**：不用做
+- **处理意见**：不用做（关闭：README 示例保持现状，CPU 基线要求以 AGENTS.md/CI 为准）
 
 ## 四、后续发现（PTY 测试落地时）
 
 ### 16. 行回收后新提示符的毫秒级输入丢失窗口（macOS 实测，已根因定位）
 
-- [ ] 审阅
+- [x] 审阅
 - **位置**：rho 侧 `src/ui/mod.rs` 的 read_line 循环（reclaim → rustyline readline：enable_raw → refresh → read）；harness 侧 `tests/pty.rs` 的 `SETTLE` 注释。
 - **现象**：打字 → Ctrl-C → 行回收 → 新提示符出现后**立即**写入的首个字节可能丢失；毫秒级窗口且随调度浮动。人类敲键延迟（~100ms）撞不上；程序化极速输入可触发。
 - **根因定位（2024-10 排查）**：字节丢失发生在**内核 PTY 层**——rho 侧插桩证明 round-2 的 `read()` 已阻塞等待、`` 正常收到并触发中断返回，但期间写入的测试字节从未出现在 fd 0 的输入队列（readline 返回后非阻塞窥探为空）。排除链（全部实验验证）：cooked→raw 的 tcsetattr 切换不丢 canonical 缓冲字节（tcgetattr→tcsetattr 窗口内写入存活）；纯 PTY 双端写入不丢（无 rho 进程时字节存活）；rustyline `check_cursor_position=false`（`[6n` 光标查询吞输入的路径未启用）；buffer-redux 未启用（无跨轮 BufReader 预读吞字节）。结论：**macOS PTY 在 slave 的 tcsetattr(TCSADRAIN) 与对端 master 写入并发时存在丢字节的内核竞态**（rho 的 reclaim 输出使 TCSADRAIN 有待 drain 数据，扩大了竞态窗口；裸探针因时序差异未复现）。
 - **缓解（已实施）**：PTY 测试在提示符后稳定 50ms 再发输入（`SETTLE`）；harness 保留 raw 流捕获，断言失败时 dump 原始输出辅助诊断。
-- **可选修复方向（未实施）**：确认根因后可考虑减少 reclaim 与 enable_raw 的间隔（如把回收序列写入合并进 readline 前的一次 write），或上报 rustyline/macOS。影响面仅程序化输入场景。
+- **修复方向（未实施，备查）**：减少 reclaim 与 enable_raw 的间隔（如把回收序列写入合并进 readline 前的一次 write），或上报 rustyline/macOS。影响面仅程序化输入场景。
 - **影响面**：仅程序化输入场景；Linux 行为未验证（CI 观察中）。
-- **处理意见**：
+- **处理意见**：维持现状，不修复。触发条件为程序化亚毫秒级输入（人类敲键 ~100ms 撞不上）；PTY 测试以 SETTLE 规避；Linux CI 表现若正常则定性为 macOS-only 已知问题。修复方向备查，如复现率上升或 Linux 也丢再启动。
 
 ## 暂不建议的方向
 
