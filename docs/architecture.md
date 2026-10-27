@@ -223,5 +223,5 @@ exit 0：/exit、空闲态 Ctrl-C 双按、Ctrl-D（均正常退出）
 | agent loop + tools | 集成：`Session` 的 launcher/tool_runner 注入边界 + `ScriptedUi`，无网络无进程驱动分支（取消/退出各粒度、占位补齐、错误路径、配对不变式；时序用 channel 握手控制）；`tools::run_bash` 直接验证输出捕获/截断/超时 |
 | provider + HTTP 层 | 集成：本地 mock SSE 服务（std TcpListener 手写），测协议映射与流读取 |
 | 端到端工具循环 | 集成：mock SSE 服务驱动多轮真实 HTTP 请求，验证占位 Tool 消息的配对/顺序/第二次请求序列化（含 echo_reasoning） |
-| 取消/退出 | 集成：`ScriptedUi` 注入 `Line("/exit")`、`Eof` 验证退出路径；注入 `Interrupted{line_empty}` 序列验证 2 秒双按窗口、编辑中撤销、提交行清除武装（并断言 `set_ctrl_c_hint` 序列）；直接注入信号记录（第 1 次）验证流式取消路径——quit 路径（第 2 次）的计数判定由 `term.rs` 单元测试覆盖，端到端行为手工验收；信号到记录、灰提示到期擦除与屏幕行回收（含到期后重新武装、窄终端提示换行、宽字符/tab 边界）这一段（`term.rs` / `ui` 模块）手工验收 |
-| 终端交互 / 真实信号 | 手工验收 |
+| 取消/退出 | 集成：`ScriptedUi` 注入 `Line("/exit")`、`Eof` 验证退出路径；注入 `Interrupted{line_empty}` 序列验证 2 秒双按窗口、编辑中撤销、提交行清除武装（并断言 `set_ctrl_c_hint` 序列）；直接注入信号记录（第 1 次）验证流式取消路径——quit 路径（第 2 次）的计数判定由 `term.rs` 单元测试覆盖，端到端行为由 PTY 测试覆盖 |
+| 终端交互 / 真实信号 | PTY 集成（`tests/pty.rs`）：openpty 起真实 rho 二进制 + vt100 屏幕网格断言，覆盖信号到记录链路（on_sigint → self-pipe → 信号线程 → Cancel：流式取消/双按 quit/确认取消）、灰提示出现与到期擦除、行回收、bash 超时表现。窄终端提示换行、宽字符/tab 边界等布局细节仍手工抽查。已知竞态：行回收后的新提示符存在毫秒级输入丢失窗口（见 maintainability-review） |

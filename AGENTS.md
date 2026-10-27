@@ -106,7 +106,8 @@ main → config
 约束：
 
 - CI 不调用真实 API；不要提交真实 key。
-- 测试不要依赖 TTY；终端行为用 PTY/`script` 手工验收。
+- 默认测试套件不依赖 TTY；终端行为由 `tests/pty.rs` 用 openpty 起真实二进制驱动
+  （屏幕断言走 vt100 网格）。真实终端的手工抽查保留用于布局细节与体感回归。
 - 当前测试是可并行的本地 mock，不要引入固定端口或共享临时文件冲突。
 - 提交前跑完整 `cargo test --all-targets --locked` 和 clippy。
 

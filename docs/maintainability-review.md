@@ -177,6 +177,19 @@
 - **验证要点**：示例与 CI 一致；发布前检查 static-pie，并在低基线 CPU 模拟环境验证 HTTPS 路径。
 - **处理意见**：不用做
 
+## 四、后续发现（PTY 测试落地时）
+
+### 16. 行回收后新提示符的毫秒级输入丢失窗口（macOS 实测）
+
+- [ ] 审阅
+- **位置**：`src/ui/mod.rs` 的 `reclaim_prompt_rows` + rustyline `enable_raw_mode`（TCSADRAIN）；`tests/pty.rs` 的 `SETTLE` 注释。
+- **现象**：打字 → Ctrl-C → 行回收 → 新提示符出现后**立即**写入的首个字节可能丢失（无回显、无输入）；2ms 后的字节存活。窗口毫秒级且随调度浮动；全保真裸 rustyline 探针不复现（差异仅 repl 循环内容）。人类敲键延迟（~100ms）撞不上；程序化极速输入/粘贴可触发。
+- **已排除**：rustyline 版本/feature、helper/hint 线程/自定义绑定（二分开关）、SIGINT 基础设施、termios 状态错乱（macOS 位常量曾误读）、FIONREAD 诊断不可靠、cooked→raw 切换丢 canonical 缓冲（实验证明字节存活）。
+- **待验证假设**：reclaim 输出（待 drain）+ `enable_raw_mode` 的 TCSADRAIN 构成阻塞窗口，期间到达的输入字节被 macOS 丢弃。实验 v3 已设计（TCSADRAIN 阻塞期间写入测试字节，验证是否丢失）。
+- **临时缓解**：PTY 测试在提示符后统一稳定 50ms 再发输入（`SETTLE`）。
+- **影响面**：仅程序化输入场景；Linux 行为未验证。
+- **处理意见**：
+
 ## 暂不建议的方向
 
 - 为本次可维护性整理引入 async runtime、多 crate、通用工具注册框架或多层 service/repository。

@@ -160,7 +160,7 @@ Other limits: at most `max_tool_steps` model-initiated tool calls per turn (defa
 cargo test --all-targets --locked
 ```
 
-CI runs the tests on stable Rust, on every push to `master` or `dev` and every pull request. Tests run against local mocks: protocol tests use a hand-written local SSE mock over `TcpListener`, and the REPL/agent-loop tests drive the real loop with a scripted `Ui` implementation. The signal → record path of `term.rs` and live terminal behaviour are verified manually.
+CI runs the tests on stable Rust, on every push to `master` or `dev` and every pull request. Tests run against local mocks: protocol tests use a hand-written local SSE mock over `TcpListener`, and the REPL/agent-loop tests drive the real loop with a scripted `Ui` implementation. The signal → record path of `term.rs` and live terminal behaviour are covered by PTY integration tests that drive the real binary through a pty and assert on the parsed screen grid.
 
 ## License
 

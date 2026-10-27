@@ -159,7 +159,7 @@ max_output_bytes = 16384
 cargo test --all-targets --locked
 ```
 
-CI 在每次 push 到 `master` 或 `dev`、以及每个 PR 上，用 stable Rust 跑测试。测试使用本地 mock：协议层用 `TcpListener` 手写本地 SSE mock，REPL/agent loop 用脚本化的 `Ui` 实现驱动真实主循环。`term.rs` 里从信号到记录这一段，以及真实终端交互，靠手工验收。
+CI 在每次 push 到 `master` 或 `dev`、以及每个 PR 上，用 stable Rust 跑测试。测试使用本地 mock：协议层用 `TcpListener` 手写本地 SSE mock，REPL/agent loop 用脚本化的 `Ui` 实现驱动真实主循环。`term.rs` 里从信号到记录这一段，以及真实终端交互，由 PTY 集成测试覆盖（openpty 驱动真实二进制，屏幕断言走 vt100 网格）。
 
 ## 许可
 
