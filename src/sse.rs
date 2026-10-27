@@ -1,6 +1,6 @@
 //! SSE 行解析器（纯函数，可夹具测试）。见 docs/architecture.md 二、四节。
 
-/// 单个 `data:` 行（含尚未遇到换行的残留缓冲）的字节上限。
+/// 单行的字节上限（不含结尾换行符；完整行与尚未遇到换行的残留缓冲同样适用）。
 /// 超出按协议错误收尾，避免异常上游用超长行把内存和 CPU 拖垮。
 pub const MAX_LINE_BYTES: usize = 1 << 20;
 
@@ -10,7 +10,7 @@ pub const MAX_LINE_BYTES: usize = 1 << 20;
 pub struct SseParser {
     /// 行缓冲（原始字节；只在完整行边界做 UTF-8 转换）
     buf: Vec<u8>,
-    /// 未终结行的字节上限
+    /// 未终结行的字节上限（完整行与残留同样适用）
     max_line_bytes: usize,
 }
 
@@ -27,13 +27,23 @@ impl SseParser {
 
     /// 喂入一段原始字节（可能是半个 UTF-8 字符/半行）。
     /// 返回本次新完成的 `data:` 载荷列表（注释/空行/非 data 行忽略；CRLF 兼容）。
-    /// 未终结的单行超过 [`MAX_LINE_BYTES`] 时返回错误（残留缓冲同时清空）。
+    /// 任一单行（完整或未终结）超过 [`MAX_LINE_BYTES`] 时返回错误（缓冲同时清空）。
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, String> {
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
         let mut start = 0;
         while let Some(rel) = self.buf[start..].iter().position(|&b| b == b'\n') {
             let end = start + rel;
+            // 长度检查用未剥离 CR 的原始行：换行随最后一片到达时，
+            // 残留缓冲里的字节（含 CR）同样计入，两种分片方式判定一致。
+            if end - start > self.max_line_bytes {
+                let len = end - start;
+                self.buf.clear();
+                return Err(format!(
+                    "SSE 单行超过上限（{len} 字节，上限 {} 字节）",
+                    self.max_line_bytes
+                ));
+            }
             let mut line = &self.buf[start..end];
             if line.last() == Some(&b'\r') {
                 line = &line[..line.len() - 1];
@@ -135,6 +145,53 @@ mod tests {
         assert!(err.contains("单行超过上限"), "error was {err}");
         // 清空后可继续使用。
         assert_eq!(p.feed(b"data: ok\n").unwrap(), vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn overlong_terminated_line_in_same_batch_is_error() {
+        let mut p = SseParser::new();
+        let mut line = b"data: ".to_vec();
+        line.extend(std::iter::repeat(b'y').take(MAX_LINE_BYTES));
+        line.push(b'\n');
+        let err = p.feed(&line).unwrap_err();
+        assert!(err.contains("单行超过上限"), "error was {err}");
+        // 清空后可继续使用。
+        assert_eq!(p.feed(b"data: ok\n").unwrap(), vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn overlong_line_error_is_chunking_independent() {
+        // 同一输入：换行随最后一片到达时由残留检查报错，整批到达时由完整行检查报错。
+        let mut line = b"data: ".to_vec();
+        line.extend(std::iter::repeat(b'y').take(MAX_LINE_BYTES));
+        let (a, b) = line.split_at(line.len() / 2);
+        let mut p = SseParser::new();
+        assert!(p.feed(a).unwrap().is_empty());
+        assert!(p.feed(b).is_err());
+
+        let mut whole = line.clone();
+        whole.push(b'\n');
+        assert!(SseParser::new().feed(&whole).is_err());
+    }
+
+    #[test]
+    fn overlong_crlf_line_is_error() {
+        let mut p = SseParser::new();
+        let mut line = b"data: ".to_vec();
+        line.extend(std::iter::repeat(b'y').take(MAX_LINE_BYTES));
+        line.extend_from_slice(b"\r\n");
+        assert!(p.feed(&line).is_err());
+    }
+
+    #[test]
+    fn line_at_exactly_limit_with_newline_is_accepted() {
+        let mut p = SseParser::new();
+        let mut line = b"data: ".to_vec();
+        line.extend(std::iter::repeat(b'y').take(MAX_LINE_BYTES - 6));
+        line.push(b'\n');
+        let out = p.feed(&line).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), MAX_LINE_BYTES - 6);
     }
 
     #[test]

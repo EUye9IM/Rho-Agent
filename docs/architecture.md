@@ -43,7 +43,7 @@ src/
                  按 base_url 缓存 ureq::Agent（TLS 根与连接池复用）、错误体截断
     openai.rs    openai_chat：请求体组装（含 max_tokens）、thinking 片段顶层合并、
                  reasoning_content 处理（echo_reasoning 构造时注入）
-  sse.rs         SSE 行解析器（纯函数，可夹具测试；未终结单行有字节上限）
+  sse.rs         SSE 行解析器（纯函数，可夹具测试；单行有字节上限，完整行与未终结残留同样适用）
   tools.rs       bash 执行：进程组 spawn、超时升级、双 drain 管道读取、
                  输出截断、allowlist + 元字符判定、确认
   render.rs      纯格式化函数：思考暗淡色、正文原样、工具行、带左边栏的工具结果、截断标注
