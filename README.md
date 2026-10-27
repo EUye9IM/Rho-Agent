@@ -18,7 +18,7 @@ Implementation: [docs/architecture.md](docs/architecture.md).
 - **Config-driven providers** — providers, models and thinking levels are declared as data. Same protocol family means configuration only.
 - **Streaming with visible reasoning** — text streams as it arrives; `reasoning_content` is rendered dimmed and stays local unless the provider sets `compat.echo_reasoning = true`.
 - **One tool: `bash`** — executed in the foreground as `bash -c <command>`, with a fresh shell per call and a per-call timeout that escalates to a process-group kill.
-- **Predictable Ctrl-C** — first Ctrl-C cancels the current stream/tool/confirmation (the streaming reader polls for cancellation and stops within about half a second), second one exits; at the idle prompt two empty-line Ctrl-C within two seconds exit (the first shows a gray hint). The conversation history is always left in a protocol-valid state.
+- **Predictable Ctrl-C** — first Ctrl-C cancels the current stream/tool/confirmation and returns you to the prompt (cancellation takes effect between chunks; if the connection stalls, the background reader ends once the next data arrives or the idle timeout hits), second one exits; at the idle prompt two empty-line Ctrl-C within two seconds exit (the first shows a gray hint). The conversation history is always left in a protocol-valid state.
 - **Strict config validation** — unknown fields, dangling references and missing required fields fail loudly with the config path (TOML syntax errors also include a line number), exit code 2.
 
 ## Requirements
