@@ -298,6 +298,22 @@ pub fn find_provider<'a>(cfg: &'a Config, id: &str) -> Option<&'a Provider> {
     cfg.providers.get(id)
 }
 
+/// thinking 档位合法性判定：None = 合法；Some(错误文案) = 非法。
+/// CLI（--thinking，exit 2）与 REPL（/thinking，展示错误）共用此判定，避免规则分叉。
+pub fn thinking_level_err(model: &Model, model_id: &str, level: &str) -> Option<String> {
+    let levels: Vec<&str> = model.thinking.keys().map(String::as_str).collect();
+    if levels.is_empty() {
+        return Some(format!("模型 {model_id} 未声明思考档位"));
+    }
+    if !model.thinking.contains_key(level) {
+        return Some(format!(
+            "无效思考档位 `{level}`（模型 {model_id}）；可选：{}",
+            levels.join(", ")
+        ));
+    }
+    None
+}
+
 pub fn find_model<'a>(cfg: &'a Config, id: &str) -> Option<&'a Model> {
     cfg.models.get(id)
 }

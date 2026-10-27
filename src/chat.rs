@@ -498,15 +498,8 @@ impl Session {
 
     /// 切换思考档位（REPL /thinking）：无效档位拒绝；更新 selection.thinking。
     pub fn switch_thinking(&mut self, level: &str) -> Result<(), String> {
-        let levels: Vec<&str> = self.selection.model.thinking.keys().map(String::as_str).collect();
-        if levels.is_empty() {
-            return Err(format!("模型 {} 未声明思考档位", self.selection.model_id));
-        }
-        if !self.selection.model.thinking.contains_key(level) {
-            return Err(format!(
-                "无效思考档位 `{level}`；可选：{}",
-                levels.join(", ")
-            ));
+        if let Some(e) = config::thinking_level_err(&self.selection.model, &self.selection.model_id, level) {
+            return Err(e);
         }
         self.selection.thinking = Some(level.to_string());
         Ok(())

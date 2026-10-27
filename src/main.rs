@@ -105,27 +105,14 @@ fn resolve_thinking(
     cli: Option<&str>,
 ) -> Result<(), String> {
     let Some(level) = cli else { return Ok(()) };
-    let levels: Vec<&str> = selection
-        .model
-        .thinking
-        .keys()
-        .map(String::as_str)
-        .collect();
-    if levels.is_empty() {
-        return Err(format!(
-            "模型 {} 未声明思考档位，不能使用 --thinking {level}",
-            selection.model_id
-        ));
+    // 与 Session::switch_thinking 共用判定（config::thinking_level_err）；CLI 文案附加提示。
+    match config::thinking_level_err(&selection.model, &selection.model_id, level) {
+        Some(e) => Err(format!("{e}，不能使用 --thinking {level}")),
+        None => {
+            selection.thinking = Some(level.to_string());
+            Ok(())
+        }
     }
-    if !selection.model.thinking.contains_key(level) {
-        return Err(format!(
-            "无效思考档位 `{level}`（模型 {}）；可选：{}",
-            selection.model_id,
-            levels.join(", ")
-        ));
-    }
-    selection.thinking = Some(level.to_string());
-    Ok(())
 }
 
 /// 手写参数解析：支持 `--flag value` 与 `--flag=value`；未知参数/重复 flag/带值的 --yes 报错。
