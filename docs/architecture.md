@@ -35,7 +35,8 @@ src/
     mod.rs       结构定义、内置默认配置（include_str! + 解析）
     validate.rs  悬空引用 / 前缀对应 / 取值校验，一次收集全部语义错误并报告配置路径
     expand.rs    header 值 ${VAR} 展开；明文密钥告警
-  chat.rs        内部消息模型 Msg、会话历史（Vec<Msg>）、工具循环
+  chat.rs        内部消息模型 Msg、会话历史（Vec<Msg>）、工具循环；
+                 StreamLauncher/ToolRunner 注入边界（生产 worker 线程/真实 bash，测试可替换）
   provider/
     mod.rs       ProviderAdapter trait（Send+Sync，Arc 共享）、按 Provider 构造（注入 compat）、
                  流式请求工作线程（取消/超时/字节上限、首字节看门狗）
@@ -217,7 +218,7 @@ exit 0：/exit、空闲态 Ctrl-C 双按、Ctrl-D（均正常退出）
 | `sse.rs` / `config` / `tools` 判定与截断 / `expand` | 纯单元测试，录制夹具 |
 | `render` 格式 / `ui::prompt_rows`（回收时上移的行数）/ `ui::should_erase_hint` / `repl::within_window`（双按窗口） | 纯单元测试，无 TTY |
 | `provider::openai` 解析 | 单元测试：构造 JSON chunk → StreamEvent |
-| agent loop + tools | 集成：mock SSE 服务 + `ScriptedUi` 驱动真实 `Session::turn`（配对、计数、占位、取消；`tools::run_bash` 直接验证输出捕获/截断/超时） |
+| agent loop + tools | 集成：`Session` 的 launcher/tool_runner 注入边界 + `ScriptedUi`，无网络无进程驱动分支（取消/退出各粒度、占位补齐、错误路径、配对不变式；时序用 channel 握手控制）；`tools::run_bash` 直接验证输出捕获/截断/超时 |
 | provider + HTTP 层 | 集成：本地 mock SSE 服务（std TcpListener 手写），测协议映射与流读取 |
 | 端到端工具循环 | 集成：mock SSE 服务驱动多轮真实 HTTP 请求，验证占位 Tool 消息的配对/顺序/第二次请求序列化（含 echo_reasoning） |
 | 取消/退出 | 集成：`ScriptedUi` 注入 `Line("/exit")`、`Eof` 验证退出路径；注入 `Interrupted{line_empty}` 序列验证 2 秒双按窗口、编辑中撤销、提交行清除武装（并断言 `set_ctrl_c_hint` 序列）；直接注入信号记录（第 1 次）验证流式取消路径——quit 路径（第 2 次）的计数判定由 `term.rs` 单元测试覆盖，端到端行为手工验收；信号到记录、灰提示到期擦除与屏幕行回收（含到期后重新武装、窄终端提示换行、宽字符/tab 边界）这一段（`term.rs` / `ui` 模块）手工验收 |

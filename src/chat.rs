@@ -1,14 +1,15 @@
 //! 内部消息模型与 agent 工具循环。见 docs/architecture.md 三/四节。
 
-use crate::config::{self, Config, Selection};
+use crate::config::{self, Config, Provider, Selection};
 use crate::provider::{self, ProviderAdapter, StreamEvent};
 use crate::render::RenderEvent;
 use crate::term::{Cancel, SignalState};
-use crate::tools::{self, BashEnd};
+use crate::tools::{self, BashEnd, BashOutput};
 use crate::ui::{ConfirmOutcome, Ui};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,14 +50,65 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// 一次流式请求的启动边界：生产实现起 worker 线程跑真实 HTTP；
+/// 测试实现注入预编排事件序列（无网络）。见 docs/architecture.md 七节。
+pub trait StreamLauncher: Send + Sync {
+    fn launch(
+        &self,
+        adapter: Arc<dyn ProviderAdapter>,
+        provider: Provider,
+        body: Value,
+        headers: Vec<(String, String)>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Receiver<StreamEvent>;
+}
+
+/// 生产实现：每轮请求一个工作线程（docs/architecture.md 五节）。
+struct WorkerLauncher;
+
+impl StreamLauncher for WorkerLauncher {
+    fn launch(
+        &self,
+        adapter: Arc<dyn ProviderAdapter>,
+        provider: Provider,
+        body: Value,
+        headers: Vec<(String, String)>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Receiver<StreamEvent> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            provider::stream_request(adapter, provider, body, headers, tx, cancelled);
+        });
+        rx
+    }
+}
+
+/// 单个 bash 调用的执行边界：生产实现跑真实进程组；
+/// 测试实现返回预设结果（无进程）。
+pub trait ToolRunner: Send + Sync {
+    fn run(&self, command: &str, cfg: &crate::config::BashToolConfig, cancel: &Cancel) -> BashOutput;
+}
+
+struct BashRunner;
+
+impl ToolRunner for BashRunner {
+    fn run(&self, command: &str, cfg: &crate::config::BashToolConfig, cancel: &Cancel) -> BashOutput {
+        tools::run_bash(command, cfg, cancel)
+    }
+}
+
 /// 会话状态：历史 + 当前选择 + 适配器 + 工具步数。
 /// adapter 为 Arc 共享：会话长期持有，每轮 clone 一份按值传给 worker
 /// （thread::spawn + detach 取消语义需 'static，不能借引用）。
 /// thinking 唯一真值源是 selection.thinking（switch_* 同步更新）。
+/// launcher / tool_runner 是测试注入边界：默认生产实现，集成测试可替换
+/// 为预编排事件与预设结果（见 tests/agent_loop.rs）。
 pub struct Session {
     pub cfg: Config,
     pub selection: Selection,
     pub adapter: Arc<dyn ProviderAdapter>,
+    pub launcher: Arc<dyn StreamLauncher>,
+    pub tool_runner: Arc<dyn ToolRunner>,
     pub yes: bool,
     pub history: Vec<Msg>,
     /// 本轮工具步数（每次用户输入触发的一轮对话计数，turn 开头重置）
@@ -118,7 +170,16 @@ impl Session {
         yes: bool,
     ) -> Self {
         let history = system_history(cfg.system_prompt.as_deref());
-        Self { cfg, selection, adapter, yes, history, steps: 0 }
+        Self {
+            cfg,
+            selection,
+            adapter,
+            launcher: Arc::new(WorkerLauncher),
+            tool_runner: Arc::new(BashRunner),
+            yes,
+            history,
+            steps: 0,
+        }
     }
 
     /// `/clear`：历史重置为仅含 system 消息（播种语义同 new）；steps 归零。
@@ -226,13 +287,9 @@ impl Session {
         let adapter = self.adapter.clone();
         // 取消标志：worker 在读取循环里轮询它，不必等下一次 send 失败。
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel();
-        {
-            let cancelled = cancelled.clone();
-            std::thread::spawn(move || {
-                provider::stream_request(adapter, provider, body, headers, tx, cancelled);
-            });
-        }
+        let rx = self
+            .launcher
+            .launch(adapter, provider, body, headers, cancelled.clone());
 
         let mut final_msg: Option<Msg> = None;
         let mut error: Option<String> = None;
@@ -494,7 +551,9 @@ fn dispatch_tool_call(
                 emit(ui, RenderEvent::ToolResult(content.clone()));
                 return CallOutcome::Cancelled(content);
             }
-            let out = tools::run_bash(command, &session.cfg.tools.bash, cancel);
+            let out = session
+                .tool_runner
+                .run(command, &session.cfg.tools.bash, cancel);
             emit(ui, RenderEvent::ToolResult(out.content.clone()));
             match out.end {
                 BashEnd::SpawnFailed(e) => {
