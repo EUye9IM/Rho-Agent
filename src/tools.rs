@@ -25,7 +25,7 @@ pub struct BashOutput {
 
 #[derive(Debug)]
 pub enum BashEnd {
-    /// 正常退出（exit code 可能为非零，非零不算错误）
+    /// 正常退出（exit code 可能为非零，非零不算错误；负值 = 被信号终止）
     Exited(i32),
     /// 超时（已 SIGTERM→2s→SIGKILL 整个进程组）
     TimedOut,
@@ -33,6 +33,8 @@ pub enum BashEnd {
     Cancelled,
     /// spawn 失败（命令不存在属 bash 127，不是这里；此处是 fork/exec 层失败）
     SpawnFailed(String),
+    /// waitpid 失败（回收错误，与信号退出区分：后者是 Exited 的负值）
+    ReapFailed(String),
     /// quit 已请求：工具等待循环只终止进程组，把 quit 上报 agent loop，
     /// 不自行退出（docs/architecture.md 五节）
     QuitRequested,
@@ -100,38 +102,40 @@ pub fn run_bash(command: &str, tool_cfg: &BashToolConfig, cancel: &Cancel) -> Ba
     let exit_seen = Arc::new(AtomicBool::new(false));
     let limit = tool_cfg.max_output_bytes;
 
-    let (out_tx, out_rx) = mpsc::channel::<StreamCapture>();
-    let (err_tx, err_rx) = mpsc::channel::<StreamCapture>();
-    let mut handles = Vec::new();
+    let (out_tx, out_rx) = mpsc::channel::<DrainOutcome>();
+    let (err_tx, err_rx) = mpsc::channel::<DrainOutcome>();
+    let mut out_handle: Option<std::thread::JoinHandle<()>> = None;
+    let mut err_handle: Option<std::thread::JoinHandle<()>> = None;
     if let Some(stdout) = stdout {
         let flag = exit_seen.clone();
-        handles.push(std::thread::spawn(move || {
+        out_handle = Some(std::thread::spawn(move || {
             let _ = out_tx.send(drain_stream(stdout, flag, limit));
         }));
     }
     if let Some(stderr) = stderr {
         let flag = exit_seen.clone();
-        handles.push(std::thread::spawn(move || {
+        err_handle = Some(std::thread::spawn(move || {
             let _ = err_tx.send(drain_stream(stderr, flag, limit));
         }));
     }
 
     let started = Instant::now();
     let timeout = Duration::from_secs(tool_cfg.timeout_seconds);
+    let mut kill_warning: Option<String> = None;
     let end = loop {
         match child.try_wait() {
             Ok(Some(status)) => break BashEnd::Exited(status.code().unwrap_or(-1)),
             Ok(None) => {}
-            Err(_) => break BashEnd::Exited(-1),
+            Err(e) => break BashEnd::ReapFailed(e.to_string()),
         }
 
         if started.elapsed() >= timeout {
-            terminate_group(&mut child, pgid, cancel);
+            kill_warning = terminate_group(&mut child, pgid, cancel);
             break BashEnd::TimedOut;
         }
 
         if let Some(sig) = cancel.pending() {
-            terminate_group(&mut child, pgid, cancel);
+            kill_warning = terminate_group(&mut child, pgid, cancel);
             break match sig {
                 SignalState::Cancel => BashEnd::Cancelled,
                 // quit（第二次 Ctrl-C）：只终止进程组并返回给 agent loop，
@@ -144,24 +148,54 @@ pub fn run_bash(command: &str, tool_cfg: &BashToolConfig, cancel: &Cancel) -> Ba
 
     // 通知 drain 线程进入有界收尾；主线程仍是唯一 reaper。
     exit_seen.store(true, Ordering::SeqCst);
-    let stdout = out_rx
-        .recv_timeout(Duration::from_secs(1))
-        .unwrap_or_default();
-    let stderr = err_rx
-        .recv_timeout(Duration::from_secs(1))
-        .unwrap_or_default();
-    for h in handles {
-        let _ = h.join();
-    }
+    let mut notes: Vec<String> = Vec::new();
+    let stdout = collect_drain(&out_rx, &mut out_handle, "stdout", &mut notes);
+    let stderr = collect_drain(&err_rx, &mut err_handle, "stderr", &mut notes);
 
-    let content = format_output(stdout, stderr, &end);
+    let mut content = format_output(stdout, stderr, &end, &notes);
+    if let Some(w) = kill_warning {
+        content.push('\n');
+        content.push_str(&format!("[警告：向进程组发信号失败：{w}]"));
+    }
     BashOutput { content, end }
 }
 
+/// 接收单个 drain 线程的结果（有界 1s）。
+/// 成功收到才 join：此时线程只差收尾，join 很快；
+/// 超时则放弃 join（detach）——线程可能仍阻塞在读取里，join 会让本函数返回无界，
+/// detach 后它会在管道关闭时自行退出。捕获失败（非阻塞设置失败）以注记行呈现。
+fn collect_drain(
+    rx: &mpsc::Receiver<DrainOutcome>,
+    handle: &mut Option<std::thread::JoinHandle<()>>,
+    label: &str,
+    notes: &mut Vec<String>,
+) -> StreamCapture {
+    match rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(DrainOutcome::Capture(c)) => {
+            if let Some(h) = handle.take() {
+                let _ = h.join();
+            }
+            c
+        }
+        Ok(DrainOutcome::SetupFailed(e)) => {
+            if let Some(h) = handle.take() {
+                let _ = h.join();
+            }
+            notes.push(format!("[{label} 捕获失败：{e}]"));
+            StreamCapture::default()
+        }
+        // 超时/断开：放弃该流剩余输出，detach 线程，返回已有内容为空。
+        Err(_) => StreamCapture::default(),
+    }
+}
+
 /// 主线程是唯一 reaper：SIGTERM → 最多 2s → 无论直接子进程状态对 pgid 发 SIGKILL → 回收。
-/// 若期间观察到 quit，提前升级到 SIGKILL。
-fn terminate_group(child: &mut Child, pgid: i32, cancel: &Cancel) {
-    let _ = term::kill_pg(pgid, libc::SIGTERM);
+/// 若期间观察到 quit，提前升级到 SIGKILL。返回发信号失败的警告（无则 None）。
+fn terminate_group(child: &mut Child, pgid: i32, cancel: &Cancel) -> Option<String> {
+    let mut warning = match term::kill_pg(pgid, libc::SIGTERM) {
+        Ok(()) => None,
+        Err(e) => Some(format!("SIGTERM：{e}")),
+    };
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         if cancel.state() == SignalState::Quit {
@@ -171,8 +205,15 @@ fn terminate_group(child: &mut Child, pgid: i32, cancel: &Cancel) {
         let _ = child.try_wait();
         std::thread::sleep(Duration::from_millis(20));
     }
-    let _ = term::kill_pg(pgid, libc::SIGKILL);
+    if let Err(e) = term::kill_pg(pgid, libc::SIGKILL) {
+        let msg = format!("SIGKILL：{e}");
+        warning = Some(match warning {
+            Some(w) => format!("{w}；{msg}"),
+            None => msg,
+        });
+    }
     let _ = child.wait();
+    warning
 }
 
 /// 单条流的两段捕获结果（已按 UTF-8 边界裁剪）。
@@ -283,18 +324,30 @@ fn utf8_tail(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
+/// 单条流的捕获结果或捕获失败（非阻塞设置失败时无法保证有界收尾，显式报告而非静默降级）。
+#[derive(Debug)]
+enum DrainOutcome {
+    Capture(StreamCapture),
+    SetupFailed(String),
+}
+
 /// 并行读取一条管道；主线程退出后进入 500ms 有界收尾读取。
 fn drain_stream<R: Read + AsRawFd>(
     mut reader: R,
     exit_seen: Arc<AtomicBool>,
     limit: usize,
-) -> StreamCapture {
+) -> DrainOutcome {
     let fd = reader.as_raw_fd();
     // SAFETY: fd 由 reader 持有，在函数期间有效。
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags != -1 {
-            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        if flags == -1
+            || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == -1
+        {
+            // 非阻塞设置失败：后续读取无法兑现收尾期限，静默降级成阻塞模式
+            // 会让线程（及 join 它的主线程）无界等待。放弃捕获剩余数据，直接返回。
+            let e = std::io::Error::last_os_error();
+            return DrainOutcome::SetupFailed(e.to_string());
         }
     }
 
@@ -322,7 +375,7 @@ fn drain_stream<R: Read + AsRawFd>(
             Err(_) => break,
         }
     }
-    buf.finish()
+    DrainOutcome::Capture(buf.finish())
 }
 
 fn poll_readable(fd: i32, timeout_ms: i32) {
@@ -333,7 +386,12 @@ fn poll_readable(fd: i32, timeout_ms: i32) {
     }
 }
 
-fn format_output(stdout: StreamCapture, stderr: StreamCapture, end: &BashEnd) -> String {
+fn format_output(
+    stdout: StreamCapture,
+    stderr: StreamCapture,
+    end: &BashEnd,
+    notes: &[String],
+) -> String {
     let stdout_text = stdout.render();
     let stderr_text = stderr.render();
     let mut out = String::new();
@@ -363,6 +421,12 @@ fn format_output(stdout: StreamCapture, stderr: StreamCapture, end: &BashEnd) ->
             "[Command cancelled (quit requested): 已部分执行（被取消，副作用已发生），进程组已终止]",
         ),
         BashEnd::SpawnFailed(e) => out.push_str(&format!("[Command failed to start: {e}]")),
+        BashEnd::ReapFailed(e) => out.push_str(&format!("[Command reap failed: {e}]")),
+    }
+    // 捕获/终止警告附在末尾（诊断信息，不掩盖结束标记）。
+    for note in notes {
+        out.push('\n');
+        out.push_str(note);
     }
     out
 }

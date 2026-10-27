@@ -593,7 +593,7 @@ fn dispatch_tool_call(
             }
             let out = tool_runner.run(command, bash_cfg, cancel);
             match out.end {
-                BashEnd::SpawnFailed(_) => tool_outcome(out.content),
+                BashEnd::SpawnFailed(_) | BashEnd::ReapFailed(_) => tool_outcome(out.content),
                 BashEnd::Cancelled | BashEnd::QuitRequested => CallOutcome {
                     content: out.content,
                     stop: true,
