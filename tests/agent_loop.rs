@@ -2,7 +2,7 @@
 //! `ToolRunner` 预设结果驱动真实 `Session::turn`，无网络无进程。
 //! 覆盖：取消/退出各粒度、占位补齐、错误路径与配对不变式。
 
-use rho::chat::{Msg, Session, StreamLauncher, ToolCall, ToolRunner, TurnEnd};
+use rho::chat::{AssistantMsg, Msg, Session, StreamLauncher, ToolCall, ToolRunner, TurnEnd};
 use rho::config::{self, BashToolConfig, Provider};
 use rho::provider::{self, ProviderAdapter, StreamEvent};
 use rho::term::Cancel;
@@ -47,12 +47,12 @@ fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
     ToolCall { id: id.into(), name: name.into(), arguments: arguments.into() }
 }
 
-fn assistant_with_calls(calls: Vec<ToolCall>) -> Msg {
-    Msg::Assistant { text: None, reasoning: None, tool_calls: calls }
+fn assistant_with_calls(calls: Vec<ToolCall>) -> AssistantMsg {
+    AssistantMsg { text: None, reasoning: None, tool_calls: calls }
 }
 
 fn text_final(t: &str) -> StreamEvent {
-    StreamEvent::Final(Box::new(Msg::Assistant {
+    StreamEvent::Final(Box::new(AssistantMsg {
         text: Some(t.into()),
         reasoning: None,
         tool_calls: vec![],
@@ -198,9 +198,9 @@ fn first_call_failures_do_not_block_rest() {
     assert!(tool_result_content(&session.history, 3).contains("参数解析失败"));
     assert_eq!(tool_result_content(&session.history, 4), "用户拒绝执行");
     match &session.history[5] {
-        Msg::Assistant { text: Some(t), tool_calls, .. } => {
-            assert_eq!(t, "done");
-            assert!(tool_calls.is_empty());
+        Msg::Assistant(a) => {
+            assert_eq!(a.text.as_deref(), Some("done"));
+            assert!(a.tool_calls.is_empty());
         }
         other => panic!("unexpected {other:?}"),
     }

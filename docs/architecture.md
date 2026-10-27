@@ -57,7 +57,7 @@ src/
     scripted.rs  测试实现 ScriptedUi（预排输入与确认、收集渲染事件）
 ```
 
-依赖方向为 `repl → chat → provider → sse`。`Msg`/`ToolCall` 等共享消息类型放在 `chat.rs`，provider 通过 `StreamEvent::Final(Box<Msg>)` 使用它们；这是唯一的跨层类型引用。`config` 被各层读取，处于依赖关系底层。`render` 提供纯格式化函数，由 `repl`/`chat`/`ui` 调用；`ui` 把格式化结果写入终端。
+依赖方向为 `repl → chat → provider → sse`。`Msg`/`AssistantMsg`/`ToolCall` 等共享消息类型放在 `chat.rs`，provider 通过 `StreamEvent::Final(Box<AssistantMsg>)` 使用它们；这是唯一的跨层类型引用。`config` 被各层读取，处于依赖关系底层。`render` 提供纯格式化函数，由 `repl`/`chat`/`ui` 调用；`ui` 把格式化结果写入终端。
 
 ## 三、关键数据类型
 
@@ -66,9 +66,10 @@ src/
 enum Msg {
     System(String),
     User(String),
-    Assistant { text: Option<String>, reasoning: Option<String>, tool_calls: Vec<ToolCall> },
+    Assistant(AssistantMsg),   // 载荷见下；流终态与历史共用同一类型
     Tool { tool_call_id: String, content: String },
 }
+struct AssistantMsg { text: Option<String>, reasoning: Option<String>, tool_calls: Vec<ToolCall> }
 struct ToolCall { id: String, name: String, arguments: String } // arguments 保持原始 JSON 字符串
 ```
 
@@ -76,10 +77,12 @@ struct ToolCall { id: String, name: String, arguments: String } // arguments 保
 // provider/mod.rs
 enum StreamEvent {
     Delta { text: Option<String>, reasoning: Option<String> }, // 渲染用增量（正文/思考文本）
-    Done,                                      // [DONE] 触发；worker 已校验 finish_reason（合法才继续发 Final）
-    Final(Box<Msg>),                           // worker 组装完成的完整 Assistant 消息，随 Done 后发送
-    Error(String),                             // HTTP 错误 / 断流 / 非法 JSON / finish_reason=length|content_filter 等截断；异常 EOF 按错误处理
+    Final(Box<AssistantMsg>),                   // worker 组装完成的完整 Assistant 消息
+    Error(String),                              // HTTP 错误 / 断流 / 非法 JSON / finish_reason=length|content_filter 等截断；异常 EOF 按错误处理
 }
+// 终态只有 Final/Error 两种：[DONE] 与 finish_reason 的提交资格判定完全内化在 worker，
+// 主线程收到即定论。流式请求的主线程侧句柄 StreamHandle 绑定接收器与取消标志，
+// abandon（置位取消标志 + drop Receiver）是唯一放弃路径。
 trait ProviderAdapter: Send + Sync {
     fn endpoint(&self, p: &Provider) -> String;
     fn build_body(&self, hist: &[Msg], model: &Model, model_id: &str, thinking: Option<&Value>) -> Value;
@@ -93,7 +96,7 @@ trait ProviderAdapter: Send + Sync {
 // （thread::spawn + detach 取消语义需 'static，不能借引用）；/provider 切换时重建。其他协议族返回可展示的 Err。
 ```
 
-- **`TurnAcc` 归 worker 线程所有**：chunk 解析与累加都在工作线程内完成；channel 传渲染增量（Delta）、终态（Done/Error）与组装完成的完整 Assistant 消息（Final）。主线程只消费 Final，提交历史/执行工具都依赖它；取消时 drop Receiver，累加器随 worker 结束丢弃。
+- **`TurnAcc` 归 worker 线程所有**：chunk 解析与累加都在工作线程内完成；channel 传渲染增量（Delta）与终态（Final/Error）。主线程只消费 Final，提交历史/执行工具都依赖它；取消时 drop Receiver，累加器随 worker 结束丢弃。`tool_calls` 按 index 归位到具名的 `PartialToolCall`（id/name/arguments 可分批到达）。
 
 ```rust
 // ui — 用户交互抽象，repl / chat / tools 通过此接口访问终端
@@ -141,9 +144,8 @@ loop {
     worker 线程发请求并持有 TurnAcc，主线程 recv_timeout 短轮询：
         每次成功收到事件后先查标志再处理（持续有事件也逐块可取消）
         Delta     → 渲染
-        Done      → 无载荷；worker 已校验 finish_reason，接收继续
         Final     → 收到完整 Assistant 消息才退出接收、进入流后处理；
-                    Done 后通道断开或缺失 Final 按 Error 收尾
+                    通道断开（未收到 Final）按 Error 收尾
         Error     → 展示错误，回合结束（保留已完成历史）
         Disconnected → worker 契约要求任何结束路径必以 Final 或 Error 收尾后
                     才退出；收到 Disconnected 即防御性按 Error 收尾
@@ -176,7 +178,7 @@ loop {
 
 关键点：
 - **历史始终配对完整**：Assistant 的全部 tool_calls 一经提交，每个调用必有对应 Tool 消息——真实结果、真实错误文本、或“拒绝/取消/超限/部分执行”占位结果。任何单调用失败，后续调用仍逐个判定；取消/退出在任何粒度发生，剩余调用必补占位后收尾。
-- **提交资格（worker 侧）**：`finish_reason` 为 `stop`/`tool_calls`/空才发 `Done`+`Final`；`length`/`content_filter` 等截断原因在 worker 内直接发 `Error`，被截断的 tool_calls 丢弃。主线程不重复判定：收到 `Final` 才提交，收到 `Error`（含通道断开）就按错误收尾。
+- **提交资格（worker 侧）**：`finish_reason` 为 `stop`/`tool_calls`/空才发 `Final`；`length`/`content_filter` 等截断原因在 worker 内直接发 `Error`，被截断的 tool_calls 丢弃。主线程不重复判定：收到 `Final` 才提交，收到 `Error`（含通道断开）就按错误收尾。
 - **取消在两个粒度检查**：接收循环逐事件检查（含持续有事件时）；工具序列逐个调用前检查。任一处发现取消即按占位规则收尾。
 - **限额逐个前置检查**：每个调用执行前先检查限额；**所有模型发起的调用都计数**（含参数解析失败/未知工具名/spawn 失败的调用），防止错误调用无限循环。
 - **历史即上下文**：历史（`Vec<Msg>`）原样序列化进请求；窗口超限时展示错误并提示 `/clear`。

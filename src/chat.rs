@@ -31,15 +31,21 @@ fn system_history(prompt: Option<&str>) -> Vec<Msg> {
 pub enum Msg {
     System(String),
     User(String),
-    Assistant {
-        text: Option<String>,
-        reasoning: Option<String>,
-        tool_calls: Vec<ToolCall>,
-    },
+    /// Assistant 载荷：流终态与历史共用同一类型（见 [`AssistantMsg`]）。
+    Assistant(AssistantMsg),
     Tool {
         tool_call_id: String,
         content: String,
     },
+}
+
+/// Assistant 消息的载荷。`Final` 事件与历史中的 Assistant 消息共用此类型，
+/// 避免事件携带 System/User/Tool 等无效状态。
+#[derive(Debug, Clone)]
+pub struct AssistantMsg {
+    pub text: Option<String>,
+    pub reasoning: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 /// arguments 保持原始 JSON 字符串。
@@ -135,7 +141,7 @@ pub enum TurnEnd {
 #[derive(Debug)]
 enum StreamOutcome {
     /// 收到完整 Assistant 消息
-    Final(Msg),
+    Final(AssistantMsg),
     /// 错误（已展示，保留已完成历史）
     Error(String),
     /// 用户取消
@@ -223,14 +229,8 @@ impl Session {
                 StreamOutcome::Quit => return Err(Quit),
             };
 
-            let Msg::Assistant { text, reasoning, tool_calls } = msg else {
-                let e = "内部协议错误：Final 不是 Assistant 消息".to_string();
-                emit(ui, RenderEvent::Error(e.clone()));
-                return Ok(TurnEnd::Error(e));
-            };
-
-            if tool_calls.is_empty() {
-                self.history.push(Msg::Assistant { text, reasoning, tool_calls });
+            if msg.tool_calls.is_empty() {
+                self.history.push(Msg::Assistant(msg));
                 // 若恰在此窗口收到第二次 Ctrl-C，直接走退出，不等下一次输入。
                 if cancel.is_quit() {
                     return Err(Quit);
@@ -240,7 +240,8 @@ impl Session {
 
             // 提交前校验：tool_call_id 唯一且非空；非法则整条按 Error。
             let mut seen = HashSet::new();
-            if let Some(bad) = tool_calls
+            if let Some(bad) = msg
+                .tool_calls
                 .iter()
                 .find(|c| c.id.is_empty() || !seen.insert(c.id.clone()))
             {
@@ -249,11 +250,8 @@ impl Session {
                 return Ok(TurnEnd::Error(e));
             }
 
-            self.history.push(Msg::Assistant {
-                text,
-                reasoning,
-                tool_calls: tool_calls.clone(),
-            });
+            let tool_calls = msg.tool_calls.clone();
+            self.history.push(Msg::Assistant(msg));
 
             match self.run_tool_calls(ui, cancel, &mut steps, &tool_calls) {
                 // 全部工具执行完：带上 Tool 结果继续请求。
@@ -287,19 +285,19 @@ impl Session {
         let rx = self
             .launcher
             .launch(adapter, provider, body, headers, cancelled.clone());
+        let handle = StreamHandle { rx, cancelled };
 
-        let mut final_msg: Option<Msg> = None;
+        let mut final_msg: Option<AssistantMsg> = None;
         let mut error: Option<String> = None;
         let mut reasoning_seen = false;
 
         loop {
-            let ev = match rx.recv_timeout(Duration::from_millis(100)) {
+            let ev = match handle.recv(Duration::from_millis(100)) {
                 Ok(ev) => ev,
                 Err(RecvTimeoutError::Timeout) => {
                     // 空闲轮询间隙只查信号；无信号继续等。
                     if let Some(sig) = cancel.pending() {
-                        cancelled.store(true, Ordering::SeqCst);
-                        drop(rx);
+                        handle.abandon();
                         return signal_outcome(ui, sig, cancel);
                     }
                     continue;
@@ -312,8 +310,7 @@ impl Session {
             };
             // 持续有事件时也逐块可取消。
             if let Some(sig) = cancel.pending() {
-                cancelled.store(true, Ordering::SeqCst);
-                drop(rx);
+                handle.abandon();
                 return signal_outcome(ui, sig, cancel);
             }
             match ev {
@@ -330,7 +327,6 @@ impl Session {
                         emit(ui, RenderEvent::TextDelta(t));
                     }
                 }
-                StreamEvent::Done => {}
                 StreamEvent::Final(msg) => {
                     final_msg = Some(*msg);
                     break;
@@ -341,8 +337,8 @@ impl Session {
                 }
             }
         }
-        // 接收结束：drop Receiver，worker 下次 send 报错即退出（取消时即放弃流线程）。
-        drop(rx);
+        // 正常结束：drop Receiver，worker 已退出（handle 随作用域结束一并释放）。
+        drop(handle);
 
         if let Some(e) = error {
             emit(ui, RenderEvent::Error(e.clone()));
@@ -495,6 +491,26 @@ impl Session {
         }
         self.selection.thinking = Some(level.to_string());
         Ok(())
+    }
+}
+
+/// 一次流式请求的主线程侧句柄：接收器与取消标志绑定在一起。
+/// `abandon` 是唯一的放弃路径：置位取消标志（worker 轮询它即静默退出）并 drop
+/// Receiver；正常收尾只需让 handle 离开作用域。
+struct StreamHandle {
+    rx: mpsc::Receiver<StreamEvent>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl StreamHandle {
+    fn recv(&self, timeout: Duration) -> Result<StreamEvent, RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+
+    /// 放弃本次请求：置位取消标志并丢弃接收器（worker 据此静默退出）。
+    fn abandon(self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        drop(self.rx);
     }
 }
 

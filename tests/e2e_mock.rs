@@ -289,10 +289,10 @@ fn full_tool_loop_with_mock_sse() {
     assert_eq!(session.history.len(), 4);
     assert!(matches!(&session.history[0], Msg::User(u) if u == "go"));
     match &session.history[1] {
-        Msg::Assistant { tool_calls, .. } => {
-            assert_eq!(tool_calls.len(), 1);
-            assert_eq!(tool_calls[0].id, "call_1");
-            assert_eq!(tool_calls[0].name, "bash");
+        Msg::Assistant(a) => {
+            assert_eq!(a.tool_calls.len(), 1);
+            assert_eq!(a.tool_calls[0].id, "call_1");
+            assert_eq!(a.tool_calls[0].name, "bash");
         }
         other => panic!("unexpected {other:?}"),
     }
@@ -304,7 +304,7 @@ fn full_tool_loop_with_mock_sse() {
         other => panic!("unexpected {other:?}"),
     }
     match &session.history[3] {
-        Msg::Assistant { text, .. } => assert_eq!(text.as_deref(), Some("done")),
+        Msg::Assistant(a) => assert_eq!(a.text.as_deref(), Some("done")),
         other => panic!("unexpected {other:?}"),
     }
 
@@ -398,7 +398,7 @@ fn slow_stream_between_chunks_is_not_an_error() {
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done), "end was {end:?}");
     match session.history.last() {
-        Some(Msg::Assistant { text, .. }) => assert_eq!(text.as_deref(), Some("ab")),
+        Some(Msg::Assistant(a)) => assert_eq!(a.text.as_deref(), Some("ab")),
         other => panic!("unexpected {other:?}"),
     }
 }

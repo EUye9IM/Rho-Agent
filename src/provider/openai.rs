@@ -1,7 +1,7 @@
 //! OpenAI Chat Completions 适配器。见 docs/architecture.md 四节。
 
 use super::{ProviderAdapter, StreamEvent, TurnAcc};
-use crate::chat::Msg;
+use crate::chat::{AssistantMsg, Msg};
 use crate::config::{Model, Provider};
 use serde_json::{json, Map, Value};
 
@@ -34,7 +34,8 @@ impl ProviderAdapter for OpenAiChatAdapter {
             .map(|m| match m {
                 Msg::System(text) => json!({ "role": "system", "content": text }),
                 Msg::User(text) => json!({ "role": "user", "content": text }),
-                Msg::Assistant { text, reasoning, tool_calls } => {
+                Msg::Assistant(a) => {
+                    let AssistantMsg { text, reasoning, tool_calls } = a;
                     let mut obj = Map::new();
                     obj.insert("role".into(), json!("assistant"));
                     obj.insert(
@@ -177,12 +178,12 @@ impl ProviderAdapter for OpenAiChatAdapter {
                             .unwrap_or("");
                         let slot = acc.tool_calls.entry(index).or_default();
                         if let Some(id) = &id {
-                            slot.0 = Some(id.clone());
+                            slot.id = Some(id.clone());
                         }
                         if let Some(name) = &name {
-                            slot.1 = Some(name.clone());
+                            slot.name = Some(name.clone());
                         }
-                        slot.2.push_str(args_frag);
+                        slot.arguments.push_str(args_frag);
                     }
                 }
             }
@@ -238,11 +239,11 @@ mod tests {
         let hist = vec![
             Msg::System("s".into()),
             Msg::User("u".into()),
-            Msg::Assistant {
+            Msg::Assistant(AssistantMsg {
                 text: Some("t".into()),
                 reasoning: Some("r".into()),
                 tool_calls: vec![],
-            },
+            }),
             Msg::Tool { tool_call_id: "id".into(), content: "ok".into() },
         ];
         let thinking = json!({ "thinking": { "type": "enabled" } });
@@ -289,14 +290,10 @@ mod tests {
         // tool_calls 片段只累积进 acc，不产生事件。
         assert!(a.parse_chunk(&next, &mut acc).is_none());
         assert_eq!(acc.finish_reason.as_deref(), Some("tool_calls"));
-        match acc.into_msg() {
-            Msg::Assistant { text, reasoning, tool_calls } => {
-                assert_eq!(text.as_deref(), Some("hi"));
-                assert_eq!(reasoning.as_deref(), Some("think"));
-                assert_eq!(tool_calls.len(), 1);
-                assert_eq!(tool_calls[0].arguments, "{\"command\":\"ls\"}");
-            }
-            other => panic!("unexpected {other:?}"),
-        }
+        let msg = acc.into_msg();
+        assert_eq!(msg.text.as_deref(), Some("hi"));
+        assert_eq!(msg.reasoning.as_deref(), Some("think"));
+        assert_eq!(msg.tool_calls.len(), 1);
+        assert_eq!(msg.tool_calls[0].arguments, "{\"command\":\"ls\"}");
     }
 }
