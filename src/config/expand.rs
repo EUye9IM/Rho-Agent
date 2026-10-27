@@ -11,9 +11,9 @@ pub enum ExpandError {
     Malformed(String),
 }
 
-/// 展开一个 header 值中的 `${VAR}`。
+/// 展开一个 header 值中的 `${VAR}`（环境查找由 `lookup` 提供，便于注入测试）。
 /// 变量缺失 → Err（该 provider 标记不可用，非全局致命——由调用方处理）。
-pub fn expand_var(template: &str) -> Result<String, ExpandError> {
+pub fn expand_var_with(template: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<String, ExpandError> {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(pos) = rest.find("${") {
@@ -26,9 +26,9 @@ pub fn expand_var(template: &str) -> Result<String, ExpandError> {
         if name.is_empty() {
             return Err(ExpandError::Malformed(format!("空的变量名：{template}")));
         }
-        match std::env::var(name) {
-            Ok(v) => out.push_str(&v),
-            Err(_) => return Err(ExpandError::Missing(name.to_string())),
+        match lookup(name) {
+            Some(v) => out.push_str(&v),
+            None => return Err(ExpandError::Missing(name.to_string())),
         }
         rest = &after[end + 1..];
     }
@@ -36,13 +36,22 @@ pub fn expand_var(template: &str) -> Result<String, ExpandError> {
     Ok(out)
 }
 
-/// 展开整个 header 表。任一变量缺失即 Err（列出缺失变量）。
-pub fn expand_headers(headers: &[(String, String)]) -> Result<Vec<(String, String)>, String> {
+/// 生产入口：从进程环境展开单个模板值。
+#[cfg(test)]
+pub(crate) fn expand_var(template: &str) -> Result<String, ExpandError> {
+    expand_var_with(template, |name| std::env::var(name).ok())
+}
+
+/// 展开整个 header 表（环境查找由 `lookup` 提供）。任一变量缺失即 Err（列出缺失变量）。
+pub fn expand_headers_with(
+    headers: &[(String, String)],
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<(String, String)>, String> {
     let mut expanded = Vec::with_capacity(headers.len());
     let mut missing = BTreeSet::new();
     let mut malformed: Option<String> = None;
     for (k, v) in headers {
-        match expand_var(v) {
+        match expand_var_with(v, &lookup) {
             Ok(value) => expanded.push((k.clone(), value)),
             Err(ExpandError::Missing(name)) => {
                 missing.insert(name);
@@ -62,6 +71,11 @@ pub fn expand_headers(headers: &[(String, String)]) -> Result<Vec<(String, Strin
         return Err(msg);
     }
     Ok(expanded)
+}
+
+/// 生产入口：从进程环境展开整个 header 表。
+pub fn expand_headers(headers: &[(String, String)]) -> Result<Vec<(String, String)>, String> {
+    expand_headers_with(headers, |name| std::env::var(name).ok())
 }
 
 /// 疑似明文密钥告警（只告警不阻断）。
@@ -86,9 +100,9 @@ mod tests {
 
     #[test]
     fn expands_known_var() {
-        std::env::set_var("RHO_TEST_VAR", "abc");
-        assert_eq!(expand_var("x-${RHO_TEST_VAR}-y").unwrap(), "x-abc-y");
-        std::env::remove_var("RHO_TEST_VAR");
+        // 规则测试用注入查找，不改进程环境（并行测试下 set_var 有竞态）。
+        let lookup = |name: &str| (name == "RHO_TEST_VAR").then(|| "abc".to_string());
+        assert_eq!(expand_var_with("x-${RHO_TEST_VAR}-y", lookup).unwrap(), "x-abc-y");
     }
 
     #[test]

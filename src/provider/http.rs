@@ -57,11 +57,8 @@ fn host_of_url(url: &str) -> Option<&str> {
     host_port.split(':').next()
 }
 
-fn no_proxy_match(host: &str) -> bool {
-    let value = std::env::var("NO_PROXY")
-        .or_else(|_| std::env::var("no_proxy"))
-        .ok();
-    let Some(value) = value else { return false };
+fn no_proxy_match(host: &str, no_proxy_value: Option<&str>) -> bool {
+    let Some(value) = no_proxy_value else { return false };
     let host = host.to_ascii_lowercase();
     value.split(',').any(|raw| {
         let entry = raw.trim().trim_start_matches('.').to_ascii_lowercase();
@@ -75,9 +72,16 @@ fn no_proxy_match(host: &str) -> bool {
     })
 }
 
-fn proxy_for(url: &str) -> Result<Option<ureq::Proxy>, String> {
+/// 代理选择（环境值由 `env` 查找提供，便于注入测试）。
+/// 优先级：https → HTTPS_PROXY/https_proxy/ALL_PROXY/all_proxy；
+/// http → HTTP_PROXY/http_proxy/ALL_PROXY/all_proxy；NO_PROXY 直连优先于一切。
+fn proxy_with(
+    url: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Option<ureq::Proxy>, String> {
     let Some(host) = host_of_url(url) else { return Ok(None) };
-    if no_proxy_match(host) {
+    let no_proxy = env("NO_PROXY").or_else(|| env("no_proxy"));
+    if no_proxy_match(host, no_proxy.as_deref()) {
         return Ok(None);
     }
     let names: &[&str] = if url.starts_with("https://") {
@@ -86,16 +90,17 @@ fn proxy_for(url: &str) -> Result<Option<ureq::Proxy>, String> {
         &["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
     };
     let Some((name, value)) = names.iter().find_map(|n| {
-        std::env::var(n)
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .map(|v| (*n, v))
+        env(n).filter(|v| !v.trim().is_empty()).map(|v| (*n, v))
     }) else {
         return Ok(None);
     };
     ureq::Proxy::new(value.trim())
         .map(Some)
         .map_err(|e| format!("代理环境变量 {name} 配置无效：{e}"))
+}
+
+fn proxy_for(url: &str) -> Result<Option<ureq::Proxy>, String> {
+    proxy_with(url, |name| std::env::var(name).ok())
 }
 
 /// 按 `base_url` 缓存 `ureq::Agent`：TLS 根与连接池都随之复用，
@@ -154,5 +159,48 @@ mod tests {
         assert_eq!(host_of_url("https://api.example.com:8443/chat"), Some("api.example.com"));
         assert_eq!(host_of_url("https://[::1]:8443/chat"), Some("::1"));
         assert_eq!(host_of_url("http://user:pw@host:80"), Some("host"));
+    }
+
+    #[test]
+    fn no_proxy_matching_rules() {
+        let empty: fn(&str) -> Option<String> = |_| None;
+        assert!(!no_proxy_match("api.example.com", None));
+        assert!(no_proxy_match("api.example.com", Some("example.com")));
+        // 子域匹配；无端口剥离需求（host 已由 host_of_url 剥离端口）。
+        assert!(no_proxy_match("api.example.com", Some(".example.com")));
+        assert!(no_proxy_match("api.example.com", Some("*")));
+        assert!(!no_proxy_match("api.example.com", Some("other.com")));
+        let _ = empty;
+    }
+
+    #[test]
+    fn proxy_selection_priority_and_bypass() {
+        // Proxy 字段私有：用 Debug 字符串区分选中的代理。
+        let dbg = |r: Result<Option<ureq::Proxy>, String>| format!("{:?}", r.unwrap());
+        let none: fn(&str) -> Option<String> = |_| None;
+        // 无环境变量：直连。
+        assert_eq!(dbg(proxy_with("https://api.example.com", none)), "None");
+        // HTTPS 优先 HTTPS_PROXY，其次 ALL_PROXY。
+        let https_only = |name: &str| (name == "HTTPS_PROXY").then(|| "http://p1".to_string());
+        let all_only = |name: &str| (name == "ALL_PROXY").then(|| "http://p2".to_string());
+        assert!(dbg(proxy_with("https://api.example.com", https_only)).contains("p1"));
+        assert!(dbg(proxy_with("https://api.example.com", all_only)).contains("p2"));
+        // http:// 用 HTTP_PROXY 而非 HTTPS_PROXY。
+        let http_only = |name: &str| (name == "HTTP_PROXY").then(|| "http://p3".to_string());
+        let https_only2 = |name: &str| (name == "HTTPS_PROXY").then(|| "http://p1".to_string());
+        let both = move |name: &str| http_only(name).or_else(|| https_only2(name));
+        assert!(dbg(proxy_with("http://api.example.com", both)).contains("p3"));
+        // NO_PROXY 覆盖代理设置。
+        let with_no_proxy = |name: &str| {
+            if name == "NO_PROXY" {
+                Some("example.com".to_string())
+            } else {
+                (name == "HTTPS_PROXY").then(|| "http://p1".to_string())
+            }
+        };
+        assert_eq!(dbg(proxy_with("https://api.example.com", with_no_proxy)), "None");
+        // 空白值的代理变量被跳过。
+        let blank = |name: &str| (name == "HTTPS_PROXY").then(|| "  ".to_string());
+        assert_eq!(dbg(proxy_with("https://api.example.com", blank)), "None");
     }
 }
