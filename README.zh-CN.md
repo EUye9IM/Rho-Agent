@@ -24,7 +24,7 @@ rho 要做一个运行在资源受限 Linux 设备上的本地 agent：单二进
 ## 环境要求
 
 - Linux：`x86_64`、`aarch64` 或 `armv7`（建议分发 musl 静态构建）。
-- 构建需要 Rust 1.75+（MSRV）。CI 会同时测试 1.75 与 stable。
+- 构建需要较新的 stable Rust 工具链（CI 在 stable 上测试）。
 - 需要交互式 TTY：stdin 非 TTY 时以退出码 2 结束。rho 以 REPL 方式运行。
 
 ## 构建
@@ -159,7 +159,7 @@ max_output_bytes = 16384
 cargo test --all-targets --locked
 ```
 
-CI 在每次 push 到 `master` 或 `dev`、以及每个 PR 上，用 Rust 1.75（MSRV）与 stable 跑测试。测试使用本地 mock：协议层用 `TcpListener` 手写本地 SSE mock，REPL/agent loop 用脚本化的 `Ui` 实现驱动真实主循环。`term.rs` 里从信号到记录这一段，以及真实终端交互，靠手工验收。
+CI 在每次 push 到 `master` 或 `dev`、以及每个 PR 上，用 stable Rust 跑测试。测试使用本地 mock：协议层用 `TcpListener` 手写本地 SSE mock，REPL/agent loop 用脚本化的 `Ui` 实现驱动真实主循环。`term.rs` 里从信号到记录这一段，以及真实终端交互，靠手工验收。
 
 ## 许可
 

@@ -11,7 +11,7 @@
 
 `rho` 是运行在资源受限 Linux 设备上的本地 agent REPL：
 
-- Rust 2021，MSRV 1.75
+- Rust 2021
 - 单 crate、单二进制
 - 阻塞 I/O + 线程，**不使用 async runtime**
 - 默认 DeepSeek，供应商/模型/thinking 由 TOML 配置驱动
@@ -35,12 +35,6 @@
 cargo build --all-targets --locked
 cargo test --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
-```
-
-MSRV 检查（本地已安装 1.75 时）：
-
-```sh
-cargo +1.75.0 test --all-targets --locked
 ```
 
 不要随手执行 `cargo fmt --all`：当前 rustfmt 版本会重排大量未改动文件，制造无关 diff。只格式化本次改动的文件，或手工保持与周围代码一致。

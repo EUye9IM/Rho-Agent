@@ -151,7 +151,7 @@ mod tests {
     fn overlong_terminated_line_in_same_batch_is_error() {
         let mut p = SseParser::new();
         let mut line = b"data: ".to_vec();
-        line.extend(std::iter::repeat(b'y').take(MAX_LINE_BYTES));
+        line.extend(std::iter::repeat_n(b'y', MAX_LINE_BYTES));
         line.push(b'\n');
         let err = p.feed(&line).unwrap_err();
         assert!(err.contains("单行超过上限"), "error was {err}");
@@ -163,7 +163,7 @@ mod tests {
     fn overlong_line_error_is_chunking_independent() {
         // 同一输入：换行随最后一片到达时由残留检查报错，整批到达时由完整行检查报错。
         let mut line = b"data: ".to_vec();
-        line.extend(std::iter::repeat(b'y').take(MAX_LINE_BYTES));
+        line.extend(std::iter::repeat_n(b'y', MAX_LINE_BYTES));
         let (a, b) = line.split_at(line.len() / 2);
         let mut p = SseParser::new();
         assert!(p.feed(a).unwrap().is_empty());
@@ -178,7 +178,7 @@ mod tests {
     fn overlong_crlf_line_is_error() {
         let mut p = SseParser::new();
         let mut line = b"data: ".to_vec();
-        line.extend(std::iter::repeat(b'y').take(MAX_LINE_BYTES));
+        line.extend(std::iter::repeat_n(b'y', MAX_LINE_BYTES));
         line.extend_from_slice(b"\r\n");
         assert!(p.feed(&line).is_err());
     }
@@ -187,7 +187,7 @@ mod tests {
     fn line_at_exactly_limit_with_newline_is_accepted() {
         let mut p = SseParser::new();
         let mut line = b"data: ".to_vec();
-        line.extend(std::iter::repeat(b'y').take(MAX_LINE_BYTES - 6));
+        line.extend(std::iter::repeat_n(b'y', MAX_LINE_BYTES - 6));
         line.push(b'\n');
         let out = p.feed(&line).unwrap();
         assert_eq!(out.len(), 1);
@@ -198,7 +198,7 @@ mod tests {
     fn long_line_within_limit_is_accepted() {
         let mut p = SseParser::new();
         let mut line = b"data: ".to_vec();
-        line.extend(std::iter::repeat(b'y').take(MAX_LINE_BYTES - 16));
+        line.extend(std::iter::repeat_n(b'y', MAX_LINE_BYTES - 16));
         line.push(b'\n');
         let out = p.feed(&line).unwrap();
         assert_eq!(out.len(), 1);

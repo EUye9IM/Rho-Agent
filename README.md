@@ -24,7 +24,7 @@ Implementation: [docs/architecture.md](docs/architecture.md).
 ## Requirements
 
 - Linux: `x86_64`, `aarch64` or `armv7` (musl static targets are the intended distribution form).
-- Rust 1.75 or newer (MSRV) to build. CI tests both 1.75 and stable.
+- A recent stable Rust toolchain to build (CI tests on stable).
 - An interactive TTY — `rho` requires one and exits with code 2 when stdin is not a TTY. It runs as a REPL.
 
 ## Build
@@ -160,7 +160,7 @@ Other limits: at most `max_tool_steps` model-initiated tool calls per turn (defa
 cargo test --all-targets --locked
 ```
 
-CI runs the tests on Rust 1.75 (MSRV) and stable, on every push to `master` or `dev` and every pull request. Tests run against local mocks: protocol tests use a hand-written local SSE mock over `TcpListener`, and the REPL/agent-loop tests drive the real loop with a scripted `Ui` implementation. The signal → record path of `term.rs` and live terminal behaviour are verified manually.
+CI runs the tests on stable Rust, on every push to `master` or `dev` and every pull request. Tests run against local mocks: protocol tests use a hand-written local SSE mock over `TcpListener`, and the REPL/agent-loop tests drive the real loop with a scripted `Ui` implementation. The signal → record path of `term.rs` and live terminal behaviour are verified manually.
 
 ## License
 
