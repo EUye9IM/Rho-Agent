@@ -8,13 +8,16 @@ use rho::repl::{self, ReplExit};
 use rho::term::Cancel;
 use rho::ui::{ConfirmOutcome, ReadOutcome, ScriptedUi, Ui};
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// 测试用临时文件名的进程内序号：`SystemTime` 分辨率不足以保证并行测试不撞名。
+static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 fn session_from(toml: &str) -> Session {
     let path = std::env::temp_dir().join(format!(
         "rho-repl-{}-{}.toml",
         std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        TMP_SEQ.fetch_add(1, Ordering::SeqCst)
     ));
     std::fs::write(&path, toml).unwrap();
     let cfg = config::load(&Some(path.display().to_string())).unwrap();

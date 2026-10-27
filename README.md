@@ -18,7 +18,7 @@ Implementation: [docs/architecture.md](docs/architecture.md).
 - **Config-driven providers** — providers, models and thinking levels are declared as data. Same protocol family means configuration only.
 - **Streaming with visible reasoning** — text streams as it arrives; `reasoning_content` is rendered dimmed and stays local unless the provider sets `compat.echo_reasoning = true`.
 - **One tool: `bash`** — executed in the foreground as `bash -c <command>`, with a fresh shell per call and a per-call timeout that escalates to a process-group kill.
-- **Predictable Ctrl-C** — first Ctrl-C cancels the current stream/tool/confirmation, second one exits; at the idle prompt two empty-line Ctrl-C within two seconds exit (the first shows a gray hint). The conversation history is always left in a protocol-valid state.
+- **Predictable Ctrl-C** — first Ctrl-C cancels the current stream/tool/confirmation (the streaming reader polls for cancellation and stops within about half a second), second one exits; at the idle prompt two empty-line Ctrl-C within two seconds exit (the first shows a gray hint). The conversation history is always left in a protocol-valid state.
 - **Strict config validation** — unknown fields, dangling references and missing required fields fail loudly with the config path (TOML syntax errors also include a line number), exit code 2.
 
 ## Requirements
@@ -79,7 +79,7 @@ rho --yes            # auto-approve every `bash` call
 | `--thinking <level>` | Initial thinking level (must exist for the chosen model). |
 | `--yes` | Skip all `bash` confirmations. |
 
-User config comes only from `--config`; otherwise the built-in config is used. Environment variables are read only for `${VAR}` header expansion. The working directory is fixed to the directory `rho` was started in.
+User config comes only from `--config`; otherwise the built-in config is used. `${VAR}` in auth headers is expanded from the environment. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` control proxy routing; `SSL_CERT_FILE`, when set, replaces the built-in TLS roots. The working directory is fixed to the directory `rho` was started in.
 
 ### REPL commands
 

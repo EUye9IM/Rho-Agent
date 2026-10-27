@@ -29,9 +29,6 @@ rustyline = { version = "14", default-features = false, features = ["custom-bind
 libc = "0.2"
 unicode-width = "0.1"
 
-[dev-dependencies]
-indexmap = { version = "2.7", features = ["serde"] }
-
 [profile.release]
 opt-level = "z"
 strip = true

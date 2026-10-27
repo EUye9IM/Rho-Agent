@@ -39,17 +39,19 @@ pub enum BashEnd {
 }
 
 /// allowlist + 元字符判定：命令与规则完全相同，或前缀后紧接空格；
-/// 且不含 `; & | < > $`、反引号、换行。
+/// 且不含 `; & | < > $`、反引号、换行。规则前后空白在比较时忽略。
 pub fn allowed(command: &str, allow: &[String]) -> bool {
     const META: &[char] = &[';', '&', '|', '<', '>', '$', '`', '\n', '\r'];
     if command.chars().any(|c| META.contains(&c)) {
         return false;
     }
     allow.iter().any(|rule| {
+        let rule = rule.trim();
         !rule.is_empty()
             && (command == rule
-                || (command.starts_with(rule)
-                    && command[rule.len()..].starts_with(' ')))
+                || command
+                    .strip_prefix(rule)
+                    .is_some_and(|rest| rest.starts_with(' ')))
     })
 }
 
@@ -69,6 +71,9 @@ pub fn run_bash(command: &str, tool_cfg: &BashToolConfig, cancel: &Cancel) -> Ba
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // SAFETY: pre_exec 在 fork 后、exec 前运行；setsid 是 async-signal-safe 的。
+    // 这里用 setsid 而非安全的 `process_group(0)`：后者只建新进程组，子进程仍属本
+    // 会话并保留控制终端，命令若打开 `/dev/tty`（ssh、sudo、分页器等）会阻塞到超时；
+    // setsid 新开会话并脱离控制终端，这类命令会直接失败而不是挂住。
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -125,16 +130,14 @@ pub fn run_bash(command: &str, tool_cfg: &BashToolConfig, cancel: &Cancel) -> Ba
             break BashEnd::TimedOut;
         }
 
-        match cancel.state() {
-            SignalState::None => {}
-            SignalState::Cancel => {
-                terminate_group(&mut child, pgid, cancel);
-                break BashEnd::Cancelled;
-            }
-            SignalState::Quit => {
-                terminate_group(&mut child, pgid, cancel);
-                break BashEnd::QuitRequested;
-            }
+        if let Some(sig) = cancel.pending() {
+            terminate_group(&mut child, pgid, cancel);
+            break match sig {
+                SignalState::Cancel => BashEnd::Cancelled,
+                // quit（第二次 Ctrl-C）：只终止进程组并返回给 agent loop，
+                // 不自行退出（docs/architecture.md 五节）
+                _ => BashEnd::QuitRequested,
+            };
         }
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -228,6 +231,17 @@ impl TruncBuf {
     }
 
     fn finish(self) -> StreamCapture {
+        let limit = self.head_cap + self.tail_cap;
+        if self.total <= limit as u64 {
+            let mut bytes = self.head;
+            bytes.extend_from_slice(&self.tail);
+            return StreamCapture {
+                head: String::from_utf8_lossy(&bytes).into_owned(),
+                tail: String::new(),
+                omitted: 0,
+            };
+        }
+
         let head_bytes = utf8_head(&self.head);
         let tail_bytes = utf8_tail(&self.tail);
         let kept = (head_bytes.len() + tail_bytes.len()) as u64;
@@ -354,7 +368,7 @@ fn format_output(stdout: StreamCapture, stderr: StreamCapture, end: &BashEnd) ->
 }
 
 /// 确认流（agent loop 的 dispatch_tool_call 调用）：
-/// allowlist 自动放行；否则向用户确认（--yes 跳过）。
+/// allowlist 自动放行；否则向用户确认（--yes 跳过全部确认）。
 pub fn gate(
     ui: &mut dyn Ui,
     yes: bool,
@@ -369,33 +383,16 @@ pub fn gate(
     }
 }
 
-/// 两段截断：头 limit/2 + 尾 limit/2，中间标注省略字节数。
-pub fn truncate_output(bytes: &[u8], limit: usize) -> String {
-    if limit == 0 {
-        return format!("…省略 {} 字节…", bytes.len());
-    }
-    if bytes.len() <= limit {
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-    let head_cap = limit / 2;
-    let tail_cap = limit - head_cap;
-    let mut head_end = head_cap.min(bytes.len());
-    while head_end > 0 && (bytes[head_end] & 0xC0) == 0x80 {
-        head_end -= 1;
-    }
-    let mut tail_start = bytes.len().saturating_sub(tail_cap);
-    while tail_start < bytes.len() && (bytes[tail_start] & 0xC0) == 0x80 {
-        tail_start += 1;
-    }
-    let omitted = tail_start.saturating_sub(head_end);
-    let head = String::from_utf8_lossy(&bytes[..head_end]);
-    let tail = String::from_utf8_lossy(&bytes[tail_start..]);
-    format!("{head}\n…省略 {omitted} 字节…\n{tail}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试用便捷封装：一次性推入并渲染（流式路径由 `drain_stream` 分块推入）。
+    fn truncate(bytes: &[u8], limit: usize) -> String {
+        let mut buf = TruncBuf::new(limit);
+        buf.push(bytes);
+        buf.finish().render()
+    }
 
     #[test]
     fn allowlist_exact_match() {
@@ -410,6 +407,14 @@ mod tests {
     }
 
     #[test]
+    fn allowlist_rule_whitespace_is_ignored() {
+        assert!(allowed("ls", &["  ls  ".into()]));
+        assert!(allowed("ls -la", &[" ls ".into()]));
+        assert!(!allowed("lsof", &[" ls ".into()]));
+        assert!(!allowed("ls", &["   ".into()]));
+    }
+
+    #[test]
     fn metachar_rejected() {
         assert!(!allowed("ls; rm -rf /", &["ls".into()]));
         assert!(!allowed("ls | cat", &["ls".into()]));
@@ -419,19 +424,18 @@ mod tests {
     #[test]
     fn truncate_keeps_head_and_tail() {
         let data = vec![b'a'; 100];
-        let out = truncate_output(&data, 20);
-        assert!(out.contains("省略"));
+        assert!(truncate(&data, 20).contains("省略"));
     }
 
     #[test]
     fn truncate_short_is_lossless() {
-        assert_eq!(truncate_output("你好".as_bytes(), 100), "你好");
+        assert_eq!(truncate("你好".as_bytes(), 100), "你好");
     }
 
     #[test]
     fn truncation_preserves_utf8_boundaries() {
         let data = "你".repeat(100);
-        let out = truncate_output(data.as_bytes(), 21);
+        let out = truncate(data.as_bytes(), 21);
         assert!(out.is_char_boundary(0));
         assert!(out.starts_with('你'));
         assert!(out.ends_with('你'));
@@ -457,5 +461,22 @@ mod tests {
         assert_eq!(capture.head, "你");
         assert_eq!(capture.tail, "你");
         assert_eq!(capture.omitted, 24);
+    }
+
+    #[test]
+    fn trunc_buf_keeps_utf8_split_when_output_fits_limit() {
+        let mut buf = TruncBuf::new(8); // head=4 在“你”中间，尾部保留剩余字节
+        buf.push("ab你".as_bytes());
+        assert_eq!(buf.finish().render(), "ab你");
+        assert_eq!(truncate("ab你".as_bytes(), 8), "ab你");
+    }
+
+    #[test]
+    fn trunc_buf_keeps_utf8_split_across_multiple_pushes() {
+        let mut buf = TruncBuf::new(8); // head=4，尾窗 4
+        for chunk in "ab你".as_bytes().chunks(1) {
+            buf.push(chunk);
+        }
+        assert_eq!(buf.finish().render(), "ab你");
     }
 }

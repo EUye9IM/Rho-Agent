@@ -54,7 +54,7 @@ fn run(args: Args) -> u8 {
             return EXIT_USAGE;
         }
     };
-    if let Err(e) = resolve_thinking(&cfg, &mut selection, args.thinking.as_deref()) {
+    if let Err(e) = resolve_thinking(&mut selection, args.thinking.as_deref()) {
         eprintln!("{e}");
         return EXIT_USAGE;
     }
@@ -101,7 +101,6 @@ fn run(args: Args) -> u8 {
 /// 解析 --thinking：None → 保持 selection.thinking（模型 thinking_default）；
 /// Some(档位) → 须属该模型档位表，写入 selection.thinking。
 fn resolve_thinking(
-    _cfg: &config::Config,
     selection: &mut config::Selection,
     cli: Option<&str>,
 ) -> Result<(), String> {

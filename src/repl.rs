@@ -1,9 +1,9 @@
 //! REPL 循环：斜杠命令、Ctrl-C 语义。循环本体依赖 Ui trait。见 docs/architecture.md 三、四节。
 
-use crate::chat::{ChatResult, Session, TurnEnd};
+use crate::chat::{Session, TurnEnd};
 use crate::config;
 use crate::render::RenderEvent;
-use crate::term::{Cancel, SignalState};
+use crate::term::Cancel;
 use crate::ui::{ReadOutcome, Ui, CTRL_C_WINDOW};
 use std::time::Instant;
 
@@ -22,7 +22,7 @@ pub fn run(ui: &mut dyn Ui, mut session: Session, cancel: &Cancel) -> Result<(),
     let mut ctrl_c_armed: Option<Instant> = None;
     loop {
         // 上一轮清理期间记录的 quit：不等下一次输入，立即退出。
-        if cancel.state() == SignalState::Quit {
+        if cancel.is_quit() {
             return Err(ReplExit::Quit);
         }
 
@@ -58,12 +58,9 @@ pub fn run(ui: &mut dyn Ui, mut session: Session, cancel: &Cancel) -> Result<(),
                     continue;
                 }
                 if trimmed.starts_with('/') {
-                    let result = match handle_command(ui, &mut session, cancel, trimmed) {
-                        Ok(r) => r,
-                        Err(_) => return Err(ReplExit::Quit),
-                    };
+                    let result = handle_command(ui, &mut session, trimmed);
                     check_fatal(ui)?;
-                    if cancel.state() == SignalState::Quit {
+                    if cancel.is_quit() {
                         return Err(ReplExit::Quit);
                     }
                     match result {
@@ -72,13 +69,14 @@ pub fn run(ui: &mut dyn Ui, mut session: Session, cancel: &Cancel) -> Result<(),
                     }
                 }
 
-                if advance_epoch(cancel) {
+                // 切轮：旧轮未消费的 quit 结转到下一轮。
+                if cancel.advance_epoch() {
                     return Err(ReplExit::Quit);
                 }
                 let turn = session.turn(ui, cancel, trimmed);
                 check_fatal(ui)?;
                 // turn 内部任何返回路径都不应把 pending quit 丢给下一次输入。
-                if cancel.state() == SignalState::Quit {
+                if cancel.is_quit() {
                     return Err(ReplExit::Quit);
                 }
                 match turn {
@@ -110,22 +108,17 @@ fn within_window(armed: Instant, now: Instant) -> bool {
 
 /// 斜杠命令处理：/model /provider /thinking /clear /help /exit。
 /// 不带参数列出可选项并标注当前值。切换只影响后续请求，不重放历史。
-fn handle_command(
-    ui: &mut dyn Ui,
-    session: &mut Session,
-    _cancel: &Cancel,
-    line: &str,
-) -> ChatResult<CommandResult> {
+fn handle_command(ui: &mut dyn Ui, session: &mut Session, line: &str) -> CommandResult {
     let mut parts = line.split_whitespace();
     let command = parts.next().unwrap_or("");
     let arg = parts.collect::<Vec<_>>().join(" ");
 
     match command {
-        "/exit" => Ok(CommandResult::Exit),
+        "/exit" => CommandResult::Exit,
         "/clear" => {
             session.clear();
             text(ui, "已清空对话历史");
-            Ok(CommandResult::Continue)
+            CommandResult::Continue
         }
         "/help" => {
             let mut lines = vec![
@@ -140,7 +133,7 @@ fn handle_command(
             lines.push("  /help            显示本帮助".to_string());
             lines.push("  /exit            退出".to_string());
             text(ui, &lines.join("\n"));
-            Ok(CommandResult::Continue)
+            CommandResult::Continue
         }
         "/model" => {
             if arg.is_empty() {
@@ -159,7 +152,7 @@ fn handle_command(
             } else {
                 text(ui, &format!("已切换到模型 {}", session.selection.model_id));
             }
-            Ok(CommandResult::Continue)
+            CommandResult::Continue
         }
         "/provider" => {
             if arg.is_empty() {
@@ -184,7 +177,7 @@ fn handle_command(
                     ),
                 );
             }
-            Ok(CommandResult::Continue)
+            CommandResult::Continue
         }
         "/thinking" => {
             let levels: Vec<String> = session
@@ -214,11 +207,11 @@ fn handle_command(
             } else {
                 text(ui, &format!("思考档位：{arg}"));
             }
-            Ok(CommandResult::Continue)
+            CommandResult::Continue
         }
         other => {
             emit_error(ui, format!("未知命令：{other}（输入 /help 查看帮助）"));
-            Ok(CommandResult::Continue)
+            CommandResult::Continue
         }
     }
 }
@@ -234,17 +227,6 @@ fn emit_error(ui: &mut dyn Ui, message: impl Into<String>) {
 enum CommandResult {
     Continue,
     Exit,
-}
-
-/// 切轮：活动操作开始前调用（流式请求/回合开始）。
-/// prev_quit 已置位 → 退出；否则清空当前轮记录。
-fn advance_epoch(cancel: &Cancel) -> bool {
-    cancel.advance_epoch()
-}
-
-/// 会话 cwd 展示（恒为进程启动目录）。
-pub fn session_cwd() -> String {
-    crate::session_cwd()
 }
 
 #[cfg(test)]

@@ -83,7 +83,7 @@ main → config
 关键规则：
 
 - `render.rs` 只提供纯格式化函数，不直接写终端。
-- `ui.rs` 负责终端输出；生产实现 `TermUi`，测试用 `ScriptedUi`。
+- `ui` 模块（`ui/mod.rs`）负责终端输出；生产实现 `TermUi`，测试用 `ScriptedUi`（`ui/scripted.rs`）。
 - 不要在 `render` / `chat` 里直接 `println!`。
 - `provider` 每轮请求在工作线程读取 HTTP 流，经 `mpsc` 回主线程；不要引入 tokio/reqwest。
 - `chat::Msg` 是协议无关的内部消息模型；OpenAI 字段映射留在 `provider/openai.rs`。
@@ -126,7 +126,7 @@ main → config
 ## 工具与安全
 
 - `bash` allowlist 是字符串匹配，不是 shell 解析或安全沙箱；不要把它描述成沙箱。
-- 确认 gate 默认拒绝；`--yes` 只跳过确认，不绕过 allowlist。
+- 确认 gate 默认拒绝；`--yes` 跳过全部确认（对任意命令直接放行），allowlist 只是免确认的便捷门槛。若打算改成“`--yes` 仍需过 allowlist”，必须先确认，因为这会改变行为。
 - 工具输出 stdout/stderr 各自有上限，只截断一次并保留省略字节数。
 - 超时和取消都走进程组 SIGTERM → 2s → SIGKILL；不要只杀直接子进程。
 - 不要新增第二个工具，除非用户明确要求。

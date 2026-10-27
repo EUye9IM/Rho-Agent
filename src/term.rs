@@ -1,11 +1,16 @@
 //! 终端信号处理：SIGINT self-pipe、专用信号线程、Cancel（epoch 记录）。
 //! 见 docs/architecture.md 五节。
 
+use std::io::{ErrorKind, Read};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// 信号处理器写入端（async-signal-safe 路径只碰这个原子量与 write(2)）。
+/// 信号处理器写入端 fd（async-signal-safe 路径只碰这个原子量与 write(2)）。
 static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+/// 写端本体：进程生命周期内常驻，保证 [`WRITE_FD`] 指向的 fd 不被关闭。
+static WRITE_END: OnceLock<UnixStream> = OnceLock::new();
 static CANCEL: OnceLock<Arc<Cancel>> = OnceLock::new();
 
 /// Ctrl-C 记录中心（活动操作期间的唯一记录消费入口）。
@@ -58,6 +63,20 @@ impl Cancel {
         }
     }
 
+    /// 便捷查询：有未消费的 Ctrl-C 记录时返回 Some(Cancel/Quit)，无信号返回 None。
+    /// 用于“无信号继续，否则按取消/退出收尾”的判定点（渲染循环、工具等待循环）。
+    pub fn pending(&self) -> Option<SignalState> {
+        match self.state() {
+            SignalState::None => None,
+            sig => Some(sig),
+        }
+    }
+
+    /// 便捷判定：当前轮是否已请求退出（含旧轮结转的 quit）。
+    pub fn is_quit(&self) -> bool {
+        matches!(self.state(), SignalState::Quit)
+    }
+
     /// 切轮（每次用户输入触发的新回合开始前调用）。
     /// 返回 prev_quit：true 表示旧轮遗留退出请求，应退出程序。
     pub fn advance_epoch(&self) -> bool {
@@ -102,24 +121,18 @@ pub fn init() -> Result<Arc<Cancel>, String> {
         return Ok(cancel.clone());
     }
 
-    let mut fds = [0i32; 2];
-    // SAFETY: fds 指向合法的两个 i32。
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
-        return Err(format!("创建信号管道失败：{}", last_os_error()));
-    }
-    let (read_fd, write_fd) = (fds[0], fds[1]);
-
+    // self-pipe 用 socketpair：std 的 `UnixStream` 自带 CLOEXEC，并提供非阻塞开关与
+    // 基于 `Read` 的阻塞读取，省去 pipe2/fcntl/close 的裸 fd 管理。
+    let (read_end, write_end) =
+        UnixStream::pair().map_err(|e| format!("创建信号管道失败：{e}"))?;
     // 写端非阻塞：管道满时处理器直接丢弃（不能阻塞在信号上下文）。
-    // SAFETY: write_fd 是刚创建的有效 fd。
-    unsafe {
-        let flags = libc::fcntl(write_fd, libc::F_GETFL);
-        if flags == -1 || libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == -1 {
-            libc::close(read_fd);
-            libc::close(write_fd);
-            return Err(format!("设置信号管道非阻塞失败：{}", last_os_error()));
-        }
-    }
-
+    write_end
+        .set_nonblocking(true)
+        .map_err(|e| format!("设置信号管道非阻塞失败：{e}"))?;
+    let write_fd = write_end.as_raw_fd();
+    WRITE_END
+        .set(write_end)
+        .map_err(|_| "信号管道初始化了两次".to_string())?;
     WRITE_FD.store(write_fd, Ordering::SeqCst);
 
     // SAFETY: 零初始化 sigaction 后逐字段赋值；handler 为 extern "C"。
@@ -130,8 +143,6 @@ pub fn init() -> Result<Arc<Cancel>, String> {
         action.sa_flags = 0;
         libc::sigemptyset(&mut action.sa_mask);
         if libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) == -1 {
-            libc::close(read_fd);
-            libc::close(write_fd);
             WRITE_FD.store(-1, Ordering::SeqCst);
             return Err(format!("安装 SIGINT 处理器失败：{}", last_os_error()));
         }
@@ -139,33 +150,31 @@ pub fn init() -> Result<Arc<Cancel>, String> {
 
     let cancel = Cancel::new();
     let thread_cancel = cancel.clone();
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("rho-sigint".into())
         .spawn(move || {
+            let mut read_end = read_end;
             let mut buf = [0u8; 64];
             loop {
-                // SAFETY: read_fd 有效，buf 是合法可写缓冲区。
-                let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
-                if n > 0 {
-                    for _ in 0..n {
-                        thread_cancel.inject();
+                match read_end.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        for _ in 0..n {
+                            thread_cancel.inject();
+                        }
                     }
-                } else if n == 0 {
-                    break;
-                } else {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    break;
+                    // 信号可能投递到本线程：EINTR 不是管道关闭，继续读。
+                    Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 }
             }
-            // SAFETY: 信号线程结束，关闭读端。
-            unsafe {
-                libc::close(read_fd);
-            }
-        })
-        .map_err(|e| format!("启动信号线程失败：{e}"))?;
+            // 读端由 read_end 的 Drop 关闭。
+        });
+    if let Err(e) = spawned {
+        // 处理器已装但无人消费：撤销写端指向，避免处理器写入无读者的管道。
+        WRITE_FD.store(-1, Ordering::SeqCst);
+        return Err(format!("启动信号线程失败：{e}"));
+    }
 
     match CANCEL.set(cancel.clone()) {
         Ok(()) => Ok(cancel),

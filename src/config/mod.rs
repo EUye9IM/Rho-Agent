@@ -141,13 +141,7 @@ fn load_source(source: &str, label: &str) -> Result<Config, String> {
     })?;
     // 明文密钥告警在加载时统一扫描一次，选择/切换阶段不再重复打印。
     for (_, provider) in providers_in_order(&cfg) {
-        let pairs: Vec<(String, String)> = provider
-            .auth
-            .headers
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        warn_plaintext_secrets(&pairs);
+        warn_plaintext_secrets(&header_pairs(provider));
     }
     match validate(&cfg) {
         Ok(()) => Ok(cfg),
@@ -155,11 +149,7 @@ fn load_source(source: &str, label: &str) -> Result<Config, String> {
             let mut msg = format!("配置校验失败 {label}：");
             for e in errs {
                 msg.push('\n');
-                if let Some(line) = e.line {
-                    msg.push_str(&format!("  - {}（第 {} 行）：{}", e.path, line, e.message));
-                } else {
-                    msg.push_str(&format!("  - {}：{}", e.path, e.message));
-                }
+                msg.push_str(&format!("  - {}：{}", e.path, e.message));
             }
             Err(msg)
         }
@@ -180,21 +170,24 @@ pub fn first_model_for<'a>(cfg: &'a Config, provider_id: &str) -> Option<(&'a St
         .find(|(id, _)| model_provider_prefix(id) == Some(provider_id))
 }
 
-fn expand_provider(provider: &Provider) -> Result<Provider, String> {
-    let pairs: Vec<(String, String)> = provider
+fn header_pairs(provider: &Provider) -> Vec<(String, String)> {
+    provider
         .auth
         .headers
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let expanded = expand_headers(&pairs)?;
+        .collect()
+}
+
+fn expand_provider(provider: &Provider) -> Result<Provider, String> {
+    let expanded = expand_headers(&header_pairs(provider))?;
     let mut out = provider.clone();
     out.auth.headers = expanded.into_iter().collect();
     Ok(out)
 }
 
 fn provider_unavailable(id: &str, err: String) -> String {
-    format!("供应商 {id} 不可用：认证变量缺失或无效（{err}）")
+    format!("供应商 {id} 不可用：{err}")
 }
 
 /// 供应商是否可用（已声明且认证变量齐全）。REPL /provider 列表标注用。

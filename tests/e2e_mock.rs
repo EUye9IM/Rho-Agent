@@ -116,15 +116,19 @@ fn write_config_extra(base_url: &str, extra: &str) -> String {
     write_config_full(base_url, extra, "")
 }
 
-fn write_config_full(base_url: &str, top_extra: &str, provider_extra: &str) -> String {
-    let path = std::env::temp_dir().join(format!(
-        "rho-integration-{}-{}.toml",
+/// 测试用临时文件名的进程内序号：`SystemTime` 分辨率不足以保证并行测试不撞名。
+static TMP_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn tmp_path(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "rho-{tag}-{}-{}.toml",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ))
+}
+
+fn write_config_full(base_url: &str, top_extra: &str, provider_extra: &str) -> String {
+    let path = tmp_path("integration");
     let toml = format!(
         r#"
 {top_extra}
@@ -208,9 +212,90 @@ fn full_tool_loop_with_mock_sse() {
     assert_eq!(second["stream"], true);
 }
 
+/// 上游“思考”一段时间才回响应头是常态，不能因读超时被当成失败。
+/// 回归护栏：ureq 的读超时同时作用于响应头与响应体，却只由 `timeout_read` 一个旋钮控制，
+/// 把它调到秒级以下会让正常请求报 “timed out reading response”。
+#[test]
+fn slow_response_headers_are_not_an_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else { return };
+        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let _ = read_request(&mut stream);
+        // 先“思考” 1.5s 再发响应头。
+        std::thread::sleep(Duration::from_millis(1500));
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        );
+        let _ = stream.write_all(
+            sse(&json!({"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}))
+                .as_bytes(),
+        );
+        let _ = stream.write_all(b"data: [DONE]\n\n");
+        let _ = stream.flush();
+        let _ = stream.shutdown(Shutdown::Both);
+    });
+
+    let cfg_path = write_config(&format!("http://{addr}"));
+    let cfg = config::load(&Some(cfg_path.clone())).unwrap();
+    let _ = std::fs::remove_file(&cfg_path);
+    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
+    let adapter = provider::adapter_for(&selection.provider).unwrap();
+    let mut session = Session::new(cfg, selection, adapter, false);
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(vec![], vec![]);
+
+    let end = session.turn(&mut ui, &cancel, "go").unwrap();
+    assert!(matches!(end, TurnEnd::Done), "end was {end:?}");
+}
+
+/// 流中间停顿跨越预期的读粒度时，流必须继续而不是被判失败。
+#[test]
+fn slow_stream_between_chunks_is_not_an_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else { return };
+        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let _ = read_request(&mut stream);
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        );
+        let _ = stream
+            .write_all(sse(&json!({"choices":[{"delta":{"content":"a"}}]})).as_bytes());
+        let _ = stream.flush();
+        // 超过一秒的空白间隔：worker 应继续读而不是报错。
+        std::thread::sleep(Duration::from_millis(1200));
+        let _ = stream.write_all(
+            sse(&json!({"choices":[{"delta":{"content":"b"},"finish_reason":"stop"}]}))
+                .as_bytes(),
+        );
+        let _ = stream.write_all(b"data: [DONE]\n\n");
+        let _ = stream.flush();
+        let _ = stream.shutdown(Shutdown::Both);
+    });
+
+    let cfg_path = write_config(&format!("http://{addr}"));
+    let cfg = config::load(&Some(cfg_path.clone())).unwrap();
+    let _ = std::fs::remove_file(&cfg_path);
+    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
+    let adapter = provider::adapter_for(&selection.provider).unwrap();
+    let mut session = Session::new(cfg, selection, adapter, false);
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(vec![], vec![]);
+
+    let end = session.turn(&mut ui, &cancel, "go").unwrap();
+    assert!(matches!(end, TurnEnd::Done), "end was {end:?}");
+    match session.history.last() {
+        Some(Msg::Assistant { text, .. }) => assert_eq!(text.as_deref(), Some("ab")),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
 #[test]
 fn config_errors_are_collected() {
-    let path = std::env::temp_dir().join(format!("rho-bad-{}.toml", std::process::id()));
+    let path = tmp_path("bad");
     let toml = r#"
 default_provider = "missing"
 default_model = "noprefix"
