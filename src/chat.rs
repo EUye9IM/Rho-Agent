@@ -111,8 +111,6 @@ pub struct Session {
     pub tool_runner: Arc<dyn ToolRunner>,
     pub yes: bool,
     pub history: Vec<Msg>,
-    /// 本轮工具步数（每次用户输入触发的一轮对话计数，turn 开头重置）
-    pub steps: u32,
 }
 
 /// REPL → agent loop 的内部错误通道。
@@ -178,14 +176,12 @@ impl Session {
             tool_runner: Arc::new(BashRunner),
             yes,
             history,
-            steps: 0,
         }
     }
 
-    /// `/clear`：历史重置为仅含 system 消息（播种语义同 new）；steps 归零。
+    /// `/clear`：历史重置为仅含 system 消息（播种语义同 new）。
     pub fn clear(&mut self) {
         self.history = system_history(self.cfg.system_prompt.as_deref());
-        self.steps = 0;
     }
 
     fn build_body(&self) -> serde_json::Value {
@@ -206,7 +202,8 @@ impl Session {
     /// 编排：发起请求并接收流（`receive_stream`）→ 无工具调用即收束；
     /// 有则交 `run_tool_calls` 执行，全部执行完带上结果继续请求。
     pub fn turn(&mut self, ui: &mut dyn Ui, cancel: &Cancel, input: &str) -> ChatResult<TurnEnd> {
-        self.steps = 0;
+        // 本轮工具步数（每次用户输入触发的回合局部计数）。
+        let mut steps: u32 = 0;
         self.history.push(Msg::User(input.to_string()));
 
         loop {
@@ -258,7 +255,7 @@ impl Session {
                 tool_calls: tool_calls.clone(),
             });
 
-            match self.run_tool_calls(ui, cancel, &tool_calls) {
+            match self.run_tool_calls(ui, cancel, &mut steps, &tool_calls) {
                 // 全部工具执行完：带上 Tool 结果继续请求。
                 ToolPhase::Done => continue,
                 ToolPhase::Cancelled => {
@@ -361,10 +358,12 @@ impl Session {
 
     /// 执行一批 tool_calls：每个执行前先查限额与取消标志；全部执行完返回 Done。
     /// 任何返回路径都保证剩余调用已补占位（docs/architecture.md 四节配对不变式）。
+    /// 结果写入与计数集中在 commit_call_result：单调用分支再多也不会漏掉历史配对。
     fn run_tool_calls(
         &mut self,
         ui: &mut dyn Ui,
         cancel: &Cancel,
+        steps: &mut u32,
         tool_calls: &[ToolCall],
     ) -> ToolPhase {
         let max = self.cfg.max_tool_steps.unwrap_or(DEFAULT_MAX_TOOL_STEPS);
@@ -372,7 +371,7 @@ impl Session {
 
         while i < tool_calls.len() {
             // 限额逐个前置检查：当前及剩余调用补超限占位。
-            if self.steps >= max {
+            if *steps >= max {
                 self.placeholders(ui, &tool_calls[i..], LIMIT_PLACEHOLDER);
                 return ToolPhase::Limit(max);
             }
@@ -386,29 +385,25 @@ impl Session {
                 };
             }
 
-            let outcome = dispatch_tool_call(self, ui, cancel, &tool_calls[i]);
-            match outcome {
-                CallOutcome::Result(content) => {
-                    self.history.push(Msg::Tool {
-                        tool_call_id: tool_calls[i].id.clone(),
-                        content,
-                    });
-                    self.steps += 1;
-                }
-                CallOutcome::Cancelled(content) => {
-                    self.history.push(Msg::Tool {
-                        tool_call_id: tool_calls[i].id.clone(),
-                        content,
-                    });
-                    self.steps += 1;
-                    self.placeholders(ui, &tool_calls[i + 1..], CANCELLED_PLACEHOLDER);
-                    // 执行/清理期间第二次 Ctrl-C：信号计数已置 quit。
-                    return if cancel.is_quit() {
-                        ToolPhase::Quit
-                    } else {
-                        ToolPhase::Cancelled
-                    };
-                }
+            let outcome = dispatch_tool_call(
+                ui,
+                cancel,
+                &*self.tool_runner,
+                &self.cfg.tools.bash,
+                self.yes,
+                &tool_calls[i],
+            );
+            // 单一出口：渲染结果、写入历史、计数（含取消/退出路径的当前调用）。
+            self.commit_call_result(ui, &tool_calls[i].id, &outcome.content, steps);
+
+            if outcome.stop {
+                self.placeholders(ui, &tool_calls[i + 1..], CANCELLED_PLACEHOLDER);
+                // 执行/清理期间第二次 Ctrl-C：信号计数已置 quit。
+                return if cancel.is_quit() {
+                    ToolPhase::Quit
+                } else {
+                    ToolPhase::Cancelled
+                };
             }
 
             // 执行/清理期间第二次 Ctrl-C：信号计数已置 quit。
@@ -421,6 +416,24 @@ impl Session {
 
         // 全部工具执行完。
         ToolPhase::Done
+    }
+
+    /// 单个调用结果的唯一出口：渲染 ToolResult、写入历史、计数。
+    /// 所有终态（真实结果/错误文本/拒绝/取消/部分执行）都经此写入，
+    /// 保证 tool_calls 与 Tool 消息的配对不变式只需在这一处维护。
+    fn commit_call_result(
+        &mut self,
+        ui: &mut dyn Ui,
+        call_id: &str,
+        content: &str,
+        steps: &mut u32,
+    ) {
+        emit(ui, RenderEvent::ToolResult(content.to_string()));
+        self.history.push(Msg::Tool {
+            tool_call_id: call_id.to_string(),
+            content: content.to_string(),
+        });
+        *steps += 1;
     }
 
     fn placeholders(&mut self, ui: &mut dyn Ui, calls: &[ToolCall], content: &str) {
@@ -485,86 +498,72 @@ impl Session {
     }
 }
 
-/// 执行单个工具调用（在 run_tool_calls 的逐个循环中被调用）。
-/// 返回该调用的 Tool 消息内容（真实结果 / 错误文本 / 占位文本）。
-enum CallOutcome {
-    Result(String),      // 正常完成 / 真实错误文本 / 占位文本
-    Cancelled(String),   // 取消：当前"已部分执行/未执行"文本；剩余调用补占位
+/// 单个调用的执行结果（在 run_tool_calls 的逐个循环中被调用）。
+/// content 是喂回模型的 Tool 消息文本（真实结果 / 错误文本 / 拒绝 / 占位）；
+/// stop = 取消/退出：当前调用结果仍经统一出口写入，剩余调用由调用方补占位。
+struct CallOutcome {
+    content: String,
+    stop: bool,
 }
 
-/// 参数/判定类错误的统一出口：展示并作为该调用的 Tool 结果文本。
-fn tool_error(ui: &mut dyn Ui, msg: String) -> CallOutcome {
-    emit(ui, RenderEvent::ToolResult(msg.clone()));
-    CallOutcome::Result(msg)
+/// 参数/判定类错误（不停止批次）：作为该调用的 Tool 结果文本。
+fn tool_outcome(content: String) -> CallOutcome {
+    CallOutcome { content, stop: false }
 }
 
 fn dispatch_tool_call(
-    session: &mut Session,
     ui: &mut dyn Ui,
     cancel: &Cancel,
+    tool_runner: &dyn ToolRunner,
+    bash_cfg: &crate::config::BashToolConfig,
+    yes: bool,
     call: &ToolCall,
 ) -> CallOutcome {
     if call.name != "bash" {
-        return tool_error(ui, format!("未知工具：{}", call.name));
+        return tool_outcome(format!("未知工具：{}", call.name));
     }
 
     let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
         Ok(v) => v,
         Err(e) => {
-            return tool_error(
-                ui,
-                format!("工具参数解析失败：{e}；原始参数：{}", call.arguments),
-            );
+            return tool_outcome(format!(
+                "工具参数解析失败：{e}；原始参数：{}",
+                call.arguments
+            ));
         }
     };
     let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
-        return tool_error(ui, "工具参数解析失败：缺少字符串字段 command".to_string());
+        return tool_outcome("工具参数解析失败：缺少字符串字段 command".to_string());
     };
     if command.trim().is_empty() {
-        return tool_error(ui, "工具参数解析失败：command 为空".to_string());
+        return tool_outcome("工具参数解析失败：command 为空".to_string());
     }
 
     emit(ui, RenderEvent::ToolCall(command.to_string()));
 
     let cwd = crate::session_cwd();
-    match tools::gate(
-        ui,
-        session.yes,
-        &cwd,
-        command,
-        &session.cfg.tools.bash.allow,
-    ) {
-        ConfirmOutcome::No => {
-            let content = "用户拒绝执行".to_string();
-            emit(ui, RenderEvent::ToolResult(content.clone()));
-            CallOutcome::Result(content)
-        }
-        ConfirmOutcome::Cancelled => {
-            let content = CANCELLED_PLACEHOLDER.to_string();
-            emit(ui, RenderEvent::ToolResult(content.clone()));
-            CallOutcome::Cancelled(content)
-        }
+    match tools::gate(ui, yes, &cwd, command, &bash_cfg.allow) {
+        ConfirmOutcome::No => tool_outcome("用户拒绝执行".to_string()),
+        ConfirmOutcome::Cancelled => CallOutcome {
+            content: CANCELLED_PLACEHOLDER.to_string(),
+            stop: true,
+        },
         ConfirmOutcome::Yes => {
             // 确认与执行之间若已收到信号，直接按取消收尾，不再 spawn。
             if cancel.pending().is_some() {
-                let content = CANCELLED_PLACEHOLDER.to_string();
-                emit(ui, RenderEvent::ToolResult(content.clone()));
-                return CallOutcome::Cancelled(content);
+                return CallOutcome {
+                    content: CANCELLED_PLACEHOLDER.to_string(),
+                    stop: true,
+                };
             }
-            let out = session
-                .tool_runner
-                .run(command, &session.cfg.tools.bash, cancel);
-            emit(ui, RenderEvent::ToolResult(out.content.clone()));
+            let out = tool_runner.run(command, bash_cfg, cancel);
             match out.end {
-                BashEnd::SpawnFailed(e) => {
-                    CallOutcome::Result(format!("无法启动命令：{e}"))
-                }
-                BashEnd::Cancelled | BashEnd::QuitRequested => {
-                    CallOutcome::Cancelled(out.content)
-                }
-                BashEnd::TimedOut | BashEnd::Exited(_) => {
-                    CallOutcome::Result(out.content)
-                }
+                BashEnd::SpawnFailed(_) => tool_outcome(out.content),
+                BashEnd::Cancelled | BashEnd::QuitRequested => CallOutcome {
+                    content: out.content,
+                    stop: true,
+                },
+                BashEnd::TimedOut | BashEnd::Exited(_) => tool_outcome(out.content),
             }
         }
     }
