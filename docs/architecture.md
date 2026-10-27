@@ -120,7 +120,7 @@ enum ConfirmOutcome {
 - 退出语义：`read_line` 只返回 `Line`/`Interrupted`/`Eof`；`/exit` 作为普通 `Line` 由 REPL 层解析为退出（斜杠命令由 repl.rs 解析）。空行 Ctrl-C 返回 `Interrupted`；REPL 层按 2 秒双按窗口判定——窗口内第二次才退出，第一次只武装并在提示符行尾显示灰提示，编辑中（`line_empty: false`）按 Ctrl-C 清行并撤销武装，任何提交的行（含空行）都清掉武装。`ConfirmOutcome::Cancelled` 是确认界面的 Ctrl-C，取消整轮（若为当前轮第二次则收尾后退出，见信号计数）。
 - **Ctrl-C 的唯一记录生产者是专用信号线程**（confirm 场景）：终端保持 ISIG，Ctrl-C 产生 SIGINT，经 self-pipe/signalfd 由信号线程在锁内追加记录；`confirm` 的可中断读取由 SIGINT 唤醒返回 `Cancelled`；记录只由信号线程追加，计数只有一份。
 - **rustyline 输入路径**：rustyline 原始模式会接管 SIGINT，Ctrl-C 由 rustyline 返回 `Interrupted`，REPL 层直接处理（清行/进入双按窗口）。这条路径属于按键输入；信号线程只处理活动操作（流式/工具/确认）的 SIGINT。两套路径在时间上互斥，计数保持唯一；`readline` 返回后到下一次关掉 ISIG 之间有一段 cooked 模式缝隙，落在缝隙里的 Ctrl-C 会被记成当前轮的 cancel，切轮时按旧轮单条记录作废（见五）。
-- **Ui trait 只负责输入、确认和输出**：退出有两条路径——① REPL 层判定（`/exit`、`Eof`、空行 Ctrl-C 双按），以 `Result<T, Quit>` 内部错误通道传给 agent loop，agent loop 按占位规则收尾后向上返回退出；② 活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测，同样按占位规则收尾、完成工具进程清理后退出。两条路径最终都会先完成剩余调用的占位补齐与进程组清理，再退出。
+- **Ui trait 只负责输入、确认和输出**：退出有两条路径——① REPL 层判定（`/exit`、`Eof`、空行 Ctrl-C 双按）发生在回合之间的输入阶段，此时没有进行中的调用，直接退出；② 活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测，按占位规则收尾、完成工具进程清理后以 `ChatResult` 的 `Err(Quit)` 上抛退出。`Quit` 只承载路径 ② 的回合内传播。
 
 - 生产实现 `TermUi`：rustyline 后端；`confirm` 用可中断读取（保持 ISIG，Ctrl-C 产生 SIGINT 唤醒读取并返回 `Cancelled`；记录由信号线程统一维护）。stdin 是否为 TTY 的检查在 `TermUi::new` 里做，`main` 只接收检查结果。
 - 双按提示：`TermUi` 用 `Helper` 实现 `Hinter`/`Highlighter`，武装时在空行上返回暗淡色提示（`render::dim`），由下一次 `readline` 的重绘显示；`CTRL_C_WINDOW` 常量由 `ui` 模块提供，`repl` 用同一常量判定退出。到期由 `rho-hint` 线程撤掉提示：它只向 stdout 写一个“擦到屏幕末尾”的序列（`\x1b[J`），不移动光标，因此 rustyline 的位置模型（提示符末尾、输入行空）保持不变，也不会把提示符顶到下一行；用 `\x1b[J` 而不是 `\x1b[K` 是因为窄终端下提示会换到下一行，只擦当前行会留下尾巴。动手前提由 `should_erase_hint` 判定——处于 `readline` 期间、提示行当前为空（`Hinter` 每次重绘时更新）、stdout 是 TTY，否则只撤销武装不碰终端。判定与写入之间主线程可能已经开始重绘，因此这是尽力而为的擦除，两个方向（没擦干净 / 擦掉了刚画出的新提示）都可能发生；下一次按键重绘会自愈。
@@ -180,7 +180,7 @@ loop {
 - **限额逐个前置检查**：每个调用执行前先检查限额；**所有模型发起的调用都计数**（含参数解析失败/未知工具名/spawn 失败的调用），防止错误调用无限循环。
 - **历史即上下文**：历史（`Vec<Msg>`）原样序列化进请求；窗口超限时展示错误并提示 `/clear`。
 - **reasoning 默认留在本地**：`echo_reasoning = true` 时随历史回传，其余情况序列化时丢弃（适配层职责）。
-- **两条退出路径最终汇合**：REPL 层将 `/exit` 命令、空行 Ctrl-C 双按、`Eof`（Ctrl-D）映射为退出（经内部通道传 agent loop）；活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测。两路径均先完成剩余调用占位补齐与工具进程清理再退出。
+- **两条退出路径**：REPL 层将 `/exit` 命令、空行 Ctrl-C 双按、`Eof`（Ctrl-D）映射为退出——判定发生在输入阶段（回合之间），直接退出；活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测，先完成剩余调用占位补齐与工具进程清理再退出。
 
 ## 五、线程与取消（term.rs / repl.rs）
 
@@ -217,8 +217,8 @@ exit 0：/exit、空闲态 Ctrl-C 双按、Ctrl-D（均正常退出）
 | `sse.rs` / `config` / `tools` 判定与截断 / `expand` | 纯单元测试，录制夹具 |
 | `render` 格式 / `ui::prompt_rows`（回收时上移的行数）/ `ui::should_erase_hint` / `repl::within_window`（双按窗口） | 纯单元测试，无 TTY |
 | `provider::openai` 解析 | 单元测试：构造 JSON chunk → StreamEvent |
-| agent loop + tools | 集成：fake adapter 吐预编排 `StreamEvent` 序列 + `ScriptedUi` 驱动输入/确认 |
+| agent loop + tools | 集成：mock SSE 服务 + `ScriptedUi` 驱动真实 `Session::turn`（配对、计数、占位、取消；`tools::run_bash` 直接验证输出捕获/截断/超时） |
 | provider + HTTP 层 | 集成：本地 mock SSE 服务（std TcpListener 手写），测协议映射与流读取 |
 | 端到端工具循环 | 集成：mock SSE 服务驱动多轮真实 HTTP 请求，验证占位 Tool 消息的配对/顺序/第二次请求序列化（含 echo_reasoning） |
-| 取消/退出 | 集成：`ScriptedUi` 注入 `Line("/exit")`、`Eof` 验证退出路径；注入 `Interrupted{line_empty}` 序列验证 2 秒双按窗口、编辑中撤销、提交行清除武装（并断言 `set_ctrl_c_hint` 序列）；直接注入信号记录（第 1 次/第 2 次）验证取消与退出路径；信号到记录、灰提示到期擦除与屏幕行回收（含到期后重新武装、窄终端提示换行、宽字符/tab 边界）这一段（`term.rs` / `ui` 模块）手工验收 |
+| 取消/退出 | 集成：`ScriptedUi` 注入 `Line("/exit")`、`Eof` 验证退出路径；注入 `Interrupted{line_empty}` 序列验证 2 秒双按窗口、编辑中撤销、提交行清除武装（并断言 `set_ctrl_c_hint` 序列）；直接注入信号记录（第 1 次）验证流式取消路径——quit 路径（第 2 次）的计数判定由 `term.rs` 单元测试覆盖，端到端行为手工验收；信号到记录、灰提示到期擦除与屏幕行回收（含到期后重新武装、窄终端提示换行、宽字符/tab 边界）这一段（`term.rs` / `ui` 模块）手工验收 |
 | 终端交互 / 真实信号 | 手工验收 |
