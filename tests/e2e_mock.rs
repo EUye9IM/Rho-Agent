@@ -457,6 +457,57 @@ fn bash_timeout_terminates_group() {
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 
+/// bash 已退出但后台子进程仍持有管道写端：drain 收尾有界，不等后台进程。
+#[test]
+fn bash_returns_bounded_when_background_child_holds_pipe() {
+    let cfg = BashToolConfig {
+        allow: vec![],
+        timeout_seconds: 5,
+        max_output_bytes: 1024,
+    };
+    let started = std::time::Instant::now();
+    // bash 立即退出；后台 sleep 30 继续持有 stdout 写端。
+    let out = tools::run_bash("echo hi; sleep 30 &", &cfg, &Cancel::new());
+    assert!(matches!(out.end, tools::BashEnd::Exited(0)), "end was {:?}", out.end);
+    assert!(out.content.contains("hi"));
+    assert!(started.elapsed() < Duration::from_secs(3), "elapsed {:?}", started.elapsed());
+}
+
+/// 超时清理的是进程组：后台子进程一并终止（否则 drain 管道不关闭，本测试无法收敛）。
+#[test]
+fn bash_timeout_kills_background_children_too() {
+    let cfg = BashToolConfig {
+        allow: vec![],
+        timeout_seconds: 1,
+        max_output_bytes: 1024,
+    };
+    let started = std::time::Instant::now();
+    // 前台 sleep 撑过超时；后台 sleep 与之同进程组。
+    let out = tools::run_bash("sleep 30 & sleep 30", &cfg, &Cancel::new());
+    assert!(matches!(out.end, tools::BashEnd::TimedOut));
+    assert!(started.elapsed() < Duration::from_secs(10), "elapsed {:?}", started.elapsed());
+}
+
+/// 取消路径与超时同样升级终止进程组。
+#[test]
+fn bash_cancel_terminates_group() {
+    let cfg = BashToolConfig {
+        allow: vec![],
+        timeout_seconds: 30,
+        max_output_bytes: 1024,
+    };
+    let cancel = Cancel::new();
+    let injector = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        injector.inject();
+    });
+    let started = std::time::Instant::now();
+    let out = tools::run_bash("sleep 30 & sleep 30", &cfg, &cancel);
+    assert!(matches!(out.end, tools::BashEnd::Cancelled), "end was {:?}", out.end);
+    assert!(started.elapsed() < Duration::from_secs(10), "elapsed {:?}", started.elapsed());
+}
+
 #[test]
 fn ctrl_c_during_stream_cancels_and_discards_partial() {
     let first = sse(&json!({
