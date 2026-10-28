@@ -128,7 +128,7 @@ main → config
 
 ## 文档规则
 
-- `docs/` 只放当前实现文档（目前是 `docs/architecture.md`）；不要新增设计文档、功能清单、流程/工作流文档，除非用户明确要求。
+- `docs/` 只放当前实现文档（`docs/architecture.md`；`fix-plan.md` 与 `maintainability-review.md` 是用户明确要求的例外）；不要新增设计文档、功能清单、流程/工作流文档，除非用户明确要求。
 - 文档只描述当前代码的实际行为。用正向陈述；不要用“不支持 / 不使用 / 没有 / 不做”来定义功能。必要的错误条件（非 TTY、超限、非法输入等）可以直接写。
 - 不写版本历史、变更记录、里程碑、状态横幅或“已完成 / 待发布”之类的过程信息。
 - 产品愿景和定位写在 `README.md` / `README.zh-CN.md`；两份 README 保持同步，并只链接 `docs/architecture.md`。

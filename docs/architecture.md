@@ -108,6 +108,7 @@ trait Ui {
     fn confirm(&mut self, cwd: &str, cmd: &str) -> ConfirmOutcome; // bash 确认
     fn print(&mut self, ev: &RenderEvent);                        // 渲染输出
     fn set_ctrl_c_hint(&mut self, armed: bool) {}                 // 双按灰提示开关
+    fn take_fatal(&mut self) -> Option<String> { None }           // 渲染/读取 I/O 失败（REPL 映射 exit 1）
 }
 enum ReadOutcome {
     Line(String),                     // 普通输入或斜杠命令
@@ -198,7 +199,7 @@ struct State { epoch: u64, records: Vec<u32 /*第几次 Ctrl-C*/>, prev_quit: bo
 - 主线程查询：锁内看 `prev_quit`（则退出）或当前轮记录——第 1 次为 cancel，第 2 次及以上为 quit；旧轮非 quit 记录作废。
 - 消费点：渲染/接收循环（`recv_timeout` 短轮询，超时即查；**成功收到事件也先查再处理**）、工具等待循环（触发进程组升级终止；发现 quit 只终止进程组并**返回“quit 已请求”给 agent loop**，由 agent loop 收尾）、agent loop（按占位规则补齐当前及剩余调用后回 REPL 或统一退出程序）。工具执行/清理期间由当前轮信号记录承接第二次 Ctrl-C。
 - 流线程取消：主线程 drop Receiver 并置位取消标志（`Arc<AtomicBool>`）→ worker 在读取循环中每次 `read` 返回后、以及每次 `send` 前轮询它，立即退出并静默返回（主线程已放弃接收）。读超时是 socket 级的 `timeout_read`：ureq 只有一个旋钮且同样作用于读取响应头，所以取空闲上限 120s，不用短超时轮询——上游“思考”数秒才回头是常态。取消后若连接完全无数据，worker 最多滞留到该读超时；因此取消的及时性以“下一块数据到达”为界。另有一条整轮响应体累计上限 32MiB（超限按流错误收尾），channel 为无界 `mpsc`：无界使发送永不阻塞，配合 drop-Receiver 早退语义最简单。
-- 工具执行与进程组终止：`setsid` 建进程组；stdout/stderr 各起一个 drain 线程并行读取。截断缓冲为两段结构：头部前缀（上限前半）+ 滑动尾部窗口（上限后半），中间字节计数丢弃，按头尾保留语义处理。**主线程是唯一 reaper**：`waitpid` 只由主线程执行，退出状态存入共享标志；drain 线程只轮询共享退出标志，观察到退出后进入收尾阶段（短超时上限内继续读取管道中已缓冲的剩余数据，防止后台进程持续写入），超时或 EOF 即退出线程并关闭自己持有的读端；主线程只负责 `waitpid`，读端由 drain 线程持有。终止升级以进程组为准：SIGTERM 发 pgid → 2s → 对 pgid 发 SIGKILL → 主线程回收 bash（直接子进程回收条件与进程组清理条件分离）。
+- 工具执行与进程组终止：`setsid` 建进程组；stdout/stderr 各起一个 drain 线程并行读取。清理结果三状态显式化：`waitpid` 错误（`ReapFailed`）与信号退出区分、drain 管道非阻塞设置失败显式放弃剩余输出、`kill_pg` 失败以警告行附于输出。截断缓冲为两段结构：头部前缀（上限前半）+ 滑动尾部窗口（上限后半），中间字节计数丢弃，按头尾保留语义处理。**主线程是唯一 reaper**：`waitpid` 只由主线程执行，退出状态存入共享标志；drain 线程只轮询共享退出标志，观察到退出后进入收尾阶段（短超时上限内继续读取管道中已缓冲的剩余数据，防止后台进程持续写入），超时或 EOF 即退出线程并关闭自己持有的读端；主线程只负责 `waitpid`，读端由 drain 线程持有。终止升级以进程组为准：SIGTERM 发 pgid → 2s → 对 pgid 发 SIGKILL → 主线程回收 bash（直接子进程回收条件与进程组清理条件分离）。
 - **Ctrl-C 的两套记录互不复用**：活动操作（流式/工具/确认）的计数归 `Cancel`（信号线程写入，只看次数和 epoch，没有时间概念）；提示符态的双按武装归 `repl` 的一个 `Option<Instant>`，窗口常量 `CTRL_C_WINDOW` 与 `ui` 模块共用，从不写入 `Cancel`。rustyline 在 `readline` 期间清掉 ISIG，两套记录在时间上互斥；唯一的交叠是 `readline` 返回到下一次关 ISIG 之间的 cooked 模式缝隙，那里收到的 Ctrl-C 会被记成当前轮的一次 cancel，而切轮会丢弃旧轮的单条 cancel，用户可见行为不变（只有凑巧与下一次请求竞争的 cancel 才会取消那一轮）。
 - quit（当前轮第二次 Ctrl-C）被消费即走退出路径；切轮时旧轮未消费的 quit 结转为 `prev_quit`，下一轮查询时仍触发退出。
 

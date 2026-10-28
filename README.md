@@ -152,7 +152,7 @@ Everything else prompts with the working directory and the full command, default
 
 > **Safety boundary.** The allowlist matches strings and acts as a convenience gate; the host's user permissions remain the real security boundary. Child processes inherit the full environment, so the model can read `DEEPSEEK_API_KEY` via `env`. Run `rho` as a user you are willing to have execute commands, and use it only on hosts you trust it to read.
 
-Other limits: at most `max_tool_steps` model-initiated tool calls per turn (default 25, counting rejected/failed calls too); stdout and stderr are each capped at `max_output_bytes` with the head and tail kept and the omitted byte count marked; a timeout kills the whole process group (SIGTERM, then SIGKILL after 2s). HTTP errors are reported directly. History is sent as-is; when a conversation exceeds the model window, the upstream request fails and you need `/clear`.
+Other limits: at most `max_tool_steps` model-initiated tool calls per turn (default 25, counting rejected/failed calls too); stdout and stderr are each capped at `max_output_bytes` with the head and tail kept and the omitted byte count marked; a timeout kills the whole process group (SIGTERM, then SIGKILL after 2s). Each request sends the model's `max_output` as the upstream output token limit. SSE lines are capped at 1 MiB and a single response body at 32 MiB; exceeding either ends the turn with an error. HTTP errors are reported directly. History is sent as-is; when a conversation exceeds the model window, the upstream request fails and you need `/clear`.
 
 ## Testing
 

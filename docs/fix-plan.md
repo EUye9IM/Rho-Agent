@@ -144,7 +144,7 @@ T1–T14 全部落地并推送（e1a4e64…37aed2d）。计划外追加完成：
 
 - 顺序执行 T1→T14；T7 依赖 T6，T8 依赖 T6/T7 的接口稳定，其余阶段内可按序推进。
 - 每项独立提交（英文祈使句）；行为修复（T4、T9、T10）与纯重构分开提交并在信息中注明行为变化。
-- 每次提交前：`cargo test --all-targets --locked` 与 `cargo clippy --all-targets --locked -- -D warnings` 全绿；CI 覆盖 MSRV 1.75。
+- 每次提交前：`cargo test --all-targets --locked` 与 `cargo clippy --all-targets --locked -- -D warnings` 全绿；CI 覆盖 MSRV 1.75（该约束后于 7d4b09a 移除，改为只测 stable）。
 - 涉及行为表述的项（T1/T2/T3/T8）同步更新两份 README 与 `docs/architecture.md`，不留下指向已删除描述的引用。
 - 不实施评审文档"暂不建议的方向"所列内容；第 15 项关闭不执行。
 - 终端真实行为（PTY/信号）在 T9、T10 完成后各做一次手工验收，其余项不需要。
