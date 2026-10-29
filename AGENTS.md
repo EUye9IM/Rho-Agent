@@ -11,7 +11,7 @@
 
 `rho` 是运行在资源受限 Linux 设备上的本地 agent REPL：
 
-- Rust 2021，MSRV 1.75
+- Rust 2021
 - 单 crate、单二进制
 - 阻塞 I/O + 线程，**不使用 async runtime**
 - 默认 DeepSeek，供应商/模型/thinking 由 TOML 配置驱动
@@ -35,12 +35,6 @@
 cargo build --all-targets --locked
 cargo test --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
-```
-
-MSRV 检查（本地已安装 1.75 时）：
-
-```sh
-cargo +1.75.0 test --all-targets --locked
 ```
 
 不要随手执行 `cargo fmt --all`：当前 rustfmt 版本会重排大量未改动文件，制造无关 diff。只格式化本次改动的文件，或手工保持与周围代码一致。
@@ -83,7 +77,7 @@ main → config
 关键规则：
 
 - `render.rs` 只提供纯格式化函数，不直接写终端。
-- `ui.rs` 负责终端输出；生产实现 `TermUi`，测试用 `ScriptedUi`。
+- `ui` 模块（`ui/mod.rs`）负责终端输出；生产实现 `TermUi`，测试用 `ScriptedUi`（`ui/scripted.rs`）。
 - 不要在 `render` / `chat` 里直接 `println!`。
 - `provider` 每轮请求在工作线程读取 HTTP 流，经 `mpsc` 回主线程；不要引入 tokio/reqwest。
 - `chat::Msg` 是协议无关的内部消息模型；OpenAI 字段映射留在 `provider/openai.rs`。
@@ -94,7 +88,7 @@ main → config
 
 - `--config <path>` 是唯一外部配置入口；不读环境变量配置文件，不做默认路径发现。
 - 外部配置**完全替换**内置配置，不合并。
-- 严格校验：未知字段、悬空引用、缺失必填项都报错；一次收集所有错误。
+- 严格校验：未知字段、悬空引用、缺失必填项都报错；语义错误一次收集全部，TOML 语法/反序列化错误按首个报告。
 - `${VAR}` 只用于 header 值展开；缺失变量报错；明文密钥要告警。
 - 退出码：`0` 正常退出，`1` REPL 内部错误，`2` 参数/配置/供应商不可用等用法错误。
 - 不做隐式供应商分支；同协议族新供应商只加配置。
@@ -112,7 +106,8 @@ main → config
 约束：
 
 - CI 不调用真实 API；不要提交真实 key。
-- 测试不要依赖 TTY；终端行为用 PTY/`script` 手工验收。
+- 默认测试套件不依赖 TTY；终端行为由 `tests/pty.rs` 用 openpty 起真实二进制驱动
+  （屏幕断言走 vt100 网格）。真实终端的手工抽查保留用于布局细节与体感回归。
 - 当前测试是可并行的本地 mock，不要引入固定端口或共享临时文件冲突。
 - 提交前跑完整 `cargo test --all-targets --locked` 和 clippy。
 
@@ -126,14 +121,14 @@ main → config
 ## 工具与安全
 
 - `bash` allowlist 是字符串匹配，不是 shell 解析或安全沙箱；不要把它描述成沙箱。
-- 确认 gate 默认拒绝；`--yes` 只跳过确认，不绕过 allowlist。
+- 确认 gate 默认拒绝；`--yes` 跳过全部确认（对任意命令直接放行），allowlist 只是免确认的便捷门槛。若打算改成“`--yes` 仍需过 allowlist”，必须先确认，因为这会改变行为。
 - 工具输出 stdout/stderr 各自有上限，只截断一次并保留省略字节数。
 - 超时和取消都走进程组 SIGTERM → 2s → SIGKILL；不要只杀直接子进程。
 - 不要新增第二个工具，除非用户明确要求。
 
 ## 文档规则
 
-- `docs/` 只放当前实现文档（目前是 `docs/architecture.md`）；不要新增设计文档、功能清单、流程/工作流文档，除非用户明确要求。
+- `docs/` 只放当前实现文档（`docs/architecture.md`；`fix-plan.md` 与 `maintainability-review.md` 是用户明确要求的例外）；不要新增设计文档、功能清单、流程/工作流文档，除非用户明确要求。
 - 文档只描述当前代码的实际行为。用正向陈述；不要用“不支持 / 不使用 / 没有 / 不做”来定义功能。必要的错误条件（非 TTY、超限、非法输入等）可以直接写。
 - 不写版本历史、变更记录、里程碑、状态横幅或“已完成 / 待发布”之类的过程信息。
 - 产品愿景和定位写在 `README.md` / `README.zh-CN.md`；两份 README 保持同步，并只链接 `docs/architecture.md`。

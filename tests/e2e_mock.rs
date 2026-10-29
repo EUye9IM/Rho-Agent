@@ -12,8 +12,9 @@ use rho::ui::{ConfirmOutcome, ReadOutcome, ScriptedUi};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 fn read_request(stream: &mut TcpStream) -> Vec<u8> {
     let mut data = Vec::new();
@@ -44,29 +45,147 @@ fn read_request(stream: &mut TcpStream) -> Vec<u8> {
     data[header_end..(header_end + content_len).min(data.len())].to_vec()
 }
 
-fn start_server(responses: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+/// mock 服务器共享状态：请求体收集、已服务连接计数、停止标志。
+#[derive(Default)]
+struct ServerShared {
+    bodies: Mutex<Vec<String>>,
+    served: Mutex<usize>,
+    ready: Condvar,
+    stop: AtomicBool,
+}
+
+impl ServerShared {
+    fn push_body(&self, body: Vec<u8>) {
+        self.bodies
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(&body).into_owned());
+    }
+
+    fn finish_connection(&self) {
+        let mut served = self.served.lock().unwrap();
+        *served += 1;
+        drop(served);
+        self.ready.notify_all();
+    }
+}
+
+/// 本地 mock SSE 服务器句柄：可等待已服务连接数、按需读取捕获的请求体；
+/// Drop 时停止（accept 轮询线程随后退出，之后连接被拒绝），
+/// 请求数不足时测试也能结束服务线程。
+struct MockServer {
+    base_url: String,
+    shared: Arc<ServerShared>,
+}
+
+impl MockServer {
+    fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// 第 i 个请求体（clone）。
+    fn body(&self, i: usize) -> String {
+        self.shared.bodies.lock().unwrap()[i].clone()
+    }
+
+    fn request_count(&self) -> usize {
+        self.shared.bodies.lock().unwrap().len()
+    }
+
+    /// 有界等待至少 n 个连接服务完成。
+    fn wait_served(&self, n: usize, timeout: Duration) -> bool {
+        let mut served = self.shared.served.lock().unwrap();
+        let deadline = Instant::now() + timeout;
+        while *served < n {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (guard, _) = self
+                .shared
+                .ready
+                .wait_timeout(served, deadline - now)
+                .unwrap();
+            served = guard;
+        }
+        true
+    }
+
+    /// 停止服务器：轮询线程在下个间隔退出，后续连接被拒绝。
+    fn stop(&self) {
+        self.shared.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// 等待一个新连接；停止标志置位或 listener 失效时返回 None。
+/// listener 保持非阻塞，靠短间隔轮询让 stop 能及时生效。
+fn accept_next(listener: &TcpListener, shared: &ServerShared) -> Option<TcpStream> {
+    loop {
+        if shared.stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => return Some(stream),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// 读请求、捕获请求体、执行自定义响应、计数并广播。
+fn serve_one(stream: &mut TcpStream, shared: &ServerShared, respond: impl FnOnce(&mut TcpStream)) {
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    let body = read_request(stream);
+    shared.push_body(body);
+    respond(stream);
+    shared.finish_connection();
+}
+
+fn start_server(responses: Vec<String>) -> MockServer {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let bodies = Arc::new(Mutex::new(Vec::new()));
-    let captured = bodies.clone();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    // macOS 上 accept 出的 socket 会继承 O_NONBLOCK，显式恢复阻塞再读写。
+    listener.set_nonblocking(true).unwrap();
+    let shared: Arc<ServerShared> = Arc::new(Default::default());
+    let thread_shared = shared.clone();
     std::thread::spawn(move || {
         for response in responses {
-            let Ok((mut stream, _)) = listener.accept() else { return };
-            stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-            let body = read_request(&mut stream);
-            captured
-                .lock()
-                .unwrap()
-                .push(String::from_utf8_lossy(&body).into_owned());
-            let _ = stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-            );
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
-            let _ = stream.shutdown(Shutdown::Both);
+            let Some(mut stream) = accept_next(&listener, &thread_shared) else { return };
+            stream.set_nonblocking(false).ok();
+            serve_one(&mut stream, &thread_shared, |s| {
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                );
+                let _ = s.write_all(response.as_bytes());
+                let _ = s.flush();
+                let _ = s.shutdown(Shutdown::Both);
+            });
         }
     });
-    (format!("http://{addr}"), bodies)
+    MockServer { base_url, shared }
+}
+
+/// 单连接自定义响应（时序类测试用：慢响应头、分片中停顿等）。
+fn start_custom(respond: impl Fn(&mut TcpStream) + Send + 'static) -> MockServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let shared: Arc<ServerShared> = Arc::new(Default::default());
+    let thread_shared = shared.clone();
+    std::thread::spawn(move || {
+        let Some(mut stream) = accept_next(&listener, &thread_shared) else { return };
+        stream.set_nonblocking(false).ok();
+        serve_one(&mut stream, &thread_shared, respond);
+    });
+    MockServer { base_url, shared }
 }
 
 fn sse(value: &Value) -> String {
@@ -108,24 +227,9 @@ fn text_response(text: &str) -> String {
     out
 }
 
-fn write_config(base_url: &str) -> String {
-    write_config_extra(base_url, "")
-}
-
-fn write_config_extra(base_url: &str, extra: &str) -> String {
-    write_config_full(base_url, extra, "")
-}
-
-fn write_config_full(base_url: &str, top_extra: &str, provider_extra: &str) -> String {
-    let path = std::env::temp_dir().join(format!(
-        "rho-integration-{}-{}.toml",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let toml = format!(
+/// 由 mock 服务器 base_url 组装完整 TOML（测试用，不再落盘）。
+fn config_toml(base_url: &str, top_extra: &str, provider_extra: &str) -> String {
+    format!(
         r#"
 {top_extra}
 [providers.mock]
@@ -142,33 +246,48 @@ allow = []
 timeout_seconds = 5
 max_output_bytes = 1024
 "#
-    );
-    std::fs::write(&path, toml).unwrap();
-    path.display().to_string()
+    )
+}
+
+/// 保留一个真实文件加载路径的护栏：报错文案带文件路径。
+#[test]
+fn file_load_error_mentions_path() {
+    let path = std::env::temp_dir().join(format!(
+        "rho-e2e-fileload-{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(&path, "not valid toml =").unwrap();
+    let err = config::load(&Some(path.display().to_string())).unwrap_err();
+    let _ = std::fs::remove_file(&path);
+    assert!(err.contains(&path.display().to_string()), "error was {err}");
+}
+
+/// 按配置文本构建会话（mock 服务器 base_url 注入）。
+fn session_for(base_url: &str, top_extra: &str, provider_extra: &str) -> Session {
+    let cfg = config::load_str(&config_toml(base_url, top_extra, provider_extra), "<测试配置>").unwrap();
+    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
+    let adapter = provider::adapter_for(&selection.provider).unwrap();
+    Session::new(cfg, selection, adapter, false)
 }
 
 #[test]
 fn full_tool_loop_with_mock_sse() {
-    let (base_url, bodies) = start_server(vec![tool_call_response(), text_response("done")]);
-    let path = write_config(&base_url);
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let server = start_server(vec![tool_call_response(), text_response("done")]);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::No]);
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done));
+    assert!(server.wait_served(2, Duration::from_secs(5)));
 
     assert_eq!(session.history.len(), 4);
     assert!(matches!(&session.history[0], Msg::User(u) if u == "go"));
     match &session.history[1] {
-        Msg::Assistant { tool_calls, .. } => {
-            assert_eq!(tool_calls.len(), 1);
-            assert_eq!(tool_calls[0].id, "call_1");
-            assert_eq!(tool_calls[0].name, "bash");
+        Msg::Assistant(a) => {
+            assert_eq!(a.tool_calls.len(), 1);
+            assert_eq!(a.tool_calls[0].id, "call_1");
+            assert_eq!(a.tool_calls[0].name, "bash");
         }
         other => panic!("unexpected {other:?}"),
     }
@@ -180,7 +299,7 @@ fn full_tool_loop_with_mock_sse() {
         other => panic!("unexpected {other:?}"),
     }
     match &session.history[3] {
-        Msg::Assistant { text, .. } => assert_eq!(text.as_deref(), Some("done")),
+        Msg::Assistant(a) => assert_eq!(a.text.as_deref(), Some("done")),
         other => panic!("unexpected {other:?}"),
     }
 
@@ -195,9 +314,9 @@ fn full_tool_loop_with_mock_sse() {
         .iter()
         .any(|e| matches!(e, RenderEvent::TextDelta(t) if t == "done")));
 
-    let bodies = bodies.lock().unwrap();
-    assert_eq!(bodies.len(), 2);
-    let second: Value = serde_json::from_str(&bodies[1]).unwrap();
+    let bodies = server.request_count();
+    assert_eq!(bodies, 2);
+    let second: Value = serde_json::from_str(&server.body(1)).unwrap();
     let messages = second["messages"].as_array().unwrap();
     assert_eq!(messages[0]["role"], "user");
     assert_eq!(messages[1]["role"], "assistant");
@@ -208,9 +327,69 @@ fn full_tool_loop_with_mock_sse() {
     assert_eq!(second["stream"], true);
 }
 
+/// 上游“思考”一段时间才回响应头是常态，不能因读超时被当成失败。
+/// 回归护栏：ureq 的读超时同时作用于响应头与响应体，却只由 `timeout_read` 一个旋钮控制，
+/// 把它调到秒级以下会让正常请求报 “timed out reading response”。
+#[test]
+fn slow_response_headers_are_not_an_error() {
+    let server = start_custom(|stream| {
+        // 先“思考” 1.5s 再发响应头。
+        std::thread::sleep(Duration::from_millis(1500));
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        );
+        let _ = stream.write_all(
+            sse(&json!({"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}))
+                .as_bytes(),
+        );
+        let _ = stream.write_all(b"data: [DONE]\n\n");
+        let _ = stream.flush();
+        let _ = stream.shutdown(Shutdown::Both);
+    });
+
+    let mut session = session_for(server.base_url(), "", "");
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(vec![], vec![]);
+
+    let end = session.turn(&mut ui, &cancel, "go").unwrap();
+    assert!(matches!(end, TurnEnd::Done), "end was {end:?}");
+}
+
+/// 流中间停顿跨越预期的读粒度时，流必须继续而不是被判失败。
+#[test]
+fn slow_stream_between_chunks_is_not_an_error() {
+    let server = start_custom(|stream| {
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        );
+        let _ = stream
+            .write_all(sse(&json!({"choices":[{"delta":{"content":"a"}}]})).as_bytes());
+        let _ = stream.flush();
+        // 超过一秒的空白间隔：worker 应继续读而不是报错。
+        std::thread::sleep(Duration::from_millis(1200));
+        let _ = stream.write_all(
+            sse(&json!({"choices":[{"delta":{"content":"b"},"finish_reason":"stop"}]}))
+                .as_bytes(),
+        );
+        let _ = stream.write_all(b"data: [DONE]\n\n");
+        let _ = stream.flush();
+        let _ = stream.shutdown(Shutdown::Both);
+    });
+
+    let mut session = session_for(server.base_url(), "", "");
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(vec![], vec![]);
+
+    let end = session.turn(&mut ui, &cancel, "go").unwrap();
+    assert!(matches!(end, TurnEnd::Done), "end was {end:?}");
+    match session.history.last() {
+        Some(Msg::Assistant(a)) => assert_eq!(a.text.as_deref(), Some("ab")),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
 #[test]
 fn config_errors_are_collected() {
-    let path = std::env::temp_dir().join(format!("rho-bad-{}.toml", std::process::id()));
     let toml = r#"
 default_provider = "missing"
 default_model = "noprefix"
@@ -224,9 +403,7 @@ thinking_default = "high"
 [models.bad.thinking]
 low = { thinking = { type = "enabled" } }
 "#;
-    std::fs::write(&path, toml).unwrap();
-    let err = config::load(&Some(path.display().to_string())).unwrap_err();
-    let _ = std::fs::remove_file(path);
+    let err = config::load_str(toml, "<测试配置>").unwrap_err();
     assert!(err.contains("default_provider"));
     assert!(err.contains("default_model"));
     assert!(err.contains("thinking_default"));
@@ -262,24 +439,55 @@ fn bash_timeout_terminates_group() {
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 
-fn start_partial_server(first: String, rest: String) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
+/// bash 已退出但后台子进程仍持有管道写端：drain 收尾有界，不等后台进程。
+#[test]
+fn bash_returns_bounded_when_background_child_holds_pipe() {
+    let cfg = BashToolConfig {
+        allow: vec![],
+        timeout_seconds: 5,
+        max_output_bytes: 1024,
+    };
+    let started = std::time::Instant::now();
+    // bash 立即退出；后台 sleep 30 继续持有 stdout 写端。
+    let out = tools::run_bash("echo hi; sleep 30 &", &cfg, &Cancel::new());
+    assert!(matches!(out.end, tools::BashEnd::Exited(0)), "end was {:?}", out.end);
+    assert!(out.content.contains("hi"));
+    assert!(started.elapsed() < Duration::from_secs(3), "elapsed {:?}", started.elapsed());
+}
+
+/// 超时清理的是进程组：后台子进程一并终止（否则 drain 管道不关闭，本测试无法收敛）。
+#[test]
+fn bash_timeout_kills_background_children_too() {
+    let cfg = BashToolConfig {
+        allow: vec![],
+        timeout_seconds: 1,
+        max_output_bytes: 1024,
+    };
+    let started = std::time::Instant::now();
+    // 前台 sleep 撑过超时；后台 sleep 与之同进程组。
+    let out = tools::run_bash("sleep 30 & sleep 30", &cfg, &Cancel::new());
+    assert!(matches!(out.end, tools::BashEnd::TimedOut));
+    assert!(started.elapsed() < Duration::from_secs(10), "elapsed {:?}", started.elapsed());
+}
+
+/// 取消路径与超时同样升级终止进程组。
+#[test]
+fn bash_cancel_terminates_group() {
+    let cfg = BashToolConfig {
+        allow: vec![],
+        timeout_seconds: 30,
+        max_output_bytes: 1024,
+    };
+    let cancel = Cancel::new();
+    let injector = cancel.clone();
     std::thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else { return };
-        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-        let _ = read_request(&mut stream);
-        let _ = stream.write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-        );
-        let _ = stream.write_all(first.as_bytes());
-        let _ = stream.flush();
-        std::thread::sleep(Duration::from_secs(1));
-        let _ = stream.write_all(rest.as_bytes());
-        let _ = stream.flush();
-        let _ = stream.shutdown(Shutdown::Both);
+        std::thread::sleep(Duration::from_millis(200));
+        injector.inject();
     });
-    format!("http://{addr}")
+    let started = std::time::Instant::now();
+    let out = tools::run_bash("sleep 30 & sleep 30", &cfg, &cancel);
+    assert!(matches!(out.end, tools::BashEnd::Cancelled), "end was {:?}", out.end);
+    assert!(started.elapsed() < Duration::from_secs(10), "elapsed {:?}", started.elapsed());
 }
 
 #[test]
@@ -292,13 +500,19 @@ fn ctrl_c_during_stream_cancels_and_discards_partial() {
         sse(&json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] })),
         sse(&json!({ "choices": [{ "delta": { "content": "late" } }] }))
     );
-    let base_url = start_partial_server(first, rest);
-    let path = write_config(&base_url);
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    // 服务端在首块后停顿 1s 再发剩余，保证取消注入落在流式期间。
+    let server = start_custom(move |stream| {
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        );
+        let _ = stream.write_all(first.as_bytes());
+        let _ = stream.flush();
+        std::thread::sleep(Duration::from_secs(1));
+        let _ = stream.write_all(rest.as_bytes());
+        let _ = stream.flush();
+        let _ = stream.shutdown(Shutdown::Both);
+    });
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let injector = cancel.clone();
     std::thread::spawn(move || {
@@ -313,6 +527,23 @@ fn ctrl_c_during_stream_cancels_and_discards_partial() {
     // 未完成的 assistant 响应不进入历史，只保留用户输入。
     assert_eq!(session.history.len(), 1);
     assert!(matches!(&session.history[0], Msg::User(u) if u == "go"));
+}
+
+/// mock 服务器生命周期：stop 后不再接受连接（测试提前失败时也能结束服务线程）。
+#[test]
+fn mock_server_stop_closes_listener() {
+    let server = start_server(vec![text_response("x")]);
+    server.stop();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match TcpStream::connect(server.base_url()) {
+            Err(_) => break,
+            Ok(_) if Instant::now() >= deadline => {
+                panic!("server still accepting connections after stop")
+            }
+            Ok(_) => {}
+        }
+    }
 }
 
 
@@ -345,13 +576,8 @@ fn two_tool_calls_response() -> String {
 
 #[test]
 fn multiple_tool_calls_are_paired_in_order() {
-    let (base_url, bodies) = start_server(vec![two_tool_calls_response(), text_response("ok")]);
-    let path = write_config(&base_url);
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let server = start_server(vec![two_tool_calls_response(), text_response("ok")]);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(
         vec![],
@@ -373,7 +599,7 @@ fn multiple_tool_calls_are_paired_in_order() {
         }
         other => panic!("unexpected {other:?}"),
     }
-    let second: Value = serde_json::from_str(&bodies.lock().unwrap()[1]).unwrap();
+    let second: Value = serde_json::from_str(&server.body(1)).unwrap();
     let messages = second["messages"].as_array().unwrap();
     assert_eq!(messages[2]["tool_call_id"], "call_a");
     assert_eq!(messages[3]["tool_call_id"], "call_b");
@@ -381,13 +607,8 @@ fn multiple_tool_calls_are_paired_in_order() {
 
 #[test]
 fn max_tool_steps_placeholders_remaining_calls() {
-    let (base_url, bodies) = start_server(vec![two_tool_calls_response()]);
-    let path = write_config_extra(&base_url, "max_tool_steps = 1");
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let server = start_server(vec![two_tool_calls_response()]);
+    let mut session = session_for(server.base_url(), "max_tool_steps = 1", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::No]);
 
@@ -406,7 +627,7 @@ fn max_tool_steps_placeholders_remaining_calls() {
         }
         other => panic!("unexpected {other:?}"),
     }
-    assert_eq!(bodies.lock().unwrap().len(), 1);
+    assert_eq!(server.request_count(), 1);
 }
 
 
@@ -433,22 +654,17 @@ fn tool_call_response_with_reasoning() -> String {
 
 #[test]
 fn echo_reasoning_is_serialized_on_next_request() {
-    let (base_url, bodies) = start_server(vec![
+    let server = start_server(vec![
         tool_call_response_with_reasoning(),
         text_response("ok"),
     ]);
-    let path = write_config_full(&base_url, "", "[providers.mock.compat]\necho_reasoning = true");
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let mut session = session_for(server.base_url(), "", "[providers.mock.compat]\necho_reasoning = true");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::No]);
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done));
-    let second: Value = serde_json::from_str(&bodies.lock().unwrap()[1]).unwrap();
+    let second: Value = serde_json::from_str(&server.body(1)).unwrap();
     assert_eq!(second["messages"][1]["reasoning_content"], "think");
 }
 
@@ -459,13 +675,8 @@ fn top_level_error_chunk_is_surfaced() {
         sse(&json!({ "error": { "message": "boom" } })),
         "data: [DONE]\n\n"
     );
-    let (base_url, _bodies) = start_server(vec![response]);
-    let path = write_config(&base_url);
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let server = start_server(vec![response]);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![]);
 
@@ -483,13 +694,8 @@ fn truncated_finish_reason_is_error() {
         "choices": [{ "delta": {}, "finish_reason": "length" }]
     })));
     response.push_str("data: [DONE]\n\n");
-    let (base_url, _bodies) = start_server(vec![response]);
-    let path = write_config(&base_url);
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let server = start_server(vec![response]);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![]);
 
@@ -506,13 +712,8 @@ fn done_without_trailing_newline_is_accepted() {
         sse(&json!({ "choices": [{ "delta": { "content": "ok" } }] })),
         sse(&json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] }))
     );
-    let (base_url, _bodies) = start_server(vec![response]);
-    let path = write_config(&base_url);
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let server = start_server(vec![response]);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![]);
 
@@ -542,13 +743,8 @@ fn unknown_tool_response() -> String {
 
 #[test]
 fn unknown_tool_result_is_rendered() {
-    let (base_url, _bodies) = start_server(vec![unknown_tool_response(), text_response("ok")]);
-    let path = write_config(&base_url);
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let server = start_server(vec![unknown_tool_response(), text_response("ok")]);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![]);
 
@@ -586,13 +782,8 @@ fn bash_large_output_is_truncated_once_with_accurate_count() {
 
 #[test]
 fn repl_adds_line_break_after_done_response() {
-    let (base_url, _bodies) = start_server(vec![text_response("one line")]);
-    let path = write_config(&base_url);
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let session = Session::new(cfg, selection, adapter, false);
+    let server = start_server(vec![text_response("one line")]);
+    let session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(
         vec![ReadOutcome::Line("go".into()), ReadOutcome::Line("/exit".into())],
@@ -629,13 +820,8 @@ fn line_break_is_rendered_between_reasoning_and_text() {
     })));
     response.push_str("data: [DONE]\n\n");
 
-    let (base_url, _bodies) = start_server(vec![response]);
-    let path = write_config(&base_url);
-    let cfg = config::load(&Some(path.clone())).unwrap();
-    let _ = std::fs::remove_file(path);
-    let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
-    let adapter = provider::adapter_for(&selection.provider).unwrap();
-    let mut session = Session::new(cfg, selection, adapter, false);
+    let server = start_server(vec![response]);
+    let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![]);
 

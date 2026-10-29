@@ -121,14 +121,21 @@ pub fn load(path: &Option<String>) -> Result<Config, String> {
 fn load_file(path: &str) -> Result<Config, String> {
     let source = std::fs::read_to_string(path)
         .map_err(|e| format!("无法读取配置文件 {path}：{e}"))?;
-    load_source(&source, path)
+    // 报错文案带文件路径而非通用标签。
+    parse_and_validate(&source, path)
 }
 
 fn load_builtin() -> Result<Config, String> {
-    load_source(include_str!("default.toml"), "<内置默认配置>")
+    parse_and_validate(include_str!("default.toml"), "<内置默认配置>")
 }
 
-fn load_source(source: &str, label: &str) -> Result<Config, String> {
+/// 从 TOML 字符串构建已验证的 Config（测试入口：无需临时文件）。
+/// `label` 仅用于报错文案。
+pub fn load_str(source: &str, label: &str) -> Result<Config, String> {
+    parse_and_validate(source, label)
+}
+
+fn parse_and_validate(source: &str, label: &str) -> Result<Config, String> {
     let cfg: Config = toml::from_str(source).map_err(|e| {
         let line = e
             .span()
@@ -141,13 +148,7 @@ fn load_source(source: &str, label: &str) -> Result<Config, String> {
     })?;
     // 明文密钥告警在加载时统一扫描一次，选择/切换阶段不再重复打印。
     for (_, provider) in providers_in_order(&cfg) {
-        let pairs: Vec<(String, String)> = provider
-            .auth
-            .headers
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        warn_plaintext_secrets(&pairs);
+        warn_plaintext_secrets(&header_pairs(provider));
     }
     match validate(&cfg) {
         Ok(()) => Ok(cfg),
@@ -155,11 +156,7 @@ fn load_source(source: &str, label: &str) -> Result<Config, String> {
             let mut msg = format!("配置校验失败 {label}：");
             for e in errs {
                 msg.push('\n');
-                if let Some(line) = e.line {
-                    msg.push_str(&format!("  - {}（第 {} 行）：{}", e.path, line, e.message));
-                } else {
-                    msg.push_str(&format!("  - {}：{}", e.path, e.message));
-                }
+                msg.push_str(&format!("  - {}：{}", e.path, e.message));
             }
             Err(msg)
         }
@@ -180,21 +177,24 @@ pub fn first_model_for<'a>(cfg: &'a Config, provider_id: &str) -> Option<(&'a St
         .find(|(id, _)| model_provider_prefix(id) == Some(provider_id))
 }
 
-fn expand_provider(provider: &Provider) -> Result<Provider, String> {
-    let pairs: Vec<(String, String)> = provider
+fn header_pairs(provider: &Provider) -> Vec<(String, String)> {
+    provider
         .auth
         .headers
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let expanded = expand_headers(&pairs)?;
+        .collect()
+}
+
+fn expand_provider(provider: &Provider) -> Result<Provider, String> {
+    let expanded = expand_headers(&header_pairs(provider))?;
     let mut out = provider.clone();
     out.auth.headers = expanded.into_iter().collect();
     Ok(out)
 }
 
 fn provider_unavailable(id: &str, err: String) -> String {
-    format!("供应商 {id} 不可用：认证变量缺失或无效（{err}）")
+    format!("供应商 {id} 不可用：{err}")
 }
 
 /// 供应商是否可用（已声明且认证变量齐全）。REPL /provider 列表标注用。
@@ -303,6 +303,22 @@ pub fn resolve_selection(
 /// 查找辅助（供 resolve_selection / REPL 切换复用）。
 pub fn find_provider<'a>(cfg: &'a Config, id: &str) -> Option<&'a Provider> {
     cfg.providers.get(id)
+}
+
+/// thinking 档位合法性判定：None = 合法；Some(错误文案) = 非法。
+/// CLI（--thinking，exit 2）与 REPL（/thinking，展示错误）共用此判定，避免规则分叉。
+pub fn thinking_level_err(model: &Model, model_id: &str, level: &str) -> Option<String> {
+    let levels: Vec<&str> = model.thinking.keys().map(String::as_str).collect();
+    if levels.is_empty() {
+        return Some(format!("模型 {model_id} 未声明思考档位"));
+    }
+    if !model.thinking.contains_key(level) {
+        return Some(format!(
+            "无效思考档位 `{level}`（模型 {model_id}）；可选：{}",
+            levels.join(", ")
+        ));
+    }
+    None
 }
 
 pub fn find_model<'a>(cfg: &'a Config, id: &str) -> Option<&'a Model> {

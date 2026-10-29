@@ -1,17 +1,16 @@
-//! 配置严格校验：悬空引用、前缀对应、必填字段；一次报全部，带 TOML 位置。
+//! 配置严格校验：悬空引用、前缀对应、必填字段；一次收集并报告全部错误。
 
 use super::{find_model, find_provider, model_provider_prefix, Config};
 
-/// 单条校验错误（带位置信息，供一次报出）。
+/// 单条校验错误。语义错误只到字段路径级；TOML 语法错误才带行号。
 #[derive(Debug)]
 pub struct ValidationError {
     pub path: String, // 如 providers.deepseek.protocol
-    pub line: Option<usize>,
     pub message: String,
 }
 
 fn err(path: impl Into<String>, message: impl Into<String>) -> ValidationError {
-    ValidationError { path: path.into(), line: None, message: message.into() }
+    ValidationError { path: path.into(), message: message.into() }
 }
 
 /// 收集全部校验错误（不首个即停）：

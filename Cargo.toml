@@ -2,7 +2,6 @@
 name = "rho"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
 description = "Lightweight local agent REPL for resource-constrained devices"
 license = "MIT"
 
@@ -30,7 +29,9 @@ libc = "0.2"
 unicode-width = "0.1"
 
 [dev-dependencies]
-indexmap = { version = "2.7", features = ["serde"] }
+# PTY 集成测试：终端模拟 + 屏幕网格断言（仅测试用，不进发布产物）
+portable-pty = "0.9"
+vt100 = "0.18"
 
 [profile.release]
 opt-level = "z"

@@ -1,7 +1,7 @@
-//! OpenAI Chat Completions 适配器。见 docs/architecture.md 四节。
+//! OpenAI Chat Completions 适配器：请求体组装、流式 chunk 解析、finish_reason 记录。
 
 use super::{ProviderAdapter, StreamEvent, TurnAcc};
-use crate::chat::Msg;
+use crate::chat::{AssistantMsg, Msg};
 use crate::config::{Model, Provider};
 use serde_json::{json, Map, Value};
 
@@ -25,7 +25,7 @@ impl ProviderAdapter for OpenAiChatAdapter {
     fn build_body(
         &self,
         hist: &[Msg],
-        _model: &Model,
+        model: &Model,
         model_id: &str,
         thinking: Option<&Value>,
     ) -> Value {
@@ -34,7 +34,8 @@ impl ProviderAdapter for OpenAiChatAdapter {
             .map(|m| match m {
                 Msg::System(text) => json!({ "role": "system", "content": text }),
                 Msg::User(text) => json!({ "role": "user", "content": text }),
-                Msg::Assistant { text, reasoning, tool_calls } => {
+                Msg::Assistant(a) => {
+                    let AssistantMsg { text, reasoning, tool_calls } = a;
                     let mut obj = Map::new();
                     obj.insert("role".into(), json!("assistant"));
                     obj.insert(
@@ -70,7 +71,7 @@ impl ProviderAdapter for OpenAiChatAdapter {
             })
             .collect();
 
-        let model_name = _model
+        let model_name = model
             .api_model
             .clone()
             .unwrap_or_else(|| model_id.split_once('/').map(|(_, m)| m).unwrap_or(model_id).to_string());
@@ -79,6 +80,8 @@ impl ProviderAdapter for OpenAiChatAdapter {
             "model": model_name,
             "messages": messages,
             "stream": true,
+            // 模型声明的输出上限直接编进请求，避免上游超长回复。
+            "max_tokens": model.max_output,
             "tools": [{
                 "type": "function",
                 "function": {
@@ -122,15 +125,11 @@ impl ProviderAdapter for OpenAiChatAdapter {
         out
     }
 
-    fn parse_chunk(&self, chunk: &Value, acc: &mut TurnAcc) -> Vec<StreamEvent> {
-        let mut out = Vec::new();
-        let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
-            // 只带 usage 的尾 chunk 也可能没有 choices。
-            if let Some(usage) = usage_event(chunk) {
-                out.push(usage);
-            }
-            return out;
-        };
+    /// 解析单个 chunk：累积进 acc；有 text/reasoning 增量时返回 Delta 事件。
+    /// tool_calls 的组装只进 acc（不产生事件）；请求从不设置 n，choices 实际只有一条。
+    fn parse_chunk(&self, chunk: &Value, acc: &mut TurnAcc) -> Option<StreamEvent> {
+        let choices = chunk.get("choices")?.as_array()?;
+        let mut delta_event = None;
 
         for (pos, choice) in choices.iter().enumerate() {
             if let Some(delta) = choice.get("delta").and_then(Value::as_object) {
@@ -152,7 +151,7 @@ impl ProviderAdapter for OpenAiChatAdapter {
                     if let Some(r) = &reasoning {
                         acc.reasoning.get_or_insert_with(String::new).push_str(r);
                     }
-                    out.push(StreamEvent::Delta { text, reasoning });
+                    delta_event = Some(StreamEvent::Delta { text, reasoning });
                 }
 
                 if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -179,18 +178,12 @@ impl ProviderAdapter for OpenAiChatAdapter {
                             .unwrap_or("");
                         let slot = acc.tool_calls.entry(index).or_default();
                         if let Some(id) = &id {
-                            slot.0 = Some(id.clone());
+                            slot.id = Some(id.clone());
                         }
                         if let Some(name) = &name {
-                            slot.1 = Some(name.clone());
+                            slot.name = Some(name.clone());
                         }
-                        slot.2.push_str(args_frag);
-                        out.push(StreamEvent::ToolDelta {
-                            index,
-                            id,
-                            name,
-                            args_frag: args_frag.to_string(),
-                        });
+                        slot.arguments.push_str(args_frag);
                     }
                 }
             }
@@ -200,21 +193,8 @@ impl ProviderAdapter for OpenAiChatAdapter {
             }
         }
 
-        if let Some(usage) = usage_event(chunk) {
-            out.push(usage);
-        }
-        out
+        delta_event
     }
-}
-
-fn usage_event(chunk: &Value) -> Option<StreamEvent> {
-    let usage = chunk.get("usage")?.as_object()?;
-    let prompt = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
-    let completion = usage
-        .get("completion_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    Some(StreamEvent::Usage { prompt, completion })
 }
 
 /// thinking 片段顶层合并（对象浅合并；片段须为对象，否则配置校验报错）。
@@ -259,17 +239,18 @@ mod tests {
         let hist = vec![
             Msg::System("s".into()),
             Msg::User("u".into()),
-            Msg::Assistant {
+            Msg::Assistant(AssistantMsg {
                 text: Some("t".into()),
                 reasoning: Some("r".into()),
                 tool_calls: vec![],
-            },
+            }),
             Msg::Tool { tool_call_id: "id".into(), content: "ok".into() },
         ];
         let thinking = json!({ "thinking": { "type": "enabled" } });
         let body = a.build_body(&hist, &model, "p/m", Some(&thinking));
         assert_eq!(body["model"], "m");
         assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], 1);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["messages"][2]["reasoning_content"], "r");
         assert!(body["tools"].is_array());
@@ -292,9 +273,8 @@ mod tests {
                 }
             }]
         });
-        let events = a.parse_chunk(&chunk, &mut acc);
-        assert!(matches!(events[0], StreamEvent::Delta { .. }));
-        assert!(matches!(events[1], StreamEvent::ToolDelta { .. }));
+        let ev = a.parse_chunk(&chunk, &mut acc);
+        assert!(matches!(ev, Some(StreamEvent::Delta { .. })));
 
         let next = json!({
             "choices": [{
@@ -307,17 +287,13 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let events = a.parse_chunk(&next, &mut acc);
-        assert!(!events.iter().any(|e| matches!(e, StreamEvent::Done { .. })));
+        // tool_calls 片段只累积进 acc，不产生事件。
+        assert!(a.parse_chunk(&next, &mut acc).is_none());
         assert_eq!(acc.finish_reason.as_deref(), Some("tool_calls"));
-        match acc.into_msg() {
-            Msg::Assistant { text, reasoning, tool_calls } => {
-                assert_eq!(text.as_deref(), Some("hi"));
-                assert_eq!(reasoning.as_deref(), Some("think"));
-                assert_eq!(tool_calls.len(), 1);
-                assert_eq!(tool_calls[0].arguments, "{\"command\":\"ls\"}");
-            }
-            other => panic!("unexpected {other:?}"),
-        }
+        let msg = acc.into_msg();
+        assert_eq!(msg.text.as_deref(), Some("hi"));
+        assert_eq!(msg.reasoning.as_deref(), Some("think"));
+        assert_eq!(msg.tool_calls.len(), 1);
+        assert_eq!(msg.tool_calls[0].arguments, "{\"command\":\"ls\"}");
     }
 }

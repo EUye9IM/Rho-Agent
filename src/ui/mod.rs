@@ -1,33 +1,27 @@
 //! 用户交互抽象：Ui trait + 生产实现 TermUi + 测试实现 ScriptedUi。
-//! Ui 不承载退出语义（退出由 REPL 层判定）。见 docs/architecture.md 三节。
+//! Ui 不承载退出语义（退出由 REPL 层判定）；灰提示子系统在 `hint` 子模块。
+
+mod hint;
+mod scripted;
+
+pub use hint::CTRL_C_WINDOW;
+pub use scripted::ScriptedUi;
 
 use crate::render::{self, RenderEvent};
-use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::fmt;
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 use unicode_width::UnicodeWidthStr;
 
-use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
-use rustyline::validate::Validator;
 use rustyline::{
-    Cmd, ConditionalEventHandler, Context, Editor, Event, EventContext, EventHandler, Helper,
-    KeyEvent, Modifiers, RepeatCount,
+    Cmd, ConditionalEventHandler, Event, EventContext, EventHandler, KeyEvent, Modifiers,
+    RepeatCount,
 };
 
-/// 提示符下 Ctrl-C 双按窗口：两次空行 Ctrl-C 间隔小于它才退出。
-/// `repl` 用同一个常量判定退出，`TermUi` 用它到期撤掉灰提示。
-pub const CTRL_C_WINDOW: Duration = Duration::from_secs(2);
-
-/// 第一次空行 Ctrl-C 后在提示符行尾显示的灰色提示。
-const CTRL_C_HINT: &str = "再按一次 Ctrl-C 退出";
+use hint::{HintArm, HintHelper};
 
 /// 提示符。宽度按字节数算（纯 ASCII）。
 const PROMPT: &str = "rho> ";
@@ -49,7 +43,7 @@ fn prompt_rows(width: usize, cols: usize) -> usize {
 
 /// 终端列数（取 stdout 窗口尺寸）；拿不到时按 80 列算。
 fn terminal_cols() -> usize {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let mut ws = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
     // SAFETY: ws 是合法的 winsize 可写缓冲区，fd 是常量 stdout。
     if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
     {
@@ -57,12 +51,6 @@ fn terminal_cols() -> usize {
     } else {
         80
     }
-}
-
-/// 到期后是否该擦掉灰提示：只有提示确实画在一个空输入行上、且终端在本次
-/// `readline` 内时才动手（否则可能擦掉别人的行）。
-fn should_erase_hint(out_tty: bool, reading: bool, line_empty: bool) -> bool {
-    out_tty && reading && line_empty
 }
 
 /// 读取一行输入的结果。
@@ -142,168 +130,6 @@ impl ConditionalEventHandler for CtrlCHandler {
     }
 }
 
-/// Ctrl-C 灰提示的共享状态：主线程武装/撤销，期限线程到期擦掉提示。
-struct HintArm {
-    armed: AtomicBool,
-    /// 当前提示行是否为空（`Hinter` 每次重绘时更新）。
-    line_empty: AtomicBool,
-    /// 灰提示是否包含在最后一次 `refresh` 的布局里（`Hinter` 每次重绘时更新）。
-    /// 语义是“布局”而非“像素”：到期擦除只动屏幕、不动 rustyline 缓存的 layout，
-    /// 下次 `Cmd::Interrupt` 的 `move_cursor_to_end` 仍会把光标移到含提示的 `layout.end`，
-    /// 所以不能因到期擦除而清零，否则回收会少上移一行。
-    layout_hint: AtomicBool,
-    /// 是否处于 `readline` 期间：期限线程只在此时动终端。
-    reading: AtomicBool,
-    /// stdout 是否 TTY：非 TTY 时不写光标控制序列。
-    out_tty: bool,
-    deadline: Mutex<Option<Instant>>,
-    ready: Condvar,
-}
-
-impl HintArm {
-    fn new(out_tty: bool) -> Self {
-        Self {
-            armed: AtomicBool::new(false),
-            line_empty: AtomicBool::new(false),
-            layout_hint: AtomicBool::new(false),
-            reading: AtomicBool::new(false),
-            out_tty,
-            deadline: Mutex::new(None),
-            ready: Condvar::new(),
-        }
-    }
-
-    fn lock(&self) -> MutexGuard<'_, Option<Instant>> {
-        self.deadline.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn wait<'a>(&self, guard: MutexGuard<'a, Option<Instant>>) -> MutexGuard<'a, Option<Instant>> {
-        self.ready.wait(guard).unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn wait_timeout<'a>(
-        &self,
-        guard: MutexGuard<'a, Option<Instant>>,
-        dur: Duration,
-    ) -> MutexGuard<'a, Option<Instant>> {
-        self.ready
-            .wait_timeout(guard, dur)
-            .unwrap_or_else(|e| e.into_inner())
-            .0
-    }
-
-    fn arm(&self, window: Duration) {
-        let mut deadline = self.lock();
-        *deadline = Some(Instant::now() + window);
-        self.armed.store(true, Ordering::SeqCst);
-        drop(deadline);
-        self.ready.notify_all();
-    }
-
-    fn disarm(&self) {
-        let mut deadline = self.lock();
-        *deadline = None;
-        self.armed.store(false, Ordering::SeqCst);
-        drop(deadline);
-        self.ready.notify_all();
-    }
-
-    fn armed(&self) -> bool {
-        self.armed.load(Ordering::SeqCst)
-    }
-
-    /// 到期是否该擦提示（判定见 `should_erase_hint`）。
-    fn can_erase(&self) -> bool {
-        should_erase_hint(
-            self.out_tty,
-            self.reading.load(Ordering::SeqCst),
-            self.line_empty.load(Ordering::SeqCst),
-        )
-    }
-
-    /// 最后一次 `refresh` 的布局里是否包含灰提示（由 `Hinter` 每次重绘时更新）。
-    /// `refresh_line_with_msg`（空行回车 / Ctrl-D）不调 `hint()`，标志可能短时残留；
-    /// 但 `reclaim_width` 只在 `Interrupted` 里快照，那时本次 `readline` 的首个
-    /// `refresh_line` 已经重算过一遍，所以不会用到残留值。
-    fn mark_layout_hint(&self, shown: bool) {
-        self.layout_hint.store(shown, Ordering::SeqCst);
-    }
-
-    fn take_layout_hint(&self) -> bool {
-        self.layout_hint.swap(false, Ordering::SeqCst)
-    }
-
-    /// 擦掉光标右侧的灰提示。不移动光标，因此 rustyline 的位置模型（提示符末尾、
-    /// 输入行为空）保持不变，下一次重绘自然接上。
-    /// 用“擦到屏幕末尾”而不是 `\x1b[K`：窄终端下提示会换到下一行，光标却在提示符行，
-    /// 只擦当前行会留下下一行的尾巴。
-    fn erase_hint(&self) {
-        let mut out = std::io::stdout();
-        let _ = out.write_all(b"\x1b[J").and_then(|()| out.flush());
-    }
-}
-
-/// rustyline helper：只在武装窗口内的空行上给出灰色提示。
-struct HintHelper {
-    hint: Arc<HintArm>,
-}
-
-impl Completer for HintHelper {
-    type Candidate = String;
-}
-
-impl Hinter for HintHelper {
-    type Hint = String;
-
-    fn hint(&self, line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
-        let empty = line.is_empty();
-        let show = empty && self.hint.armed();
-        self.hint.line_empty.store(empty, Ordering::SeqCst);
-        self.hint.mark_layout_hint(show);
-        show.then(|| CTRL_C_HINT.to_string())
-    }
-}
-
-impl Highlighter for HintHelper {
-    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-        Cow::Owned(render::dim(hint))
-    }
-}
-
-impl Validator for HintHelper {}
-impl Helper for HintHelper {}
-
-/// 提示期限线程：到点撤销武装并擦掉灰提示。
-/// rustyline 只在按键时重绘，从别的线程推动整行重绘会把提示符顶到下一行（留一行空白），
-/// 所以这里只从光标位置擦到屏幕末尾：不移动光标，与 rustyline 的位置模型不冲突
-/// （到期时光标在提示符行末尾，提示符块是最后一段输出）。
-/// 这是尽力而为的擦除：`can_erase` 判定与写入之间主线程可能已经开始重绘，两个方向
-/// （没擦干净 / 擦掉了刚画出的新提示）都可能发生，下一次按键重绘会自愈。
-fn hint_timer(arm: Arc<HintArm>) {
-    let mut guard = arm.lock();
-    loop {
-        match *guard {
-            None => guard = arm.wait(guard),
-            Some(deadline) => {
-                let now = Instant::now();
-                if now < deadline {
-                    guard = arm.wait_timeout(guard, deadline - now);
-                } else {
-                    *guard = None;
-                    arm.armed.store(false, Ordering::SeqCst);
-                    let erase = arm.can_erase();
-                    // 不持锁做 I/O：主线程的武装/撤销要能立刻拿到锁。
-                    drop(guard);
-                    if erase {
-                        arm.erase_hint();
-                    }
-                    guard = arm.lock();
-                }
-            }
-        }
-    }
-}
-
 /// 生产实现：rustyline 后端。
 ///
 /// - `stdin 非 TTY 拒绝启动`的检查在 `TermUi::new` 里做
@@ -316,7 +142,7 @@ fn hint_timer(arm: Arc<HintArm>) {
 /// - 每次 `readline` 收尾都会被 rustyline 的换行钉死一行（输入长时多行）：Ctrl-C 后
 ///   下一次读取前把这些行收回重用，输入过的内容也一并清掉，不另起新行
 pub struct TermUi {
-    editor: Editor<HintHelper, DefaultHistory>,
+    editor: Editor,
     line_empty: Arc<AtomicBool>,
     line_width: Arc<AtomicUsize>,
     hint: Arc<HintArm>,
@@ -325,6 +151,8 @@ pub struct TermUi {
     reclaim_width: Option<usize>,
 }
 
+type Editor = rustyline::Editor<HintHelper, DefaultHistory>;
+
 impl TermUi {
     pub fn new() -> Result<Self, TermUiInitError> {
         if !std::io::stdin().is_terminal() {
@@ -332,12 +160,12 @@ impl TermUi {
                 "stdin 不是 TTY，rho 只支持交互式 REPL".into(),
             ));
         }
-        let mut editor: Editor<HintHelper, DefaultHistory> =
-            Editor::new().map_err(|e| TermUiInitError::Init(format!("初始化终端失败：{e}")))?;
+        let mut editor: Editor =
+            rustyline::Editor::new().map_err(|e| TermUiInitError::Init(format!("初始化终端失败：{e}")))?;
         let line_empty = Arc::new(AtomicBool::new(false));
         let line_width = Arc::new(AtomicUsize::new(0));
         let hint = Arc::new(HintArm::new(std::io::stdout().is_terminal()));
-        editor.set_helper(Some(HintHelper { hint: hint.clone() }));
+        editor.set_helper(Some(HintHelper::new(hint.clone())));
         editor.bind_sequence(
             KeyEvent::new('\x03', Modifiers::NONE),
             EventHandler::Conditional(Box::new(CtrlCHandler {
@@ -348,7 +176,7 @@ impl TermUi {
         let thread_hint = hint.clone();
         std::thread::Builder::new()
             .name("rho-hint".into())
-            .spawn(move || hint_timer(thread_hint))
+            .spawn(move || hint::hint_timer(thread_hint))
             .map_err(|e| TermUiInitError::Init(format!("启动提示期限线程失败：{e}")))?;
         Ok(Self {
             editor,
@@ -379,7 +207,7 @@ impl TermUi {
             return;
         }
         let hint_width = if self.hint.take_layout_hint() {
-            CTRL_C_HINT.width()
+            hint::CTRL_C_HINT.width()
         } else {
             0
         };
@@ -401,7 +229,7 @@ impl TermUi {
 impl Ui for TermUi {
     fn read_line(&mut self) -> ReadOutcome {
         self.reclaim_prompt_rows();
-        self.hint.reading.store(true, Ordering::SeqCst);
+        self.hint.set_reading(true);
         let outcome = match self.editor.readline(PROMPT) {
             Ok(line) => ReadOutcome::Line(line),
             Err(ReadlineError::Interrupted) => {
@@ -417,16 +245,20 @@ impl Ui for TermUi {
                 ReadOutcome::Eof
             }
         };
-        self.hint.reading.store(false, Ordering::SeqCst);
+        self.hint.set_reading(false);
         outcome
     }
 
     fn confirm(&mut self, cwd: &str, cmd: &str) -> ConfirmOutcome {
-        print!(
-            "\n当前目录：{cwd}\n将执行 bash：\n  {cmd}\n执行？[y/N] "
-        );
-        let mut out = std::io::stdout();
-        if let Err(e) = out.flush() {
+        let result = (|| -> std::io::Result<()> {
+            let mut out = std::io::stdout().lock();
+            write!(
+                out,
+                "\n当前目录：{cwd}\n将执行 bash：\n  {cmd}\n执行？[y/N] "
+            )?;
+            out.flush()
+        })();
+        if let Err(e) = result {
             self.set_fatal(format!("渲染输出失败：{e}"));
             return ConfirmOutcome::No;
         }
@@ -459,7 +291,11 @@ impl Ui for TermUi {
                 }
                 RenderEvent::Error(msg) => {
                     out.flush()?;
-                    eprintln!("错误：{msg}");
+                    // 错误走 stderr（与渲染流分离）；写失败与渲染同路径进 fatal，
+                    // 不用可能 panic 的 eprintln!。
+                    let mut err = std::io::stderr().lock();
+                    writeln!(err, "错误：{msg}")?;
+                    err.flush()?;
                 }
             }
             out.flush()
@@ -488,6 +324,7 @@ impl Drop for TermUi {
         // 前提：中断到 drop 之间没有其他输出，否则上移落点会比块首低一行，
         // 既留下块首行、又擦掉中间那段输出。
         self.reclaim_prompt_rows();
+        self.hint.stop();
     }
 }
 
@@ -517,52 +354,6 @@ fn read_confirm_line() -> std::io::Result<Option<String>> {
     Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-/// 测试实现：预排输入 + 预排确认 + 收集渲染事件。
-/// 驱动 repl → agent loop → tools 全链路，无网络无 TTY。
-pub struct ScriptedUi {
-    pub inputs: VecDeque<ReadOutcome>,
-    pub confirms: VecDeque<ConfirmOutcome>,
-    pub rendered: Vec<RenderEvent>,
-    /// 灰提示武装序列（`set_ctrl_c_hint` 的调用值，按顺序）。
-    pub hints: Vec<bool>,
-}
-
-impl ScriptedUi {
-    pub fn new(inputs: Vec<ReadOutcome>, confirms: Vec<ConfirmOutcome>) -> Self {
-        Self {
-            inputs: inputs.into(),
-            confirms: confirms.into(),
-            rendered: Vec::new(),
-            hints: Vec::new(),
-        }
-    }
-}
-
-impl Ui for ScriptedUi {
-    fn read_line(&mut self) -> ReadOutcome {
-        self.inputs.pop_front().unwrap_or(ReadOutcome::Eof)
-    }
-
-    fn confirm(&mut self, _cwd: &str, _cmd: &str) -> ConfirmOutcome {
-        self.confirms.pop_front().unwrap_or(ConfirmOutcome::No)
-    }
-
-    fn print(&mut self, ev: &RenderEvent) {
-        self.rendered.push(match ev {
-            RenderEvent::ReasoningDelta(s) => RenderEvent::ReasoningDelta(s.clone()),
-            RenderEvent::TextDelta(s) => RenderEvent::TextDelta(s.clone()),
-            RenderEvent::LineBreak => RenderEvent::LineBreak,
-            RenderEvent::ToolCall(s) => RenderEvent::ToolCall(s.clone()),
-            RenderEvent::ToolResult(s) => RenderEvent::ToolResult(s.clone()),
-            RenderEvent::Error(s) => RenderEvent::Error(s.clone()),
-        });
-    }
-
-    fn set_ctrl_c_hint(&mut self, armed: bool) {
-        self.hints.push(armed);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,18 +375,10 @@ mod tests {
 
     #[test]
     fn prompt_rows_counts_hint_on_narrow_terminals() {
-        let with_hint = PROMPT.len() + CTRL_C_HINT.width();
+        let with_hint = PROMPT.len() + hint::CTRL_C_HINT.width();
         // 80 列下多出来的灰提示仍在一行内。
         assert_eq!(prompt_rows(with_hint, 80), 1);
         // 窄于提示 + 提示符总宽时占两行：回收必须上移两行，否则会留残影。
         assert_eq!(prompt_rows(with_hint, with_hint - 1), 2);
-    }
-
-    #[test]
-    fn hint_erase_needs_tty_readline_and_empty_line() {
-        assert!(should_erase_hint(true, true, true));
-        assert!(!should_erase_hint(false, true, true));
-        assert!(!should_erase_hint(true, false, true));
-        assert!(!should_erase_hint(true, true, false));
     }
 }
