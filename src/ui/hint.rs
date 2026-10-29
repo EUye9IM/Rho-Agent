@@ -1,5 +1,5 @@
 //! Ctrl-C 双按灰提示子系统：武装窗口常量、Hinter/高亮、期限线程与到期擦除。
-//! 由 `TermUi`（ui 模块）组装；擦除与行回收语义见 docs/architecture.md 三节。
+//! 由 `TermUi`（ui 模块）组装；只负责提示的显示与到期擦除，行回收由 TermUi 处理。
 
 use crate::render;
 use std::borrow::Cow;

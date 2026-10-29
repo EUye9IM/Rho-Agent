@@ -1,4 +1,4 @@
-//! 内部消息模型与 agent 工具循环。见 docs/architecture.md 三/四节。
+//! 内部消息模型与 agent 工具循环：历史、流接收、工具批次执行。
 
 use crate::config::{self, Config, Provider, Selection};
 use crate::provider::{self, ProviderAdapter, StreamEvent};
@@ -59,7 +59,7 @@ pub struct ToolCall {
 }
 
 /// 一次流式请求的启动边界：生产实现起 worker 线程跑真实 HTTP；
-/// 测试实现注入预编排事件序列（无网络）。见 docs/architecture.md 七节。
+/// 测试实现注入预编排事件序列（无网络）。
 pub trait StreamLauncher: Send + Sync {
     fn launch(
         &self,
@@ -71,7 +71,7 @@ pub trait StreamLauncher: Send + Sync {
     ) -> Receiver<StreamEvent>;
 }
 
-/// 生产实现：每轮请求一个工作线程（docs/architecture.md 五节）。
+/// 生产实现：每轮请求一个工作线程。
 struct WorkerLauncher;
 
 impl StreamLauncher for WorkerLauncher {
@@ -210,7 +210,7 @@ impl Session {
         )
     }
 
-    /// agent 工具循环（docs/architecture.md 四节）。
+    /// agent 工具循环。
     /// 编排：发起请求并接收流（`receive_stream`）→ 无工具调用即收束；
     /// 有则交 `run_tool_calls` 执行，全部执行完带上结果继续请求。
     pub fn turn(&mut self, ui: &mut dyn Ui, cancel: &Cancel, input: &str) -> ChatResult<TurnEnd> {
@@ -286,7 +286,7 @@ impl Session {
     }
 
     /// 发起一次流式请求并接收事件：渲染增量、逐块取消判定都在这里。
-    /// 契约见 docs/architecture.md 四节接收循环。
+    /// 契约：worker 必经 Final 或 Error 收尾；收到终态或取消后返回。
     fn receive_stream(&self, ui: &mut dyn Ui, cancel: &Cancel) -> StreamOutcome {
         let body = self.build_body();
         let provider = self.selection.provider.clone();
@@ -365,7 +365,7 @@ impl Session {
     }
 
     /// 执行一批 tool_calls：每个执行前先查限额与取消标志；全部执行完返回 Done。
-    /// 任何返回路径都保证剩余调用已补占位（docs/architecture.md 四节配对不变式）。
+    /// 任何返回路径都保证剩余调用已补占位：Assistant 的每个 tool_call 都有对应 Tool 消息。
     /// 结果写入与计数集中在 commit_call_result：单调用分支再多也不会漏掉历史配对。
     fn run_tool_calls(
         &mut self,

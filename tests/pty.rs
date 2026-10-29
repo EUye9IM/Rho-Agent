@@ -1,6 +1,6 @@
 //! PTY 集成测试：真实终端（openpty）+ 真实 rho 二进制 + 真实 SIGINT 信号路径。
 //!
-//! 覆盖此前只能手工验收的链路（docs/architecture.md 七节）：
+//! 覆盖此前只能手工验收的链路：
 //! - 信号到记录：on_sigint → self-pipe → rho-sigint 线程 → Cancel（inject()
 //!   绕过这段，这里是唯一自动化覆盖）
 //! - 终端行为：灰提示出现/到期擦除、Ctrl-C 行回收、rustyline 按键路径
@@ -10,7 +10,7 @@
 //! 这类语义本身带时间的用例除外，不用固定 sleep 对齐时序。
 //!
 //! 已知竞态（macOS 实测）：行回收后的新提示符与下一个字节的输入窗口存在
-//! 毫秒级竞态——提示符出现后立即写入的首个字节可能丢失（详见 maintainability-review）。
+//! 毫秒级竞态——提示符出现后立即写入的首个字节可能丢失。
 //! 人类敲键延迟（~100ms）撞不上该窗口；用例统一在提示符后稳定 50ms 再发输入。
 
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};

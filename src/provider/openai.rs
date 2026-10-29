@@ -1,4 +1,4 @@
-//! OpenAI Chat Completions 适配器。见 docs/architecture.md 四节。
+//! OpenAI Chat Completions 适配器：请求体组装、流式 chunk 解析、finish_reason 记录。
 
 use super::{ProviderAdapter, StreamEvent, TurnAcc};
 use crate::chat::{AssistantMsg, Msg};

@@ -1,5 +1,5 @@
 //! bash 工具执行：进程组 spawn、超时升级、双 drain 管道、两段截断、
-//! allowlist + 元字符判定。见 docs/architecture.md 四、五节。
+//! allowlist + 元字符判定。
 
 use crate::config::BashToolConfig;
 use crate::term::{self, Cancel, SignalState};
@@ -36,7 +36,7 @@ pub enum BashEnd {
     /// waitpid 失败（回收错误，与信号退出区分：后者是 Exited 的负值）
     ReapFailed(String),
     /// quit 已请求：工具等待循环只终止进程组，把 quit 上报 agent loop，
-    /// 不自行退出（docs/architecture.md 五节）
+    /// 不自行退出
     QuitRequested,
 }
 
@@ -59,7 +59,7 @@ pub fn allowed(command: &str, allow: &[String]) -> bool {
 
 /// 执行 `bash -c <command>`（前台，工作目录恒为会话 cwd = 进程启动目录）。
 ///
-/// 线程模型（docs/architecture.md 五节）：
+/// 线程模型：
 /// - setsid 建进程组；stdout/stderr 各一个 drain 线程，两段截断缓冲
 /// - 主线程是唯一 reaper（waitpid 只在此处）；退出状态存共享标志
 /// - drain 观察到退出 → 有界收尾读取（短超时）→ 自行退出并关自己的读端
@@ -139,7 +139,7 @@ pub fn run_bash(command: &str, tool_cfg: &BashToolConfig, cancel: &Cancel) -> Ba
             break match sig {
                 SignalState::Cancel => BashEnd::Cancelled,
                 // quit（第二次 Ctrl-C）：只终止进程组并返回给 agent loop，
-                // 不自行退出（docs/architecture.md 五节）
+                // 不自行退出
                 _ => BashEnd::QuitRequested,
             };
         }

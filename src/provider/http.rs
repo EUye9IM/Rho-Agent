@@ -1,6 +1,5 @@
 //! HTTP 基础设施：TLS 根配置（SSL_CERT_FILE 覆盖）、代理环境变量分流（NO_PROXY）、
 //! 按 base_url 缓存 ureq::Agent（TLS 根与连接池复用）、错误体截断与读取上限。
-//! 见 docs/architecture.md 四、五节。
 
 use std::collections::HashMap;
 use std::io::BufReader;

@@ -1,5 +1,4 @@
-//! 终端信号处理：SIGINT self-pipe、专用信号线程、Cancel（epoch 记录）。
-//! 见 docs/architecture.md 五节。
+//! 终端信号处理：SIGINT self-pipe、专用信号线程、Cancel（按轮计数、旧轮 quit 结转）。
 
 use std::io::{ErrorKind, Read};
 use std::os::fd::AsRawFd;

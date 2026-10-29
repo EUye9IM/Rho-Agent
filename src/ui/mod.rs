@@ -1,6 +1,5 @@
 //! 用户交互抽象：Ui trait + 生产实现 TermUi + 测试实现 ScriptedUi。
 //! Ui 不承载退出语义（退出由 REPL 层判定）；灰提示子系统在 `hint` 子模块。
-//! 见 docs/architecture.md 三节。
 
 mod hint;
 mod scripted;
