@@ -139,7 +139,10 @@ fn help_and_model_list_follow_current_provider() {
 #[test]
 fn help_hides_thinking_for_model_without_table() {
     let mut ui = ScriptedUi::new(
-        vec![ReadOutcome::Line("/help".into()), ReadOutcome::Line("/exit".into())],
+        vec![
+            ReadOutcome::Line("/help".into()),
+            ReadOutcome::Line("/exit".into()),
+        ],
         vec![],
     );
     let cancel = Cancel::new();
@@ -249,7 +252,10 @@ max_output = 100
 #[test]
 fn unavailable_provider_is_marked_in_listing() {
     let mut ui = ScriptedUi::new(
-        vec![ReadOutcome::Line("/provider".into()), ReadOutcome::Line("/exit".into())],
+        vec![
+            ReadOutcome::Line("/provider".into()),
+            ReadOutcome::Line("/exit".into()),
+        ],
         vec![],
     );
     let cancel = Cancel::new();

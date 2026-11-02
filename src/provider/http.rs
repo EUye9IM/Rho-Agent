@@ -57,7 +57,9 @@ fn host_of_url(url: &str) -> Option<&str> {
 }
 
 fn no_proxy_match(host: &str, no_proxy_value: Option<&str>) -> bool {
-    let Some(value) = no_proxy_value else { return false };
+    let Some(value) = no_proxy_value else {
+        return false;
+    };
     let host = host.to_ascii_lowercase();
     value.split(',').any(|raw| {
         let entry = raw.trim().trim_start_matches('.').to_ascii_lowercase();
@@ -78,7 +80,9 @@ fn proxy_with(
     url: &str,
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<ureq::Proxy>, String> {
-    let Some(host) = host_of_url(url) else { return Ok(None) };
+    let Some(host) = host_of_url(url) else {
+        return Ok(None);
+    };
     let no_proxy = env("NO_PROXY").or_else(|| env("no_proxy"));
     if no_proxy_match(host, no_proxy.as_deref()) {
         return Ok(None);
@@ -88,9 +92,10 @@ fn proxy_with(
     } else {
         &["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
     };
-    let Some((name, value)) = names.iter().find_map(|n| {
-        env(n).filter(|v| !v.trim().is_empty()).map(|v| (*n, v))
-    }) else {
+    let Some((name, value)) = names
+        .iter()
+        .find_map(|n| env(n).filter(|v| !v.trim().is_empty()).map(|v| (*n, v)))
+    else {
         return Ok(None);
     };
     ureq::Proxy::new(value.trim())
@@ -154,8 +159,14 @@ mod tests {
 
     #[test]
     fn host_of_url_handles_ports_credentials_and_ipv6() {
-        assert_eq!(host_of_url("https://api.example.com/chat"), Some("api.example.com"));
-        assert_eq!(host_of_url("https://api.example.com:8443/chat"), Some("api.example.com"));
+        assert_eq!(
+            host_of_url("https://api.example.com/chat"),
+            Some("api.example.com")
+        );
+        assert_eq!(
+            host_of_url("https://api.example.com:8443/chat"),
+            Some("api.example.com")
+        );
         assert_eq!(host_of_url("https://[::1]:8443/chat"), Some("::1"));
         assert_eq!(host_of_url("http://user:pw@host:80"), Some("host"));
     }
@@ -197,7 +208,10 @@ mod tests {
                 (name == "HTTPS_PROXY").then(|| "http://p1".to_string())
             }
         };
-        assert_eq!(dbg(proxy_with("https://api.example.com", with_no_proxy)), "None");
+        assert_eq!(
+            dbg(proxy_with("https://api.example.com", with_no_proxy)),
+            "None"
+        );
         // 空白值的代理变量被跳过。
         let blank = |name: &str| (name == "HTTPS_PROXY").then(|| "  ".to_string());
         assert_eq!(dbg(proxy_with("https://api.example.com", blank)), "None");

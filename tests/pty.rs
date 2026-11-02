@@ -88,22 +88,20 @@ fn start_mock(respond: impl FnOnce(&mut TcpStream) + Send + 'static) -> MockServ
     listener.set_nonblocking(true).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
-    std::thread::spawn(move || {
-        loop {
-            if thread_stop.load(Ordering::SeqCst) {
+    std::thread::spawn(move || loop {
+        if thread_stop.load(Ordering::SeqCst) {
+            return;
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream.set_nonblocking(false).ok();
+                stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+                let _ = read_request(&mut stream);
+                respond(&mut stream);
+                let _ = stream.shutdown(Shutdown::Both);
                 return;
             }
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    stream.set_nonblocking(false).ok();
-                    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-                    let _ = read_request(&mut stream);
-                    respond(&mut stream);
-                    let _ = stream.shutdown(Shutdown::Both);
-                    return;
-                }
-                Err(_) => std::thread::sleep(Duration::from_millis(5)),
-            }
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
         }
     });
     MockServer { base_url, stop }
@@ -138,7 +136,11 @@ fn tool_call_response(command: &str) -> impl FnOnce(&mut TcpStream) + Send {
 
 /// 慢流响应：发一个 Delta 后停 `pause`，再发剩余并正常收尾。
 /// 给测试窗口在流式期间发 Ctrl-C（真实 SIGINT 路径）。
-fn slow_stream_response(first: &str, rest: &str, pause: Duration) -> impl FnOnce(&mut TcpStream) + Send {
+fn slow_stream_response(
+    first: &str,
+    rest: &str,
+    pause: Duration,
+) -> impl FnOnce(&mut TcpStream) + Send {
     let chunk1 = serde_json::json!({
         "choices": [{ "delta": { "content": first } }]
     });
@@ -208,7 +210,11 @@ impl PtyRho {
     /// 起一个挂 mock 配置的 rho（不依赖外部环境变量）。
     fn spawn(config_path: &str) -> Self {
         let pty = NativePtySystem::default()
-            .openpty(PtySize { rows: ROWS, cols: COLS, ..Default::default() })
+            .openpty(PtySize {
+                rows: ROWS,
+                cols: COLS,
+                ..Default::default()
+            })
             .unwrap();
         let mut cmd = CommandBuilder::new(RHO_BIN);
         cmd.arg("--config");
@@ -250,7 +256,14 @@ impl PtyRho {
                 }
             }
         });
-        PtyRho { child, _master: pty.master, writer, screen, raw, killed }
+        PtyRho {
+            child,
+            _master: pty.master,
+            writer,
+            screen,
+            raw,
+            killed,
+        }
     }
 
     fn send(&mut self, bytes: &[u8]) {
@@ -331,7 +344,10 @@ impl PtyRho {
                 return status.exit_code();
             }
             if Instant::now() > deadline {
-                panic!("rho 未在 {timeout:?} 内退出。当前屏幕：\n{}", self.screen_text());
+                panic!(
+                    "rho 未在 {timeout:?} 内退出。当前屏幕：\n{}",
+                    self.screen_text()
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -426,7 +442,11 @@ fn ctrl_c_after_typing_reclaims_prompt_rows() {
 /// 取消本轮 → 回提示符。inject() 测试绕过这段，此处是唯一端到端覆盖。
 #[test]
 fn real_sigint_during_stream_cancels_and_returns_to_prompt() {
-    let server = start_mock(slow_stream_response("partial", "late", Duration::from_secs(1)));
+    let server = start_mock(slow_stream_response(
+        "partial",
+        "late",
+        Duration::from_secs(1),
+    ));
     let config = write_config(&server.base_url);
     let mut rho = PtyRho::spawn(&config);
 
@@ -447,7 +467,11 @@ fn real_sigint_during_stream_cancels_and_returns_to_prompt() {
 /// 信号），早了两次会被合并统计。mock 慢流 + 密集两击覆盖该窗口。
 #[test]
 fn real_double_sigint_during_stream_quits() {
-    let server = start_mock(slow_stream_response("partial", "late", Duration::from_secs(10)));
+    let server = start_mock(slow_stream_response(
+        "partial",
+        "late",
+        Duration::from_secs(10),
+    ));
     let config = write_config(&server.base_url);
     let mut rho = PtyRho::spawn(&config);
 

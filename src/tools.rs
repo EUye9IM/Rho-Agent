@@ -3,7 +3,6 @@
 
 use crate::config::BashToolConfig;
 use crate::term::{self, Cancel, SignalState};
-use crate::ui::{ConfirmOutcome, Ui};
 
 use std::io::{ErrorKind, Read};
 use std::os::fd::AsRawFd;
@@ -341,9 +340,7 @@ fn drain_stream<R: Read + AsRawFd>(
     // SAFETY: fd 由 reader 持有，在函数期间有效。
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags == -1
-            || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == -1
-        {
+        if flags == -1 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == -1 {
             // 非阻塞设置失败：后续读取无法兑现收尾期限，静默降级成阻塞模式
             // 会让线程（及 join 它的主线程）无界等待。放弃捕获剩余数据，直接返回。
             let e = std::io::Error::last_os_error();
@@ -379,7 +376,11 @@ fn drain_stream<R: Read + AsRawFd>(
 }
 
 fn poll_readable(fd: i32, timeout_ms: i32) {
-    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
     // SAFETY: pfd 是合法的 pollfd。
     unsafe {
         let _ = libc::poll(&mut pfd, 1, timeout_ms);
@@ -429,22 +430,6 @@ fn format_output(
         out.push_str(note);
     }
     out
-}
-
-/// 确认流（agent loop 的 dispatch_tool_call 调用）：
-/// allowlist 自动放行；否则向用户确认（--yes 跳过全部确认）。
-pub fn gate(
-    ui: &mut dyn Ui,
-    yes: bool,
-    cwd: &str,
-    command: &str,
-    allow: &[String],
-) -> ConfirmOutcome {
-    if allowed(command, allow) || yes {
-        ConfirmOutcome::Yes
-    } else {
-        ui.confirm(cwd, command)
-    }
 }
 
 #[cfg(test)]

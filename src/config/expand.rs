@@ -13,14 +13,19 @@ pub enum ExpandError {
 
 /// 展开一个 header 值中的 `${VAR}`（环境查找由 `lookup` 提供，便于注入测试）。
 /// 变量缺失 → Err（该 provider 标记不可用，非全局致命——由调用方处理）。
-pub fn expand_var_with(template: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<String, ExpandError> {
+pub fn expand_var_with(
+    template: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String, ExpandError> {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(pos) = rest.find("${") {
         out.push_str(&rest[..pos]);
         let after = &rest[pos + 2..];
         let Some(end) = after.find('}') else {
-            return Err(ExpandError::Malformed(format!("未闭合的 ${{...}}：{template}")));
+            return Err(ExpandError::Malformed(format!(
+                "未闭合的 ${{...}}：{template}"
+            )));
         };
         let name = &after[..end];
         if name.is_empty() {
@@ -102,7 +107,10 @@ mod tests {
     fn expands_known_var() {
         // 规则测试用注入查找，不改进程环境（并行测试下 set_var 有竞态）。
         let lookup = |name: &str| (name == "RHO_TEST_VAR").then(|| "abc".to_string());
-        assert_eq!(expand_var_with("x-${RHO_TEST_VAR}-y", lookup).unwrap(), "x-abc-y");
+        assert_eq!(
+            expand_var_with("x-${RHO_TEST_VAR}-y", lookup).unwrap(),
+            "x-abc-y"
+        );
     }
 
     #[test]

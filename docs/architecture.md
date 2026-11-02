@@ -7,7 +7,7 @@
 ```
 ┌─────────────────────────── main thread ───────────────────────────┐
 │                                                                    │
-│  repl ──► agent loop ──► adapter(openai_chat) ──► http(ureq)      │
+│  repl ──► agent loop ──► adapter(protocol) ──► http(ureq)         │
 │    ▲         │              ▲                        │             │
 │    │         │              │ events (mpsc)          │             │
 │    │         ▼              │                        │             │
@@ -35,18 +35,25 @@ src/
     mod.rs       结构定义、内置默认配置（include_str! + 解析）
     validate.rs  悬空引用 / 前缀对应 / 取值校验，一次收集全部语义错误并报告配置路径
     expand.rs    header 值 ${VAR} 展开；明文密钥告警
-  chat.rs        内部消息模型 Msg、会话历史（Vec<Msg>）、工具循环；
-                 StreamLauncher/ToolRunner 注入边界（生产 worker 线程/真实 bash，测试可替换）
+  message.rs     与协议解耦的消息模型 Msg / AssistantMsg / ToolCall（chat 与 provider 共用）
+  tool_spec.rs   与协议无关的 bash 工具定义（name/description/JSON Schema）
+  chat.rs        会话历史（Vec<Msg>，对外只读）、工具循环与确认 gate；
+                 StreamLauncher/ToolRunner 注入边界
+                 （生产 worker 线程/真实 bash，测试可替换）
   provider/
-    mod.rs       ProviderAdapter trait（Send+Sync，Arc 共享）、按 Provider 构造（注入 compat）、
-                 流式请求工作线程（取消/超时/字节上限、首字节看门狗）
+    mod.rs       ProviderAdapter trait（Send+Sync，Arc 共享）、FinishReason / ChunkOutcome、
+                 按 Provider 构造、流式请求工作线程（取消/超时/字节上限、首字节看门狗）
+    common.rs    适配器共用：模型名解析、默认 header、thinking 片段合并
     http.rs      TLS 根配置（SSL_CERT_FILE 覆盖）、代理环境变量分流（NO_PROXY）、
                  按 base_url 缓存 ureq::Agent（TLS 根与连接池复用）、错误体截断
-    openai.rs    openai_chat：请求体组装（含 max_tokens）、thinking 片段顶层合并、
-                 reasoning_content 处理（echo_reasoning 构造时注入）
+    openai.rs    openai_chat：/chat/completions、messages、max_tokens、reasoning_content
+                 （echo_reasoning 构造时注入）、`[DONE]` 结束标记
+    openai_responses.rs
+                 openai_responses：/responses、input items、max_output_tokens、
+                 function_call / function_call_output、reasoning summary 与最终 response 事件
   sse.rs         SSE 行解析器（纯函数，可夹具测试；单行有字节上限，完整行与未终结残留同样适用）
   tools.rs       bash 执行：进程组 spawn、超时升级、双 drain 管道读取、
-                 输出截断、allowlist + 元字符判定、确认
+                 输出截断、allowlist + 元字符判定
   render.rs      纯格式化函数：思考暗淡色、正文原样、工具行、带左边栏的工具结果、截断标注
                  （颜色固定使用 ANSI 转义，暗色终端下仍可用）
   repl.rs        斜杠命令、Ctrl-C 语义；循环本体依赖 Ui trait
@@ -57,12 +64,12 @@ src/
     scripted.rs  测试实现 ScriptedUi（预排输入与确认、收集渲染事件）
 ```
 
-依赖方向为 `repl → chat → provider → sse`。`Msg`/`AssistantMsg`/`ToolCall` 等共享消息类型放在 `chat.rs`，provider 通过 `StreamEvent::Final(Box<AssistantMsg>)` 使用它们；这是唯一的跨层类型引用。`config` 被各层读取，处于依赖关系底层。`render` 提供纯格式化函数，由 `repl`/`chat`/`ui` 调用；`ui` 把格式化结果写入终端。
+依赖方向为 `repl → chat → provider → sse/message`。`Msg`/`AssistantMsg`/`ToolCall` 放在 `message.rs`，chat 与 provider 都只依赖这个共享模型，provider 不再反向依赖 chat。`config` 被各层读取，处于依赖关系底层。`render` 提供纯格式化函数，由 `repl`/`chat`/`ui` 调用；`ui` 把格式化结果写入终端。
 
 ## 三、关键数据类型
 
 ```rust
-// chat.rs — 内部消息模型（与协议解耦，适配层负责映射）
+// message.rs — 内部消息模型（与协议解耦，适配层负责映射）
 enum Msg {
     System(String),
     User(String),
@@ -80,26 +87,28 @@ enum StreamEvent {
     Final(Box<AssistantMsg>),                   // worker 组装完成的完整 Assistant 消息
     Error(String),                              // HTTP 错误 / 断流 / 非法 JSON / finish_reason=length|content_filter 等截断；异常 EOF 按错误处理
 }
-// 终态只有 Final/Error 两种：[DONE] 与 finish_reason 的提交资格判定完全内化在 worker，
+// 终态只有 Final/Error 两种：结束标记与 finish_reason 的提交资格判定完全内化在 worker，
 // 主线程收到即定论。流式请求的主线程侧句柄 StreamHandle 绑定接收器与取消标志，
 // abandon（置位取消标志 + drop Receiver）是唯一放弃路径。
 trait ProviderAdapter: Send + Sync {
     fn endpoint(&self, p: &Provider) -> String;
     fn build_body(&self, hist: &[Msg], model: &Model, model_id: &str, thinking: Option<&Value>) -> Value;
     fn headers(&self, p: &Provider) -> Vec<(String, String)>;
-    // 解析单个 chunk：累积进 acc；有 text/reasoning 增量时返回 Some(Delta)。
-    // tool_calls 的组装只进 acc，不产生事件。
-    fn parse_chunk(&self, chunk: &Value, acc: &mut TurnAcc) -> Option<StreamEvent>;
+    // 原始载荷是否表示流结束（OpenAI Chat 的 [DONE]）。
+    fn is_stream_end(&self, payload: &str) -> bool;
+    // 解析单个 JSON chunk：增量与工具调用累积进 acc；协议最终事件返回 Done。
+    fn parse_chunk(&self, chunk: &Value, acc: &mut TurnAcc) -> ChunkOutcome;
 }
 // 适配器按 Provider 构造（adapter_for(&Provider) -> Result<Arc<dyn ProviderAdapter>, String>）：
 // compat 开关（echo_reasoning）构造时注入；Session 长期持有 Arc，每轮 clone 一份按值传给 worker
-// （thread::spawn + detach 取消语义需 'static，不能借引用）；/provider 切换时重建。其他协议族返回可展示的 Err。
+// （thread::spawn + detach 取消语义需 'static，不能借引用）；/provider 切换时重建。
+// Protocol::parse 决定 openai_chat / openai_responses；未知协议返回可展示的 Err。
 ```
 
-- **`TurnAcc` 归 worker 线程所有**：chunk 解析与累加都在工作线程内完成；channel 传渲染增量（Delta）与终态（Final/Error）。主线程只消费 Final，提交历史/执行工具都依赖它；取消时 drop Receiver，累加器随 worker 结束丢弃。`tool_calls` 按 index 归位到具名的 `PartialToolCall`（id/name/arguments 可分批到达）。
+- **`TurnAcc` 归 worker 线程所有**：chunk 解析与累加都在工作线程内完成；channel 传渲染增量（Delta）与终态（Final/Error）。主线程只消费 Final，提交历史/执行工具都依赖它；取消时 drop Receiver，累加器随 worker 结束丢弃。`tool_calls` 按 index 归位到具名的 `PartialToolCall`（id/name/arguments 可分批到达）。`finish_reason` 是内部 `FinishReason`，适配器把协议字符串（stop/tool_calls/length/content_filter/max_output_tokens 等）归一化后写入；缺失 reason 仍按可提交处理。
 
 ```rust
-// ui — 用户交互抽象，repl / chat / tools 通过此接口访问终端
+// ui — 用户交互抽象，repl / chat 通过此接口访问终端
 // 退出语义由 REPL 层负责：/exit、Eof、空行 Ctrl-C 双按映射为退出；
 // 活动操作中信号路径的 quit 由 agent loop 检测（见五）
 
@@ -134,7 +143,8 @@ enum ConfirmOutcome {
 - 测试实现 `ScriptedUi`：预排输入队列 + 预排确认结果 + 收集渲染事件，驱动 `repl → agent loop → tools` 全链路。
 
 - `TurnAcc`（worker 线程的每流累加器）：按 `index` 组装多段 `tool_calls`、累积 text/reasoning；流正常结束时组装为完整 Assistant 消息经 `Final` 交付主线程。取消时主线程 drop Receiver，累加器随 worker 结束一起丢弃。
-- 响应 / Anthropic 协议：当前实现保留 trait 分发；`protocol` 指向其他协议时返回可展示的错误。
+- OpenAI Responses：`openai_responses` 适配器把历史映射为 `input` items（user/assistant 文本、`function_call`、`function_call_output`），系统提示写入顶层 `instructions`；流式事件按 `response.output_text.delta` / reasoning summary / `function_call_arguments.delta` 累积，`response.completed` / `response.incomplete` 作为终态，`response.failed` / `error` 直接报错。
+- Anthropic Messages：尚未实现；`protocol` 指向未知协议时返回可展示的错误。
 
 ## 四、Agent 工具循环（chat.rs）
 
@@ -220,7 +230,7 @@ exit 0：/exit、空闲态 Ctrl-C 双按、Ctrl-D（均正常退出）
 |---|---|
 | `sse.rs` / `config` / `tools` 判定与截断 / `expand` | 纯单元测试，录制夹具 |
 | `render` 格式 / `ui::prompt_rows`（回收时上移的行数）/ `ui::should_erase_hint` / `repl::within_window`（双按窗口） | 纯单元测试，无 TTY |
-| `provider::openai` 解析 | 单元测试：构造 JSON chunk → StreamEvent |
+| `provider::openai` / `provider::openai_responses` 解析 | 单元测试：构造 JSON chunk/事件 → `ChunkOutcome` / `TurnAcc` |
 | agent loop + tools | 集成：`Session` 的 launcher/tool_runner 注入边界 + `ScriptedUi`，无网络无进程驱动分支（取消/退出各粒度、占位补齐、错误路径、配对不变式；时序用 channel 握手控制）；`tools::run_bash` 直接验证输出捕获/截断/超时 |
 | provider + HTTP 层 | 集成：本地 mock SSE 服务（std TcpListener 手写），测协议映射与流读取 |
 | 端到端工具循环 | 集成：mock SSE 服务驱动多轮真实 HTTP 请求，验证占位 Tool 消息的配对/顺序/第二次请求序列化（含 echo_reasoning） |

@@ -43,7 +43,12 @@ fn prompt_rows(width: usize, cols: usize) -> usize {
 
 /// 终端列数（取 stdout 窗口尺寸）；拿不到时按 80 列算。
 fn terminal_cols() -> usize {
-    let mut ws = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+    let mut ws = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
     // SAFETY: ws 是合法的 winsize 可写缓冲区，fd 是常量 stdout。
     if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
     {
@@ -160,8 +165,8 @@ impl TermUi {
                 "stdin 不是 TTY，rho 只支持交互式 REPL".into(),
             ));
         }
-        let mut editor: Editor =
-            rustyline::Editor::new().map_err(|e| TermUiInitError::Init(format!("初始化终端失败：{e}")))?;
+        let mut editor: Editor = rustyline::Editor::new()
+            .map_err(|e| TermUiInitError::Init(format!("初始化终端失败：{e}")))?;
         let line_empty = Arc::new(AtomicBool::new(false));
         let line_width = Arc::new(AtomicUsize::new(0));
         let hint = Arc::new(HintArm::new(std::io::stdout().is_terminal()));
@@ -283,9 +288,7 @@ impl Ui for TermUi {
                 RenderEvent::ReasoningDelta(s) => write!(out, "{}", render::dim(s))?,
                 RenderEvent::TextDelta(s) => write!(out, "{s}")?,
                 RenderEvent::LineBreak => writeln!(out)?,
-                RenderEvent::ToolCall(cmd) => {
-                    write!(out, "\n{}\n", render::tool_call_line(cmd))?
-                }
+                RenderEvent::ToolCall(cmd) => write!(out, "\n{}\n", render::tool_call_line(cmd))?,
                 RenderEvent::ToolResult(content) => {
                     writeln!(out, "{}", render::tool_result_block(content))?
                 }

@@ -22,7 +22,10 @@ impl Default for SseParser {
 
 impl SseParser {
     pub fn new() -> Self {
-        Self { buf: Vec::new(), max_line_bytes: MAX_LINE_BYTES }
+        Self {
+            buf: Vec::new(),
+            max_line_bytes: MAX_LINE_BYTES,
+        }
     }
 
     /// 喂入一段原始字节（可能是半个 UTF-8 字符/半行）。

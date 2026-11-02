@@ -4,7 +4,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-`rho` is a small local agent that lives in your terminal. It is a single binary (musl static builds are the intended distribution form), uses blocking I/O and threads, and is built for resource-constrained Linux boxes. You talk to it in a REPL; it streams answers from an OpenAI Chat Completions–compatible provider (DeepSeek by default) and can run shell commands through a `bash` tool gated by an allowlist plus an explicit confirmation.
+`rho` is a small local agent that lives in your terminal. It is a single binary (musl static builds are the intended distribution form), uses blocking I/O and threads, and is built for resource-constrained Linux boxes. You talk to it in a REPL; it streams answers from an OpenAI Chat Completions–compatible provider (DeepSeek by default), with OpenAI Responses support available by configuration, and can run shell commands through a `bash` tool gated by an allowlist plus an explicit confirmation.
 
 ## Vision
 
@@ -15,7 +15,7 @@ Implementation: [docs/architecture.md](docs/architecture.md).
 ## Features
 
 - **Small by design** — one crate, one binary, blocking I/O + threads; `strip` + LTO + `panic = "abort"` in release.
-- **Config-driven providers** — providers, models and thinking levels are declared as data. Same protocol family means configuration only.
+- **Config-driven providers** — providers, models and thinking levels are declared as data. `openai_chat` and `openai_responses` are both supported; switching protocol is configuration only.
 - **Streaming with visible reasoning** — text streams as it arrives; `reasoning_content` is rendered dimmed and stays local unless the provider sets `compat.echo_reasoning = true`.
 - **One tool: `bash`** — executed in the foreground as `bash -c <command>`, with a fresh shell per call and a per-call timeout that escalates to a process-group kill.
 - **Predictable Ctrl-C** — first Ctrl-C cancels the current stream/tool/confirmation and returns you to the prompt (cancellation takes effect between chunks; if the connection stalls, the background reader ends once the next data arrives or the idle timeout hits), second one exits; at the idle prompt two empty-line Ctrl-C within two seconds exit (the first shows a gray hint). The conversation history is always left in a protocol-valid state.
@@ -105,7 +105,7 @@ system_prompt    = "You are rho, a lightweight local ops assistant."  # omit to 
 max_tool_steps   = 25
 
 [providers.deepseek]
-protocol = "openai_chat"                        # the protocol implemented today
+protocol = "openai_chat"                        # openai_chat or openai_responses
 base_url = "https://api.deepseek.com"
 
 [providers.deepseek.auth]
@@ -135,6 +135,7 @@ max_output_bytes = 16384
 Rules worth knowing:
 
 - Model ids are global and must carry a provider prefix (`deepseek/deepseek-v4-pro`); the prefix must match a declared provider. The upstream `model` field defaults to the part after the first `/`.
+- `protocol` accepts `openai_chat` (Chat Completions, `/chat/completions`) or `openai_responses` (Responses, `/responses`). The Responses adapter maps history to `input` items and uses `max_output_tokens`.
 - `${VAR}` in auth headers is expanded per provider. A missing variable marks that provider unavailable; other providers keep working, unless that provider was explicitly requested.
 - Thinking levels are JSON object fragments merged into the top level of the request body. Level names are yours to choose.
 - Validation is strict: unknown fields, dangling references and missing required fields abort startup with exit code 2 and the config path; TOML syntax errors also include a line number.
@@ -157,10 +158,11 @@ Other limits: at most `max_tool_steps` model-initiated tool calls per turn (defa
 ## Testing
 
 ```sh
+cargo fmt --all --check
 cargo test --all-targets --locked
 ```
 
-CI runs the tests on stable Rust, on every push to `master` or `dev` and every pull request. Tests run against local mocks: protocol tests use a hand-written local SSE mock over `TcpListener`, and the REPL/agent-loop tests drive the real loop with a scripted `Ui` implementation. The signal → record path of `term.rs` and live terminal behaviour are covered by PTY integration tests that drive the real binary through a pty and assert on the parsed screen grid.
+CI runs formatting, clippy and tests on stable Rust, on every push to `master` or `dev` and every pull request. Tests run against local mocks: protocol tests use a hand-written local SSE mock over `TcpListener`, and the REPL/agent-loop tests drive the real loop with a scripted `Ui` implementation. The signal → record path of `term.rs` and live terminal behaviour are covered by PTY integration tests that drive the real binary through a pty and assert on the parsed screen grid.
 
 ## License
 

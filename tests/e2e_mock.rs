@@ -3,10 +3,10 @@
 use rho::chat::{Msg, Session, TurnEnd};
 use rho::config::{self, BashToolConfig};
 use rho::provider;
-use rho::term::Cancel;
-use rho::tools;
 use rho::render::RenderEvent;
 use rho::repl;
+use rho::term::Cancel;
+use rho::tools;
 use rho::ui::{ConfirmOutcome, ReadOutcome, ScriptedUi};
 
 use serde_json::{json, Value};
@@ -158,7 +158,9 @@ fn start_server(responses: Vec<String>) -> MockServer {
     let thread_shared = shared.clone();
     std::thread::spawn(move || {
         for response in responses {
-            let Some(mut stream) = accept_next(&listener, &thread_shared) else { return };
+            let Some(mut stream) = accept_next(&listener, &thread_shared) else {
+                return;
+            };
             stream.set_nonblocking(false).ok();
             serve_one(&mut stream, &thread_shared, |s| {
                 let _ = s.write_all(
@@ -181,7 +183,9 @@ fn start_custom(respond: impl Fn(&mut TcpStream) + Send + 'static) -> MockServer
     let shared: Arc<ServerShared> = Arc::new(Default::default());
     let thread_shared = shared.clone();
     std::thread::spawn(move || {
-        let Some(mut stream) = accept_next(&listener, &thread_shared) else { return };
+        let Some(mut stream) = accept_next(&listener, &thread_shared) else {
+            return;
+        };
         stream.set_nonblocking(false).ok();
         serve_one(&mut stream, &thread_shared, respond);
     });
@@ -190,6 +194,61 @@ fn start_custom(respond: impl Fn(&mut TcpStream) + Send + 'static) -> MockServer
 
 fn sse(value: &Value) -> String {
     format!("data: {value}\n\n")
+}
+
+fn responses_tool_call_response(command: &str) -> String {
+    let arguments = json!({ "command": command }).to_string();
+    let mut out = String::new();
+    out.push_str(&sse(&json!({
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "bash",
+            "arguments": ""
+        }
+    })));
+    out.push_str(&sse(&json!({
+        "type": "response.function_call_arguments.delta",
+        "item_id": "fc_1",
+        "output_index": 0,
+        "delta": arguments
+    })));
+    out.push_str(&sse(&json!({
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": arguments
+            }]
+        }
+    })));
+    out
+}
+
+fn responses_text_response(text: &str) -> String {
+    let mut out = String::new();
+    out.push_str(&sse(&json!({
+        "type": "response.output_text.delta",
+        "delta": text
+    })));
+    out.push_str(&sse(&json!({
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": text }]
+            }]
+        }
+    })));
+    out
 }
 
 fn tool_call_response() -> String {
@@ -228,12 +287,17 @@ fn text_response(text: &str) -> String {
 }
 
 /// 由 mock 服务器 base_url 组装完整 TOML（测试用，不再落盘）。
-fn config_toml(base_url: &str, top_extra: &str, provider_extra: &str) -> String {
+fn config_toml_with_protocol(
+    base_url: &str,
+    top_extra: &str,
+    provider_extra: &str,
+    protocol: &str,
+) -> String {
     format!(
         r#"
 {top_extra}
 [providers.mock]
-protocol = "openai_chat"
+protocol = "{protocol}"
 base_url = "{base_url}"
 {provider_extra}
 
@@ -252,10 +316,7 @@ max_output_bytes = 1024
 /// 保留一个真实文件加载路径的护栏：报错文案带文件路径。
 #[test]
 fn file_load_error_mentions_path() {
-    let path = std::env::temp_dir().join(format!(
-        "rho-e2e-fileload-{}.toml",
-        std::process::id()
-    ));
+    let path = std::env::temp_dir().join(format!("rho-e2e-fileload-{}.toml", std::process::id()));
     std::fs::write(&path, "not valid toml =").unwrap();
     let err = config::load(&Some(path.display().to_string())).unwrap_err();
     let _ = std::fs::remove_file(&path);
@@ -264,7 +325,20 @@ fn file_load_error_mentions_path() {
 
 /// 按配置文本构建会话（mock 服务器 base_url 注入）。
 fn session_for(base_url: &str, top_extra: &str, provider_extra: &str) -> Session {
-    let cfg = config::load_str(&config_toml(base_url, top_extra, provider_extra), "<测试配置>").unwrap();
+    session_for_protocol(base_url, top_extra, provider_extra, "openai_chat")
+}
+
+fn session_for_protocol(
+    base_url: &str,
+    top_extra: &str,
+    provider_extra: &str,
+    protocol: &str,
+) -> Session {
+    let cfg = config::load_str(
+        &config_toml_with_protocol(base_url, top_extra, provider_extra, protocol),
+        "<测试配置>",
+    )
+    .unwrap();
     let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
     let adapter = provider::adapter_for(&selection.provider).unwrap();
     Session::new(cfg, selection, adapter, false)
@@ -281,9 +355,9 @@ fn full_tool_loop_with_mock_sse() {
     assert!(matches!(end, TurnEnd::Done));
     assert!(server.wait_served(2, Duration::from_secs(5)));
 
-    assert_eq!(session.history.len(), 4);
-    assert!(matches!(&session.history[0], Msg::User(u) if u == "go"));
-    match &session.history[1] {
+    assert_eq!(session.history().len(), 4);
+    assert!(matches!(&session.history()[0], Msg::User(u) if u == "go"));
+    match &session.history()[1] {
         Msg::Assistant(a) => {
             assert_eq!(a.tool_calls.len(), 1);
             assert_eq!(a.tool_calls[0].id, "call_1");
@@ -291,14 +365,17 @@ fn full_tool_loop_with_mock_sse() {
         }
         other => panic!("unexpected {other:?}"),
     }
-    match &session.history[2] {
-        Msg::Tool { tool_call_id, content } => {
+    match &session.history()[2] {
+        Msg::Tool {
+            tool_call_id,
+            content,
+        } => {
             assert_eq!(tool_call_id, "call_1");
             assert_eq!(content, "用户拒绝执行");
         }
         other => panic!("unexpected {other:?}"),
     }
-    match &session.history[3] {
+    match &session.history()[3] {
         Msg::Assistant(a) => assert_eq!(a.text.as_deref(), Some("done")),
         other => panic!("unexpected {other:?}"),
     }
@@ -327,6 +404,55 @@ fn full_tool_loop_with_mock_sse() {
     assert_eq!(second["stream"], true);
 }
 
+#[test]
+fn responses_protocol_full_tool_loop() {
+    let server = start_server(vec![
+        responses_tool_call_response("echo hi"),
+        responses_text_response("done"),
+    ]);
+    let mut session = session_for_protocol(server.base_url(), "", "", "openai_responses");
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::No]);
+
+    let end = session.turn(&mut ui, &cancel, "go").unwrap();
+    assert!(matches!(end, TurnEnd::Done));
+    assert!(server.wait_served(2, Duration::from_secs(5)));
+
+    assert_eq!(session.history().len(), 4);
+    match &session.history()[1] {
+        Msg::Assistant(a) => {
+            assert_eq!(a.tool_calls.len(), 1);
+            assert_eq!(a.tool_calls[0].id, "call_1");
+            assert_eq!(a.tool_calls[0].name, "bash");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    match &session.history()[2] {
+        Msg::Tool {
+            tool_call_id,
+            content,
+        } => {
+            assert_eq!(tool_call_id, "call_1");
+            assert_eq!(content, "用户拒绝执行");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    match &session.history()[3] {
+        Msg::Assistant(a) => assert_eq!(a.text.as_deref(), Some("done")),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    let second: Value = serde_json::from_str(&server.body(1)).unwrap();
+    assert_eq!(second["stream"], true);
+    assert_eq!(second["max_output_tokens"], 1000);
+    assert_eq!(second["tools"][0]["name"], "bash");
+    assert_eq!(second["input"][0]["role"], "user");
+    assert_eq!(second["input"][1]["type"], "function_call");
+    assert_eq!(second["input"][1]["call_id"], "call_1");
+    assert_eq!(second["input"][2]["type"], "function_call_output");
+    assert_eq!(second["input"][2]["call_id"], "call_1");
+}
+
 /// 上游“思考”一段时间才回响应头是常态，不能因读超时被当成失败。
 /// 回归护栏：ureq 的读超时同时作用于响应头与响应体，却只由 `timeout_read` 一个旋钮控制，
 /// 把它调到秒级以下会让正常请求报 “timed out reading response”。
@@ -339,8 +465,7 @@ fn slow_response_headers_are_not_an_error() {
             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
         );
         let _ = stream.write_all(
-            sse(&json!({"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}))
-                .as_bytes(),
+            sse(&json!({"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]})).as_bytes(),
         );
         let _ = stream.write_all(b"data: [DONE]\n\n");
         let _ = stream.flush();
@@ -362,14 +487,12 @@ fn slow_stream_between_chunks_is_not_an_error() {
         let _ = stream.write_all(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
         );
-        let _ = stream
-            .write_all(sse(&json!({"choices":[{"delta":{"content":"a"}}]})).as_bytes());
+        let _ = stream.write_all(sse(&json!({"choices":[{"delta":{"content":"a"}}]})).as_bytes());
         let _ = stream.flush();
         // 超过一秒的空白间隔：worker 应继续读而不是报错。
         std::thread::sleep(Duration::from_millis(1200));
         let _ = stream.write_all(
-            sse(&json!({"choices":[{"delta":{"content":"b"},"finish_reason":"stop"}]}))
-                .as_bytes(),
+            sse(&json!({"choices":[{"delta":{"content":"b"},"finish_reason":"stop"}]})).as_bytes(),
         );
         let _ = stream.write_all(b"data: [DONE]\n\n");
         let _ = stream.flush();
@@ -382,7 +505,7 @@ fn slow_stream_between_chunks_is_not_an_error() {
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done), "end was {end:?}");
-    match session.history.last() {
+    match session.history().last() {
         Some(Msg::Assistant(a)) => assert_eq!(a.text.as_deref(), Some("ab")),
         other => panic!("unexpected {other:?}"),
     }
@@ -450,9 +573,17 @@ fn bash_returns_bounded_when_background_child_holds_pipe() {
     let started = std::time::Instant::now();
     // bash 立即退出；后台 sleep 30 继续持有 stdout 写端。
     let out = tools::run_bash("echo hi; sleep 30 &", &cfg, &Cancel::new());
-    assert!(matches!(out.end, tools::BashEnd::Exited(0)), "end was {:?}", out.end);
+    assert!(
+        matches!(out.end, tools::BashEnd::Exited(0)),
+        "end was {:?}",
+        out.end
+    );
     assert!(out.content.contains("hi"));
-    assert!(started.elapsed() < Duration::from_secs(3), "elapsed {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "elapsed {:?}",
+        started.elapsed()
+    );
 }
 
 /// 超时清理的是进程组：后台子进程一并终止（否则 drain 管道不关闭，本测试无法收敛）。
@@ -467,7 +598,11 @@ fn bash_timeout_kills_background_children_too() {
     // 前台 sleep 撑过超时；后台 sleep 与之同进程组。
     let out = tools::run_bash("sleep 30 & sleep 30", &cfg, &Cancel::new());
     assert!(matches!(out.end, tools::BashEnd::TimedOut));
-    assert!(started.elapsed() < Duration::from_secs(10), "elapsed {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "elapsed {:?}",
+        started.elapsed()
+    );
 }
 
 /// 取消路径与超时同样升级终止进程组。
@@ -486,8 +621,16 @@ fn bash_cancel_terminates_group() {
     });
     let started = std::time::Instant::now();
     let out = tools::run_bash("sleep 30 & sleep 30", &cfg, &cancel);
-    assert!(matches!(out.end, tools::BashEnd::Cancelled), "end was {:?}", out.end);
-    assert!(started.elapsed() < Duration::from_secs(10), "elapsed {:?}", started.elapsed());
+    assert!(
+        matches!(out.end, tools::BashEnd::Cancelled),
+        "end was {:?}",
+        out.end
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "elapsed {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -525,8 +668,8 @@ fn ctrl_c_during_stream_cancels_and_discards_partial() {
     assert!(matches!(end, TurnEnd::Cancelled));
     assert!(started.elapsed() < Duration::from_secs(2));
     // 未完成的 assistant 响应不进入历史，只保留用户输入。
-    assert_eq!(session.history.len(), 1);
-    assert!(matches!(&session.history[0], Msg::User(u) if u == "go"));
+    assert_eq!(session.history().len(), 1);
+    assert!(matches!(&session.history()[0], Msg::User(u) if u == "go"));
 }
 
 /// mock 服务器生命周期：stop 后不再接受连接（测试提前失败时也能结束服务线程）。
@@ -545,7 +688,6 @@ fn mock_server_stop_closes_listener() {
         }
     }
 }
-
 
 fn two_tool_calls_response() -> String {
     let mut out = String::new();
@@ -579,18 +721,21 @@ fn multiple_tool_calls_are_paired_in_order() {
     let server = start_server(vec![two_tool_calls_response(), text_response("ok")]);
     let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(
-        vec![],
-        vec![ConfirmOutcome::No, ConfirmOutcome::No],
-    );
+    let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::No, ConfirmOutcome::No]);
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done));
-    assert_eq!(session.history.len(), 5);
-    match (&session.history[2], &session.history[3]) {
+    assert_eq!(session.history().len(), 5);
+    match (&session.history()[2], &session.history()[3]) {
         (
-            Msg::Tool { tool_call_id: a, content: ca },
-            Msg::Tool { tool_call_id: b, content: cb },
+            Msg::Tool {
+                tool_call_id: a,
+                content: ca,
+            },
+            Msg::Tool {
+                tool_call_id: b,
+                content: cb,
+            },
         ) => {
             assert_eq!(a, "call_a");
             assert_eq!(b, "call_b");
@@ -614,11 +759,17 @@ fn max_tool_steps_placeholders_remaining_calls() {
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Error(_)));
-    assert_eq!(session.history.len(), 4);
-    match (&session.history[2], &session.history[3]) {
+    assert_eq!(session.history().len(), 4);
+    match (&session.history()[2], &session.history()[3]) {
         (
-            Msg::Tool { tool_call_id: a, content: ca },
-            Msg::Tool { tool_call_id: b, content: cb },
+            Msg::Tool {
+                tool_call_id: a,
+                content: ca,
+            },
+            Msg::Tool {
+                tool_call_id: b,
+                content: cb,
+            },
         ) => {
             assert_eq!(a, "call_a");
             assert_eq!(b, "call_b");
@@ -629,7 +780,6 @@ fn max_tool_steps_placeholders_remaining_calls() {
     }
     assert_eq!(server.request_count(), 1);
 }
-
 
 fn tool_call_response_with_reasoning() -> String {
     let mut out = String::new();
@@ -658,7 +808,11 @@ fn echo_reasoning_is_serialized_on_next_request() {
         tool_call_response_with_reasoning(),
         text_response("ok"),
     ]);
-    let mut session = session_for(server.base_url(), "", "[providers.mock.compat]\necho_reasoning = true");
+    let mut session = session_for(
+        server.base_url(),
+        "",
+        "[providers.mock.compat]\necho_reasoning = true",
+    );
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::No]);
 
@@ -689,7 +843,9 @@ fn top_level_error_chunk_is_surfaced() {
 #[test]
 fn truncated_finish_reason_is_error() {
     let mut response = String::new();
-    response.push_str(&sse(&json!({ "choices": [{ "delta": { "content": "part" } }] })));
+    response.push_str(&sse(
+        &json!({ "choices": [{ "delta": { "content": "part" } }] }),
+    ));
     response.push_str(&sse(&json!({
         "choices": [{ "delta": {}, "finish_reason": "length" }]
     })));
@@ -786,7 +942,10 @@ fn repl_adds_line_break_after_done_response() {
     let session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(
-        vec![ReadOutcome::Line("go".into()), ReadOutcome::Line("/exit".into())],
+        vec![
+            ReadOutcome::Line("go".into()),
+            ReadOutcome::Line("/exit".into()),
+        ],
         vec![],
     );
 

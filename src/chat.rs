@@ -1,6 +1,7 @@
 //! 内部消息模型与 agent 工具循环：历史、流接收、工具批次执行。
 
 use crate::config::{self, Config, Provider, Selection};
+pub use crate::message::{AssistantMsg, Msg, ToolCall};
 use crate::provider::{self, ProviderAdapter, StreamEvent};
 use crate::render::RenderEvent;
 use crate::term::{Cancel, SignalState};
@@ -25,37 +26,9 @@ const FATAL_PLACEHOLDER: &str = "终端输出失败，未执行";
 const TURN_CANCELLED_MSG: &str = "已取消本轮响应";
 
 fn system_history(prompt: Option<&str>) -> Vec<Msg> {
-    prompt.map(|p| vec![Msg::System(p.to_string())]).unwrap_or_default()
-}
-
-/// 与协议解耦的消息模型（适配层负责映射）。
-#[derive(Debug, Clone)]
-pub enum Msg {
-    System(String),
-    User(String),
-    /// Assistant 载荷：流终态与历史共用同一类型（见 [`AssistantMsg`]）。
-    Assistant(AssistantMsg),
-    Tool {
-        tool_call_id: String,
-        content: String,
-    },
-}
-
-/// Assistant 消息的载荷。`Final` 事件与历史中的 Assistant 消息共用此类型，
-/// 避免事件携带 System/User/Tool 等无效状态。
-#[derive(Debug, Clone)]
-pub struct AssistantMsg {
-    pub text: Option<String>,
-    pub reasoning: Option<String>,
-    pub tool_calls: Vec<ToolCall>,
-}
-
-/// arguments 保持原始 JSON 字符串。
-#[derive(Debug, Clone)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
+    prompt
+        .map(|p| vec![Msg::System(p.to_string())])
+        .unwrap_or_default()
 }
 
 /// 一次流式请求的启动边界：生产实现起 worker 线程跑真实 HTTP；
@@ -94,13 +67,23 @@ impl StreamLauncher for WorkerLauncher {
 /// 单个 bash 调用的执行边界：生产实现跑真实进程组；
 /// 测试实现返回预设结果（无进程）。
 pub trait ToolRunner: Send + Sync {
-    fn run(&self, command: &str, cfg: &crate::config::BashToolConfig, cancel: &Cancel) -> BashOutput;
+    fn run(
+        &self,
+        command: &str,
+        cfg: &crate::config::BashToolConfig,
+        cancel: &Cancel,
+    ) -> BashOutput;
 }
 
 struct BashRunner;
 
 impl ToolRunner for BashRunner {
-    fn run(&self, command: &str, cfg: &crate::config::BashToolConfig, cancel: &Cancel) -> BashOutput {
+    fn run(
+        &self,
+        command: &str,
+        cfg: &crate::config::BashToolConfig,
+        cancel: &Cancel,
+    ) -> BashOutput {
         tools::run_bash(command, cfg, cancel)
     }
 }
@@ -118,7 +101,8 @@ pub struct Session {
     pub launcher: Arc<dyn StreamLauncher>,
     pub tool_runner: Arc<dyn ToolRunner>,
     pub yes: bool,
-    pub history: Vec<Msg>,
+    /// 只由 agent loop 写入；对外只读，保证 tool_calls 与 Tool 结果的配对不变式。
+    history: Vec<Msg>,
 }
 
 /// REPL → agent loop 的内部错误通道。
@@ -189,6 +173,11 @@ impl Session {
             yes,
             history,
         }
+    }
+
+    /// 只读历史（测试与 REPL 检查用）；写入路径留在 agent loop 内。
+    pub fn history(&self) -> &[Msg] {
+        &self.history
     }
 
     /// `/clear`：历史重置为仅含 system 消息（播种语义同 new）。
@@ -498,7 +487,9 @@ impl Session {
 
     /// 切换思考档位（REPL /thinking）：无效档位拒绝；更新 selection.thinking。
     pub fn switch_thinking(&mut self, level: &str) -> Result<(), String> {
-        if let Some(e) = config::thinking_level_err(&self.selection.model, &self.selection.model_id, level) {
+        if let Some(e) =
+            config::thinking_level_err(&self.selection.model, &self.selection.model_id, level)
+        {
             return Err(e);
         }
         self.selection.thinking = Some(level.to_string());
@@ -536,7 +527,20 @@ struct CallOutcome {
 
 /// 参数/判定类错误（不停止批次）：作为该调用的 Tool 结果文本。
 fn tool_outcome(content: String) -> CallOutcome {
-    CallOutcome { content, stop: false }
+    CallOutcome {
+        content,
+        stop: false,
+    }
+}
+
+/// 确认流：allowlist 自动放行；否则向用户确认（--yes 跳过全部确认）。
+/// 判定留在 agent loop，工具执行层只负责 allowed / run_bash。
+fn gate(ui: &mut dyn Ui, yes: bool, cwd: &str, command: &str, allow: &[String]) -> ConfirmOutcome {
+    if tools::allowed(command, allow) || yes {
+        ConfirmOutcome::Yes
+    } else {
+        ui.confirm(cwd, command)
+    }
 }
 
 fn dispatch_tool_call(
@@ -570,7 +574,7 @@ fn dispatch_tool_call(
     emit(ui, RenderEvent::ToolCall(command.to_string()));
 
     let cwd = crate::session_cwd();
-    match tools::gate(ui, yes, &cwd, command, &bash_cfg.allow) {
+    match gate(ui, yes, &cwd, command, &bash_cfg.allow) {
         ConfirmOutcome::No => tool_outcome("用户拒绝执行".to_string()),
         ConfirmOutcome::Cancelled => CallOutcome {
             content: CANCELLED_PLACEHOLDER.to_string(),

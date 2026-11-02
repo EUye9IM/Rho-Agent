@@ -14,7 +14,7 @@
 - Rust 2021
 - 单 crate、单二进制
 - 阻塞 I/O + 线程，**不使用 async runtime**
-- 默认 DeepSeek，供应商/模型/thinking 由 TOML 配置驱动
+- 默认 DeepSeek；`protocol` 支持 `openai_chat` 与 `openai_responses`，供应商/模型/thinking 由 TOML 配置驱动
 - 只有一个 `bash` 工具，带 allowlist、确认 gate、超时和进程组清理
 - 分发目标是 Linux musl 静态二进制（x86_64 为主）
 
@@ -32,12 +32,13 @@
 ## 常用命令
 
 ```sh
+cargo fmt --all --check
 cargo build --all-targets --locked
 cargo test --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
-不要随手执行 `cargo fmt --all`：当前 rustfmt 版本会重排大量未改动文件，制造无关 diff。只格式化本次改动的文件，或手工保持与周围代码一致。
+格式化使用仓库根目录的 `rustfmt.toml`；格式化后跑 `cargo fmt --all --check`。只改少量文件时也可以 `rustfmt --check <files>`，但提交前以全仓库检查为准。
 
 ## musl release 构建
 
@@ -70,8 +71,11 @@ qemu-x86_64 -cpu qemu64 ./rho --config <https-config>
 ```text
 main → config
      → repl → chat → provider → sse
-                   → tools
-                   → ui / render / term
+                   ├→ tools → term
+                   ├→ ui → render
+                   └→ message / render / term
+
+chat 与 provider 共享 message；provider 不再依赖 chat。
 ```
 
 关键规则：
@@ -80,9 +84,11 @@ main → config
 - `ui` 模块（`ui/mod.rs`）负责终端输出；生产实现 `TermUi`，测试用 `ScriptedUi`（`ui/scripted.rs`）。
 - 不要在 `render` / `chat` 里直接 `println!`。
 - `provider` 每轮请求在工作线程读取 HTTP 流，经 `mpsc` 回主线程；不要引入 tokio/reqwest。
-- `chat::Msg` 是协议无关的内部消息模型；OpenAI 字段映射留在 `provider/openai.rs`。
+- `message::Msg` 是协议无关的内部消息模型；Chat Completions 字段映射留在 `provider/openai.rs`，Responses 映射留在 `provider/openai_responses.rs`。
+- bash 工具定义只在 `tool_spec.rs` 维护；各 adapter 只负责映射成自己的 wire format，不要复制 schema。
+- `ProviderAdapter::parse_chunk` 返回 `ChunkOutcome`；流结束标记与 `finish_reason` 的提交资格判定留在 provider worker。
 - 工具循环必须保证历史协议合法：所有 `tool_calls` 都要有对应 `Tool` 消息占位。
-- 取消语义、进程组清理、确认 gate 的行为以 `docs/architecture.md` 和现有代码为准，不要简化成“杀直接子进程”或“只 drop 连接”。
+- 取消语义、进程组清理、确认 gate 的行为以 `docs/architecture.md` 和现有代码为准，不要简化成“杀直接子进程”或“只 drop 连接”。确认 gate 由 `chat` 编排，`tools` 只负责 allowlist 判定与执行。
 
 ## 配置语义
 
@@ -91,15 +97,15 @@ main → config
 - 严格校验：未知字段、悬空引用、缺失必填项都报错；语义错误一次收集全部，TOML 语法/反序列化错误按首个报告。
 - `${VAR}` 只用于 header 值展开；缺失变量报错；明文密钥要告警。
 - 退出码：`0` 正常退出，`1` REPL 内部错误，`2` 参数/配置/供应商不可用等用法错误。
-- 不做隐式供应商分支；同协议族新供应商只加配置。
+- 不做隐式供应商分支；`protocol` 显式选择 `openai_chat` / `openai_responses`，同协议族新供应商只加配置，新增协议族才改 adapter。
 
 ## 测试要求
 
 改动行为时补对应层测试：
 
 - 纯单元：`sse.rs`、`config`、`tools` 判定/截断、`render`
-- 协议映射：`provider::openai`
-- agent loop + 工具：`ScriptedUi` + fake adapter
+- 协议映射：`provider::openai`（Chat Completions）与 `provider::openai_responses`（Responses）
+- agent loop + 工具：`ScriptedUi` + `StreamLauncher` / `ToolRunner` 注入
 - HTTP/SSE：`tests/e2e_mock.rs` 的本地 mock 服务
 - REPL：`tests/repl_flow.rs`
 

@@ -44,7 +44,10 @@ pub enum SignalState {
 impl Cancel {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(State { count: 0, prev_quit: false }),
+            inner: Mutex::new(State {
+                count: 0,
+                prev_quit: false,
+            }),
         })
     }
 
@@ -119,8 +122,7 @@ pub fn init() -> Result<Arc<Cancel>, String> {
 
     // self-pipe 用 socketpair：std 的 `UnixStream` 自带 CLOEXEC，并提供非阻塞开关与
     // 基于 `Read` 的阻塞读取，省去 pipe2/fcntl/close 的裸 fd 管理。
-    let (read_end, write_end) =
-        UnixStream::pair().map_err(|e| format!("创建信号管道失败：{e}"))?;
+    let (read_end, write_end) = UnixStream::pair().map_err(|e| format!("创建信号管道失败：{e}"))?;
     // 写端非阻塞：管道满时处理器直接丢弃（不能阻塞在信号上下文）。
     write_end
         .set_nonblocking(true)

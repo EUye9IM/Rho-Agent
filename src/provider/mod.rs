@@ -1,26 +1,30 @@
 //! 供应商适配层：trait、按 Provider 构造（注入 compat）并分发、流式请求工作线程。
 //! TLS/代理/Agent 缓存等 HTTP 基础设施在 `http` 子模块。
 
+mod common;
 mod http;
 mod openai;
+mod openai_responses;
 
 pub use openai::OpenAiChatAdapter;
+pub use openai_responses::OpenAiResponsesAdapter;
 
+use std::fmt;
 use std::io::{ErrorKind, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::chat::{AssistantMsg, Msg, ToolCall};
-use crate::config::{Model, Provider};
+use crate::config::{Model, Protocol, Provider};
+use crate::message::{AssistantMsg, Msg, ToolCall};
 use crate::sse::SseParser;
 use serde_json::Value;
 
 use http::{agent_for, shorten, MAX_ERROR_BODY_BYTES, MAX_RESPONSE_BYTES};
 
 /// 流事件（worker → 主线程，经无界 mpsc）。
-/// 终态只有两种：Final（完整 Assistant 消息）或 Error；`[DONE]` 与 finish_reason
+/// 终态只有两种：Final（完整 Assistant 消息）或 Error；流结束标记与 finish_reason
 /// 的提交资格判定完全内化在 worker，主线程收到即定论。
 #[derive(Debug)]
 pub enum StreamEvent {
@@ -32,6 +36,49 @@ pub enum StreamEvent {
     /// worker 组装完成的完整 Assistant 消息；收到它才提交
     Final(Box<AssistantMsg>),
     /// HTTP 错误 / 断流 / 非法 JSON / finish_reason=length|content_filter 等截断
+    Error(String),
+}
+
+/// 上游结束原因的内部归一化形式。适配器负责把协议字符串映射到这里，
+/// worker 只判断是否允许提交最终消息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishReason {
+    Stop,
+    ToolCalls,
+    Length,
+    ContentFilter,
+    Other(String),
+}
+
+impl FinishReason {
+    /// 只有正常停止或工具调用允许提交；截断/过滤/未知原因按 Error 收尾。
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, Self::Stop | Self::ToolCalls)
+    }
+}
+
+impl fmt::Display for FinishReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stop => f.write_str("stop"),
+            Self::ToolCalls => f.write_str("tool_calls"),
+            Self::Length => f.write_str("length"),
+            Self::ContentFilter => f.write_str("content_filter"),
+            Self::Other(reason) => f.write_str(reason),
+        }
+    }
+}
+
+/// 单个 chunk 的解析结果。`Delta` 由 worker 转成流事件；`Done` 表示协议层
+/// 已收到最终事件（可能同时携带最终数据，因此不能只看字符串结束标记）。
+#[derive(Debug)]
+pub enum ChunkOutcome {
+    Continue,
+    Delta {
+        text: Option<String>,
+        reasoning: Option<String>,
+    },
+    Done,
     Error(String),
 }
 
@@ -50,8 +97,8 @@ pub struct TurnAcc {
     pub reasoning: Option<String>,
     /// (index → 组装中的调用)
     pub tool_calls: std::collections::BTreeMap<usize, PartialToolCall>,
-    /// 最后一个 chunk 的 finish_reason；[DONE] 时据此判断提交资格
-    pub finish_reason: Option<String>,
+    /// 最后一个 chunk 的 finish_reason；结束时据此判断提交资格
+    pub finish_reason: Option<FinishReason>,
 }
 
 impl TurnAcc {
@@ -88,19 +135,24 @@ pub trait ProviderAdapter: Send + Sync {
         thinking: Option<&Value>,
     ) -> Value;
     fn headers(&self, p: &Provider) -> Vec<(String, String)>;
-    /// 解析单个 chunk：text/reasoning/tool_calls/finish_reason 累积进 `acc`；
-    /// 有渲染增量（text/reasoning）时返回 `Some(Delta)`，否则 `None`。
-    /// tool_calls 的组装只进 acc，不产生事件。
-    fn parse_chunk(&self, chunk: &Value, acc: &mut TurnAcc) -> Option<StreamEvent>;
+    /// 原始载荷是否表示流结束（OpenAI Chat 的 `[DONE]`）。
+    fn is_stream_end(&self, payload: &str) -> bool;
+    /// 解析单个 JSON chunk：增量与工具调用累积进 `acc`；协议最终事件返回 `Done`。
+    fn parse_chunk(&self, chunk: &Value, acc: &mut TurnAcc) -> ChunkOutcome;
 }
 
 /// 按 Provider 构造适配器：compat 开关（echo_reasoning 等）在构造时注入；
-/// protocol 不认识则报"不支持"（可展示错误，非 panic）。v1 只实现 openai_chat。
+/// protocol 不认识则报"不支持"（可展示错误，非 panic）。
 pub fn adapter_for(provider: &Provider) -> Result<Arc<dyn ProviderAdapter>, String> {
-    match provider.protocol.as_str() {
-        "openai_chat" => Ok(Arc::new(OpenAiChatAdapter::new(provider.compat.echo_reasoning))),
-        // Responses / Anthropic Messages：接口预留，v1 报不支持（exit 2 由调用方映射）
-        other => Err(format!("不支持的协议族：{other}（v1 只实现 openai_chat）")),
+    match Protocol::parse(&provider.protocol) {
+        Some(Protocol::OpenAiChat) => Ok(Arc::new(OpenAiChatAdapter::new(
+            provider.compat.echo_reasoning,
+        ))),
+        Some(Protocol::OpenAiResponses) => Ok(Arc::new(OpenAiResponsesAdapter::new())),
+        None => Err(format!(
+            "不支持的协议族：{}（支持 openai_chat、openai_responses）",
+            provider.protocol
+        )),
     }
 }
 
@@ -128,7 +180,7 @@ fn handle_payload(
     if payload.is_empty() {
         return PayloadOutcome::Continue;
     }
-    if payload == "[DONE]" {
+    if adapter.is_stream_end(payload) {
         return PayloadOutcome::Done;
     }
     let chunk: Value = match serde_json::from_str(payload) {
@@ -148,15 +200,24 @@ fn handle_payload(
         send_error(tx, format!("上游返回错误：{message}"));
         return PayloadOutcome::Fatal;
     }
-    if let Some(ev) = adapter.parse_chunk(&chunk, acc) {
-        if !send(tx, ev) {
-            return PayloadOutcome::Fatal;
+    match adapter.parse_chunk(&chunk, acc) {
+        ChunkOutcome::Continue => PayloadOutcome::Continue,
+        ChunkOutcome::Delta { text, reasoning } => {
+            if send(tx, StreamEvent::Delta { text, reasoning }) {
+                PayloadOutcome::Continue
+            } else {
+                PayloadOutcome::Fatal
+            }
+        }
+        ChunkOutcome::Done => PayloadOutcome::Done,
+        ChunkOutcome::Error(e) => {
+            send_error(tx, e);
+            PayloadOutcome::Fatal
         }
     }
-    PayloadOutcome::Continue
 }
 
-/// 逐条处理载荷；见到 [DONE] 或发送失败即提前返回（剩余载荷丢弃）。
+/// 逐条处理载荷；见到协议结束标记或发送失败即提前返回（剩余载荷丢弃）。
 fn drain_payloads(
     adapter: &Arc<dyn ProviderAdapter>,
     acc: &mut TurnAcc,
@@ -190,21 +251,26 @@ impl FirstByteWatchdog {
             let tx_watch = tx.clone();
             let first_seen_w = first_seen.clone();
             let aborted_w = aborted.clone();
-            std::thread::spawn(move || match first_rx.recv_timeout(Duration::from_secs(60)) {
-                Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
-                Err(RecvTimeoutError::Timeout) => {
-                    // 超时后先给一段宽限再判：避免与 worker 的 first_seen 置位竞争而误报。
-                    std::thread::sleep(Duration::from_millis(250));
-                    if !first_seen_w.load(Ordering::SeqCst) {
-                        aborted_w.store(true, Ordering::SeqCst);
-                        let _ = tx_watch.send(StreamEvent::Error(
-                            "等待响应首字节超时（60s）".into(),
-                        ));
+            std::thread::spawn(
+                move || match first_rx.recv_timeout(Duration::from_secs(60)) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+                    Err(RecvTimeoutError::Timeout) => {
+                        // 超时后先给一段宽限再判：避免与 worker 的 first_seen 置位竞争而误报。
+                        std::thread::sleep(Duration::from_millis(250));
+                        if !first_seen_w.load(Ordering::SeqCst) {
+                            aborted_w.store(true, Ordering::SeqCst);
+                            let _ = tx_watch
+                                .send(StreamEvent::Error("等待响应首字节超时（60s）".into()));
+                        }
                     }
-                }
-            });
+                },
+            );
         }
-        Self { first_seen, aborted, first_tx }
+        Self {
+            first_seen,
+            aborted,
+            first_tx,
+        }
     }
 
     /// 收到响应体首字节后调用（仅首次生效）：看门狗退出。
@@ -343,13 +409,13 @@ pub fn stream_request(
         }
     }
     if !saw_done {
-        send_error(&tx, "响应流意外结束（未收到 [DONE]）");
+        send_error(&tx, "响应流意外结束（未收到流结束标记）");
         return;
     }
-    // [DONE] 与 finish_reason 判定留在 worker：截断原因在这里转成 Error，
-    // 主线程收到的 Final 一定有提交资格。
-    if let Some(reason) = acc.finish_reason.as_deref() {
-        if reason != "stop" && reason != "tool_calls" {
+    // 结束标记与 finish_reason 判定留在 worker：截断原因在这里转成 Error，
+    // 主线程收到的 Final 一定有提交资格。缺失 reason 仍按历史行为接受。
+    if let Some(reason) = acc.finish_reason.as_ref() {
+        if !reason.is_accepted() {
             send_error(&tx, format!("上游以截断原因结束响应：{reason}"));
             return;
         }
@@ -364,7 +430,10 @@ mod tests {
 
     #[test]
     fn acc_assembles_by_index() {
-        let mut acc = TurnAcc { text: Some("hi".into()), ..Default::default() };
+        let mut acc = TurnAcc {
+            text: Some("hi".into()),
+            ..Default::default()
+        };
         acc.tool_calls.insert(
             1,
             PartialToolCall {

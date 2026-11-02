@@ -1,6 +1,6 @@
 //! 配置严格校验：悬空引用、前缀对应、必填字段；一次收集并报告全部错误。
 
-use super::{find_model, find_provider, model_provider_prefix, Config};
+use super::{find_model, find_provider, model_provider_prefix, Config, Protocol};
 
 /// 单条校验错误。语义错误只到字段路径级；TOML 语法错误才带行号。
 #[derive(Debug)]
@@ -10,7 +10,10 @@ pub struct ValidationError {
 }
 
 fn err(path: impl Into<String>, message: impl Into<String>) -> ValidationError {
-    ValidationError { path: path.into(), message: message.into() }
+    ValidationError {
+        path: path.into(),
+        message: message.into(),
+    }
 }
 
 /// 收集全部校验错误（不首个即停）：
@@ -23,12 +26,18 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<ValidationError>> {
 
     if let Some(p) = &cfg.default_provider {
         if find_provider(cfg, p).is_none() {
-            errs.push(err("default_provider", format!("悬空引用：未声明的供应商 `{p}`")));
+            errs.push(err(
+                "default_provider",
+                format!("悬空引用：未声明的供应商 `{p}`"),
+            ));
         }
     }
     if let Some(m) = &cfg.default_model {
         if find_model(cfg, m).is_none() {
-            errs.push(err("default_model", format!("悬空引用：未声明的模型 `{m}`")));
+            errs.push(err(
+                "default_model",
+                format!("悬空引用：未声明的模型 `{m}`"),
+            ));
         }
     }
 
@@ -36,10 +45,13 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<ValidationError>> {
         let path = format!("providers.{id}");
         if provider.protocol.trim().is_empty() {
             errs.push(err(format!("{path}.protocol"), "必填字段不能为空"));
-        } else if !matches!(provider.protocol.as_str(), "openai_chat") {
+        } else if Protocol::parse(&provider.protocol).is_none() {
             errs.push(err(
                 format!("{path}.protocol"),
-                format!("未知协议族 `{}`（v1 只支持 openai_chat）", provider.protocol),
+                format!(
+                    "未知协议族 `{}`（支持 openai_chat、openai_responses）",
+                    provider.protocol
+                ),
             ));
         }
         if provider.base_url.trim().is_empty() {

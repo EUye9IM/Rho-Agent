@@ -14,6 +14,24 @@ pub use validate::{validate, ValidationError};
 /// 且 serde 原生支持反序列化任意值类型（toml::map::Map 只对 Value 实现 trait）。
 pub type OrderedMap<V> = indexmap::IndexMap<String, V>;
 
+/// 已实现的协议族。配置字段保持字符串，校验时经此解析，
+/// 以保留“语义错误一次收集全部”的行为。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    OpenAiChat,
+    OpenAiResponses,
+}
+
+impl Protocol {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "openai_chat" => Some(Self::OpenAiChat),
+            "openai_responses" => Some(Self::OpenAiResponses),
+            _ => None,
+        }
+    }
+}
+
 /// 顶层配置。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,7 +49,7 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provider {
-    pub protocol: String, // v1 只实现 "openai_chat"
+    pub protocol: String, // 经 Protocol::parse 解析；当前支持 openai_chat / openai_responses
     pub base_url: String,
     #[serde(default)]
     pub auth: AuthConfig,
@@ -96,7 +114,11 @@ fn default_max_output() -> usize {
 
 impl Default for BashToolConfig {
     fn default() -> Self {
-        Self { allow: Vec::new(), timeout_seconds: default_timeout(), max_output_bytes: default_max_output() }
+        Self {
+            allow: Vec::new(),
+            timeout_seconds: default_timeout(),
+            max_output_bytes: default_max_output(),
+        }
     }
 }
 
@@ -119,8 +141,8 @@ pub fn load(path: &Option<String>) -> Result<Config, String> {
 }
 
 fn load_file(path: &str) -> Result<Config, String> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|e| format!("无法读取配置文件 {path}：{e}"))?;
+    let source =
+        std::fs::read_to_string(path).map_err(|e| format!("无法读取配置文件 {path}：{e}"))?;
     // 报错文案带文件路径而非通用标签。
     parse_and_validate(&source, path)
 }
@@ -332,4 +354,19 @@ pub fn providers_in_order(cfg: &Config) -> impl Iterator<Item = (&String, &Provi
 
 pub fn models_in_order(cfg: &Config) -> impl Iterator<Item = (&String, &Model)> {
     cfg.models.iter()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_parses_known_values() {
+        assert_eq!(Protocol::parse("openai_chat"), Some(Protocol::OpenAiChat));
+        assert_eq!(
+            Protocol::parse("openai_responses"),
+            Some(Protocol::OpenAiResponses)
+        );
+        assert_eq!(Protocol::parse("anthropic_messages"), None);
+    }
 }

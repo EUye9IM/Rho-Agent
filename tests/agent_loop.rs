@@ -34,11 +34,19 @@ fn session() -> Session {
 }
 
 fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
-    ToolCall { id: id.into(), name: name.into(), arguments: arguments.into() }
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: arguments.into(),
+    }
 }
 
 fn assistant_with_calls(calls: Vec<ToolCall>) -> AssistantMsg {
-    AssistantMsg { text: None, reasoning: None, tool_calls: calls }
+    AssistantMsg {
+        text: None,
+        reasoning: None,
+        tool_calls: calls,
+    }
 }
 
 fn text_final(t: &str) -> StreamEvent {
@@ -63,7 +71,9 @@ struct ScriptedLauncher {
 
 impl ScriptedLauncher {
     fn new(scripts: Vec<Vec<StreamEvent>>) -> Self {
-        Self { scripts: Mutex::new(scripts) }
+        Self {
+            scripts: Mutex::new(scripts),
+        }
     }
 }
 
@@ -77,11 +87,7 @@ impl StreamLauncher for ScriptedLauncher {
         _cancelled: Arc<AtomicBool>,
     ) -> Receiver<StreamEvent> {
         // 在主线程取脚本：耗尽时直接 panic 在测试线程，失败可见。
-        let script = self
-            .scripts
-            .lock()
-            .unwrap()
-            .remove(0);
+        let script = self.scripts.lock().unwrap().remove(0);
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             for ev in script {
@@ -137,7 +143,10 @@ struct PresetRunner {
 
 impl ToolRunner for PresetRunner {
     fn run(&self, _command: &str, _cfg: &BashToolConfig, _cancel: &Cancel) -> BashOutput {
-        BashOutput { content: self.output.clone(), end: BashEnd::Exited(0) }
+        BashOutput {
+            content: self.output.clone(),
+            end: BashEnd::Exited(0),
+        }
     }
 }
 
@@ -185,7 +194,11 @@ struct FailingUi {
 
 impl FailingUi {
     fn new(prints_left: usize, confirms: Vec<ConfirmOutcome>) -> Self {
-        Self { prints_left, confirms: confirms.into(), fatal: None }
+        Self {
+            prints_left,
+            confirms: confirms.into(),
+            fatal: None,
+        }
     }
 }
 
@@ -229,11 +242,11 @@ fn first_call_failures_do_not_block_rest() {
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done), "end was {end:?}");
     // User + Assistant(3 calls) + 3×Tool + Assistant(done)
-    assert_eq!(session.history.len(), 6);
-    assert!(tool_result_content(&session.history, 2).contains("未知工具：nope"));
-    assert!(tool_result_content(&session.history, 3).contains("参数解析失败"));
-    assert_eq!(tool_result_content(&session.history, 4), "用户拒绝执行");
-    match &session.history[5] {
+    assert_eq!(session.history().len(), 6);
+    assert!(tool_result_content(session.history(), 2).contains("未知工具：nope"));
+    assert!(tool_result_content(session.history(), 3).contains("参数解析失败"));
+    assert_eq!(tool_result_content(session.history(), 4), "用户拒绝执行");
+    match &session.history()[5] {
         Msg::Assistant(a) => {
             assert_eq!(a.text.as_deref(), Some("done"));
             assert!(a.tool_calls.is_empty());
@@ -245,61 +258,61 @@ fn first_call_failures_do_not_block_rest() {
 #[test]
 fn confirm_cancel_places_placeholders_for_remaining() {
     let mut session = session();
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![
-        StreamEvent::Final(Box::new(assistant_with_calls(vec![
+    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![StreamEvent::Final(
+        Box::new(assistant_with_calls(vec![
             call("c1", "bash", CMD),
             call("c2", "bash", CMD),
-        ]))),
-    ]]));
+        ])),
+    )]]));
     let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::Cancelled]);
     let cancel = Cancel::new();
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Cancelled), "end was {end:?}");
-    assert_eq!(session.history.len(), 4);
-    assert_eq!(tool_result_content(&session.history, 2), "用户取消执行");
-    assert_eq!(tool_result_content(&session.history, 3), "用户取消执行");
+    assert_eq!(session.history().len(), 4);
+    assert_eq!(tool_result_content(session.history(), 2), "用户取消执行");
+    assert_eq!(tool_result_content(session.history(), 3), "用户取消执行");
 }
 
 #[test]
 fn execution_cancel_keeps_partial_result() {
     let mut session = session();
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![
-        StreamEvent::Final(Box::new(assistant_with_calls(vec![
+    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![StreamEvent::Final(
+        Box::new(assistant_with_calls(vec![
             call("c1", "bash", CMD),
             call("c2", "bash", CMD),
-        ]))),
-    ]]));
+        ])),
+    )]]));
     session.tool_runner = Arc::new(InjectingRunner { injects: 1 });
     let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::Yes]);
     let cancel = Cancel::new();
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Cancelled), "end was {end:?}");
-    assert_eq!(session.history.len(), 4);
+    assert_eq!(session.history().len(), 4);
     // 当前调用保留部分执行结果，剩余调用补取消占位。
-    assert!(tool_result_content(&session.history, 2).contains("已部分执行"));
-    assert_eq!(tool_result_content(&session.history, 3), "用户取消执行");
+    assert!(tool_result_content(session.history(), 2).contains("已部分执行"));
+    assert_eq!(tool_result_content(session.history(), 3), "用户取消执行");
 }
 
 #[test]
 fn quit_during_cleanup_exits_after_placeholders() {
     let mut session = session();
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![
-        StreamEvent::Final(Box::new(assistant_with_calls(vec![
+    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![StreamEvent::Final(
+        Box::new(assistant_with_calls(vec![
             call("c1", "bash", CMD),
             call("c2", "bash", CMD),
-        ]))),
-    ]]));
+        ])),
+    )]]));
     // 执行中一次取消 + 清理期间升级第二次：收尾完成后退出。
     session.tool_runner = Arc::new(InjectingRunner { injects: 2 });
     let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::Yes]);
     let cancel = Cancel::new();
 
     assert!(session.turn(&mut ui, &cancel, "go").is_err());
-    assert_eq!(session.history.len(), 4);
-    assert!(tool_result_content(&session.history, 2).contains("已部分执行"));
-    assert_eq!(tool_result_content(&session.history, 3), "用户取消执行");
+    assert_eq!(session.history().len(), 4);
+    assert!(tool_result_content(session.history(), 2).contains("已部分执行"));
+    assert_eq!(tool_result_content(session.history(), 3), "用户取消执行");
 }
 
 #[test]
@@ -319,7 +332,7 @@ fn sustained_delta_is_cancellable() {
     injector.join().unwrap();
     assert!(matches!(end, TurnEnd::Cancelled), "end was {end:?}");
     // 未完成的 assistant 响应不进入历史。
-    assert_eq!(session.history.len(), 1);
+    assert_eq!(session.history().len(), 1);
 }
 
 #[test]
@@ -337,7 +350,7 @@ fn quit_during_stream_returns_quit() {
 
     assert!(session.turn(&mut ui, &cancel, "go").is_err());
     injector.join().unwrap();
-    assert_eq!(session.history.len(), 1);
+    assert_eq!(session.history().len(), 1);
 }
 
 #[test]
@@ -358,7 +371,10 @@ fn disconnect_without_terminal_is_error() {
 fn render_failure_during_stream_aborts_before_commit() {
     let mut session = session();
     session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![
-        StreamEvent::Delta { text: Some("partial".into()), reasoning: None },
+        StreamEvent::Delta {
+            text: Some("partial".into()),
+            reasoning: None,
+        },
         text_final("done"),
     ]]));
     // 首个 Delta 渲染即失败：流收尾后不提交 Assistant，不执行工具。
@@ -369,18 +385,18 @@ fn render_failure_during_stream_aborts_before_commit() {
         rho::chat::TurnEnd::Fatal(e) => assert!(e.contains("EPIPE"), "error was {e}"),
         other => panic!("unexpected {other:?}"),
     }
-    assert_eq!(session.history.len(), 1);
+    assert_eq!(session.history().len(), 1);
 }
 
 #[test]
 fn render_failure_mid_batch_placeholders_remaining_then_fatal() {
     let mut session = session();
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![
-        StreamEvent::Final(Box::new(assistant_with_calls(vec![
+    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![StreamEvent::Final(
+        Box::new(assistant_with_calls(vec![
             call("c1", "bash", CMD),
             call("c2", "bash", CMD),
-        ]))),
-    ]]));
+        ])),
+    )]]));
     // 第一次 print（ToolCall 行）成功，第二个调用的结果渲染开始失败。
     let mut ui = FailingUi::new(1, vec![ConfirmOutcome::Yes]);
     session.tool_runner = Arc::new(PresetRunner {
@@ -393,9 +409,12 @@ fn render_failure_mid_batch_placeholders_remaining_then_fatal() {
         other => panic!("unexpected {other:?}"),
     }
     // 配对不变式：Assistant 提交后每个调用都有 Tool 结果。
-    assert_eq!(session.history.len(), 4);
-    assert!(tool_result_content(&session.history, 2).contains("hi"));
-    assert_eq!(tool_result_content(&session.history, 3), "终端输出失败，未执行");
+    assert_eq!(session.history().len(), 4);
+    assert!(tool_result_content(session.history(), 2).contains("hi"));
+    assert_eq!(
+        tool_result_content(session.history(), 3),
+        "终端输出失败，未执行"
+    );
 }
 
 #[test]
@@ -405,9 +424,9 @@ fn invalid_tool_call_ids_are_rejected_before_submit() {
         vec![call("c1", "bash", CMD), call("c1", "bash", CMD)],
     ] {
         let mut session = session();
-        session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![
-            StreamEvent::Final(Box::new(assistant_with_calls(calls))),
-        ]]));
+        session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![StreamEvent::Final(
+            Box::new(assistant_with_calls(calls)),
+        )]]));
         let mut ui = ScriptedUi::new(vec![], vec![]);
         let cancel = Cancel::new();
 
@@ -416,6 +435,6 @@ fn invalid_tool_call_ids_are_rejected_before_submit() {
             other => panic!("unexpected {other:?}"),
         }
         // 非法 Assistant 不提交：历史只有用户输入。
-        assert_eq!(session.history.len(), 1);
+        assert_eq!(session.history().len(), 1);
     }
 }

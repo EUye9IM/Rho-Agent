@@ -4,7 +4,7 @@
 
 [English](README.md) | **简体中文**
 
-`rho` 是一个跑在终端里的轻量本地 agent。单 crate、单二进制（分发建议使用 musl 静态构建），使用阻塞 I/O + 线程，面向资源受限的 Linux 设备。你在 REPL 里对话，它从兼容 OpenAI Chat Completions 的供应商（默认 DeepSeek）流式返回结果，并能通过 `bash` 工具执行命令——执行前要过 allowlist 判定和人工确认。
+`rho` 是一个跑在终端里的轻量本地 agent。单 crate、单二进制（分发建议使用 musl 静态构建），使用阻塞 I/O + 线程，面向资源受限的 Linux 设备。你在 REPL 里对话，它从兼容 OpenAI Chat Completions 的供应商（默认 DeepSeek）流式返回结果，也可通过配置使用 OpenAI Responses 协议，并能通过 `bash` 工具执行命令——执行前要过 allowlist 判定和人工确认。
 
 ## 愿景
 
@@ -15,7 +15,7 @@ rho 要做一个运行在资源受限 Linux 设备上的本地 agent：单二进
 ## 特性
 
 - **轻** —— 单 crate 单二进制，使用阻塞 I/O + 线程，release 开启 `strip` + LTO + `panic = "abort"`。
-- **配置驱动** —— 供应商、模型、思考档位都由数据声明；同协议族接入新供应商只加配置。
+- **配置驱动** —— 供应商、模型、思考档位都由数据声明；支持 `openai_chat` 与 `openai_responses`，切换协议只改配置。
 - **流式 + 思考可见** —— 正文逐块输出；`reasoning_content` 以暗淡色实时展示，默认只留在本地，仅当供应商配置 `compat.echo_reasoning = true` 时随历史回传。
 - **只有一个工具：`bash`** —— 前台执行 `bash -c <命令>`，每次调用启动新的 shell，单次超时后按进程组逐级终止。
 - **可预测的 Ctrl-C** —— 第一次取消当前流式/工具/确认，立即回到提示符（取消标志在逐块之间轮询生效；连接停滞无数据时，后台读取在下一块数据到达或空闲超时后结束），第二次退出；空闲提示符下两次空行 Ctrl-C（2 秒内）同样退出，第一次会在输入行尾显示灰色提示。对话历史在任何时刻都保持协议合法（工具调用必有对应结果）。
@@ -104,7 +104,7 @@ system_prompt    = "你是 rho，一个轻量本地运维助手。"  # 省略则
 max_tool_steps   = 25
 
 [providers.deepseek]
-protocol = "openai_chat"                        # 当前实现的协议族
+protocol = "openai_chat"                        # openai_chat 或 openai_responses
 base_url = "https://api.deepseek.com"
 
 [providers.deepseek.auth]
@@ -134,6 +134,7 @@ max_output_bytes = 16384
 要点：
 
 - 模型 id 全局唯一且必须带供应商前缀（`deepseek/deepseek-v4-pro`），前缀须对应已声明的供应商；上游 `model` 字段默认取第一个 `/` 之后的部分，`max_output` 作为输出 token 上限一并发给上游。
+- `protocol` 支持 `openai_chat`（Chat Completions，`/chat/completions`）与 `openai_responses`（Responses，`/responses`）；后者把历史映射为 `input` items，并用 `max_output_tokens` 限制输出。
 - 认证 header 中的 `${VAR}` 在选择供应商时逐个展开：变量缺失只让该供应商不可用，不影响其他供应商——除非该供应商是被显式指定的。
 - 思考档位的值是 JSON 对象片段，请求时顶层合并进 body；档位名由配置自定义。
 - 校验严格：未知字段、悬空引用、缺失必填字段直接拒绝启动（退出码 2，并给出配置路径；TOML 语法错误另带行号）。
@@ -156,10 +157,11 @@ max_output_bytes = 16384
 ## 测试
 
 ```sh
+cargo fmt --all --check
 cargo test --all-targets --locked
 ```
 
-CI 在每次 push 到 `master` 或 `dev`、以及每个 PR 上，用 stable Rust 跑测试。测试使用本地 mock：协议层用 `TcpListener` 手写本地 SSE mock，REPL/agent loop 用脚本化的 `Ui` 实现驱动真实主循环。`term.rs` 里从信号到记录这一段，以及真实终端交互，由 PTY 集成测试覆盖（openpty 驱动真实二进制，屏幕断言走 vt100 网格）。
+CI 在每次 push 到 `master` 或 `dev`、以及每个 PR 上，用 stable Rust 跑格式检查、clippy 和测试。测试使用本地 mock：协议层用 `TcpListener` 手写本地 SSE mock，REPL/agent loop 用脚本化的 `Ui` 实现驱动真实主循环。`term.rs` 里从信号到记录这一段，以及真实终端交互，由 PTY 集成测试覆盖（openpty 驱动真实二进制，屏幕断言走 vt100 网格）。
 
 ## 许可
 

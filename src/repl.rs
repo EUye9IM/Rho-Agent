@@ -144,7 +144,11 @@ fn handle_command(ui: &mut dyn Ui, session: &mut Session, line: &str) -> Command
                     if config::model_provider_prefix(id) != Some(provider_id.as_str()) {
                         continue;
                     }
-                    let mark = if id == &session.selection.model_id { "*" } else { " " };
+                    let mark = if id == &session.selection.model_id {
+                        "*"
+                    } else {
+                        " "
+                    };
                     lines.push(format!("  {mark} {id}"));
                 }
                 text(ui, &lines.join("\n"));
@@ -159,7 +163,11 @@ fn handle_command(ui: &mut dyn Ui, session: &mut Session, line: &str) -> Command
             if arg.is_empty() {
                 let mut lines = vec!["可用供应商：".to_string()];
                 for (id, _) in config::providers_in_order(&session.cfg) {
-                    let mark = if id == &session.selection.provider_id { "*" } else { " " };
+                    let mark = if id == &session.selection.provider_id {
+                        "*"
+                    } else {
+                        " "
+                    };
                     let status = match config::provider_availability(&session.cfg, id) {
                         Ok(()) => String::new(),
                         Err(e) => format!("（不可用：{e}）"),
@@ -181,20 +189,15 @@ fn handle_command(ui: &mut dyn Ui, session: &mut Session, line: &str) -> Command
             CommandResult::Continue
         }
         "/thinking" => {
-            let levels: Vec<String> = session
-                .selection
-                .model
-                .thinking
-                .keys()
-                .cloned()
-                .collect();
+            let levels: Vec<String> = session.selection.model.thinking.keys().cloned().collect();
             if arg.is_empty() {
                 if levels.is_empty() {
                     text(ui, "当前模型未声明思考档位");
                 } else {
                     let mut lines = vec!["可用思考档位：".to_string()];
                     for level in &levels {
-                        let mark = if session.selection.thinking.as_deref() == Some(level.as_str()) {
+                        let mark = if session.selection.thinking.as_deref() == Some(level.as_str())
+                        {
                             "*"
                         } else {
                             " "
@@ -239,7 +242,10 @@ mod tests {
     fn window_covers_exactly_two_seconds() {
         let armed = Instant::now();
         assert!(within_window(armed, armed));
-        assert!(within_window(armed, armed + CTRL_C_WINDOW - Duration::from_millis(1)));
+        assert!(within_window(
+            armed,
+            armed + CTRL_C_WINDOW - Duration::from_millis(1)
+        ));
         assert!(!within_window(armed, armed + CTRL_C_WINDOW));
         assert!(!within_window(armed, armed + Duration::from_secs(30)));
     }
