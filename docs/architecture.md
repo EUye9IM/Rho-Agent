@@ -132,7 +132,7 @@ enum ConfirmOutcome {
 ```
 
 - 退出语义：`read_line` 只返回 `Line`/`Interrupted`/`Eof`；`/exit` 作为普通 `Line` 由 REPL 层解析为退出（斜杠命令由 repl.rs 解析）。空行 Ctrl-C 返回 `Interrupted`；REPL 层按 2 秒双按窗口判定——窗口内第二次才退出，第一次只武装并在提示符行尾显示灰提示，编辑中（`line_empty: false`）按 Ctrl-C 清行并撤销武装，任何提交的行（含空行）都清掉武装。`ConfirmOutcome::Cancelled` 是确认界面的 Ctrl-C，取消整轮（若为当前轮第二次则收尾后退出，见信号计数）。
-- **Ctrl-C 的唯一记录生产者是专用信号线程**（confirm 场景）：终端保持 ISIG，Ctrl-C 产生 SIGINT，经 self-pipe/signalfd 由信号线程在锁内追加记录；`confirm` 的可中断读取由 SIGINT 唤醒返回 `Cancelled`；记录只由信号线程追加，计数只有一份。
+- **Ctrl-C 的唯一记录生产者是专用信号线程**（confirm 场景）：终端保持 ISIG，Ctrl-C 产生 SIGINT，经 self-pipe（socketpair）由信号线程在锁内追加记录；`confirm` 的可中断读取由 SIGINT 唤醒返回 `Cancelled`；记录只由信号线程追加，计数只有一份。
 - **rustyline 输入路径**：rustyline 原始模式会接管 SIGINT，Ctrl-C 由 rustyline 返回 `Interrupted`，REPL 层直接处理（清行/进入双按窗口）。这条路径属于按键输入；信号线程只处理活动操作（流式/工具/确认）的 SIGINT。两套路径在时间上互斥，计数保持唯一；`readline` 返回后到下一次关掉 ISIG 之间有一段 cooked 模式缝隙，落在缝隙里的 Ctrl-C 会被记成当前轮的 cancel，切轮时按旧轮单条记录作废（见五）。
 - **Ui trait 只负责输入、确认和输出**：退出有两条路径——① REPL 层判定（`/exit`、`Eof`、空行 Ctrl-C 双按）发生在回合之间的输入阶段，此时没有进行中的调用，直接退出；② 活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测，按占位规则收尾、完成工具进程清理后以 `ChatResult` 的 `Err(Quit)` 上抛退出。`Quit` 只承载路径 ② 的回合内传播。
 
@@ -200,17 +200,17 @@ loop {
 
 ```rust
 struct Cancel {
-    inner: Mutex<State>, // epoch、记录追加、切轮共用同一把锁
+    inner: Mutex<State>, // 计数追加、查询、切轮共用同一把锁
 }
-struct State { epoch: u64, records: Vec<u32 /*第几次 Ctrl-C*/>, prev_quit: bool }
+struct State { count: u32 /*当前轮 Ctrl-C 次数*/, prev_quit: bool }
 ```
 
-- **异步信号安全**：信号处理器只做最小动作（向 socketpair 写一个字节，或写 signalfd）；取锁、读取 epoch 和追加记录都由**专用信号线程**在普通线程上下文完成。活动操作（流式/工具/确认）期间，Ctrl-C 记录只由这个线程产生；REPL 输入态的 Ctrl-C 走 rustyline 按键路径（见 ui 模块一节）。专用线程与主线程切轮在同一锁内串行化——信号线程先拿锁则记入旧轮并被结转，切轮先拿锁则记入新轮，两种顺序新轮都能看到，旧轮尚未消费的 quit 会结转，下一轮仍触发退出。
-- 主线程查询：锁内看 `prev_quit`（则退出）或当前轮记录——第 1 次为 cancel，第 2 次及以上为 quit；旧轮非 quit 记录作废。
+- **异步信号安全**：信号处理器只做最小动作（向 socketpair 写一个字节）；取锁和追加计数都由**专用信号线程**在普通线程上下文完成。活动操作（流式/工具/确认）期间，Ctrl-C 记录只由这个线程产生；REPL 输入态的 Ctrl-C 走 rustyline 按键路径（见 ui 模块一节）。专用线程与主线程切轮在同一锁内串行化——信号线程先拿锁则记入旧轮并被结转，切轮先拿锁则记入新轮，两种顺序新轮都能看到，旧轮尚未消费的 quit 会结转，下一轮仍触发退出。
+- 主线程查询：锁内看 `prev_quit`（则退出）或当前轮计数——1 为 cancel，≥2 为 quit；切轮（`advance_epoch`）时计数清零，旧轮 quit 结转为 `prev_quit`，旧轮单次 cancel 作废。
 - 消费点：渲染/接收循环（`recv_timeout` 短轮询，超时即查；**成功收到事件也先查再处理**）、工具等待循环（触发进程组升级终止；发现 quit 只终止进程组并**返回“quit 已请求”给 agent loop**，由 agent loop 收尾）、agent loop（按占位规则补齐当前及剩余调用后回 REPL 或统一退出程序）。工具执行/清理期间由当前轮信号记录承接第二次 Ctrl-C。
 - 流线程取消：主线程 drop Receiver 并置位取消标志（`Arc<AtomicBool>`）→ worker 在读取循环中每次 `read` 返回后、以及每次 `send` 前轮询它，立即退出并静默返回（主线程已放弃接收）。读超时是 socket 级的 `timeout_read`：ureq 只有一个旋钮且同样作用于读取响应头，所以取空闲上限 120s，不用短超时轮询——上游“思考”数秒才回头是常态。取消后若连接完全无数据，worker 最多滞留到该读超时；因此取消的及时性以“下一块数据到达”为界。另有一条整轮响应体累计上限 32MiB（超限按流错误收尾），channel 为无界 `mpsc`：无界使发送永不阻塞，配合 drop-Receiver 早退语义最简单。
 - 工具执行与进程组终止：`setsid` 建进程组；stdout/stderr 各起一个 drain 线程并行读取。清理结果三状态显式化：`waitpid` 错误（`ReapFailed`）与信号退出区分、drain 管道非阻塞设置失败显式放弃剩余输出、`kill_pg` 失败以警告行附于输出。截断缓冲为两段结构：头部前缀（上限前半）+ 滑动尾部窗口（上限后半），中间字节计数丢弃，按头尾保留语义处理。**主线程是唯一 reaper**：`waitpid` 只由主线程执行，退出状态存入共享标志；drain 线程只轮询共享退出标志，观察到退出后进入收尾阶段（短超时上限内继续读取管道中已缓冲的剩余数据，防止后台进程持续写入），超时或 EOF 即退出线程并关闭自己持有的读端；主线程只负责 `waitpid`，读端由 drain 线程持有。终止升级以进程组为准：SIGTERM 发 pgid → 2s → 对 pgid 发 SIGKILL → 主线程回收 bash（直接子进程回收条件与进程组清理条件分离）。
-- **Ctrl-C 的两套记录互不复用**：活动操作（流式/工具/确认）的计数归 `Cancel`（信号线程写入，只看次数和 epoch，没有时间概念）；提示符态的双按武装归 `repl` 的一个 `Option<Instant>`，窗口常量 `CTRL_C_WINDOW` 与 `ui` 模块共用，从不写入 `Cancel`。rustyline 在 `readline` 期间清掉 ISIG，两套记录在时间上互斥；唯一的交叠是 `readline` 返回到下一次关 ISIG 之间的 cooked 模式缝隙，那里收到的 Ctrl-C 会被记成当前轮的一次 cancel，而切轮会丢弃旧轮的单条 cancel，用户可见行为不变（只有凑巧与下一次请求竞争的 cancel 才会取消那一轮）。
+- **Ctrl-C 的两套记录互不复用**：活动操作（流式/工具/确认）的计数归 `Cancel`（信号线程写入，只看次数，按轮清零，没有时间概念）；提示符态的双按武装归 `repl` 的一个 `Option<Instant>`，窗口常量 `CTRL_C_WINDOW` 与 `ui` 模块共用，从不写入 `Cancel`。rustyline 在 `readline` 期间清掉 ISIG，两套记录在时间上互斥；唯一的交叠是 `readline` 返回到下一次关 ISIG 之间的 cooked 模式缝隙，那里收到的 Ctrl-C 会被记成当前轮的一次 cancel，而切轮会丢弃旧轮的单条 cancel，用户可见行为不变（只有凑巧与下一次请求竞争的 cancel 才会取消那一轮）。
 - quit（当前轮第二次 Ctrl-C）被消费即走退出路径；切轮时旧轮未消费的 quit 结转为 `prev_quit`，下一轮查询时仍触发退出。
 
 ## 六、错误与退出码
@@ -235,4 +235,4 @@ exit 0：/exit、空闲态 Ctrl-C 双按、Ctrl-D（均正常退出）
 | provider + HTTP 层 | 集成：本地 mock SSE 服务（std TcpListener 手写），测协议映射与流读取 |
 | 端到端工具循环 | 集成：mock SSE 服务驱动多轮真实 HTTP 请求，验证占位 Tool 消息的配对/顺序/第二次请求序列化（含 echo_reasoning） |
 | 取消/退出 | 集成：`ScriptedUi` 注入 `Line("/exit")`、`Eof` 验证退出路径；注入 `Interrupted{line_empty}` 序列验证 2 秒双按窗口、编辑中撤销、提交行清除武装（并断言 `set_ctrl_c_hint` 序列）；直接注入信号记录（第 1 次）验证流式取消路径——quit 路径（第 2 次）的计数判定由 `term.rs` 单元测试覆盖，端到端行为由 PTY 测试覆盖 |
-| 终端交互 / 真实信号 | PTY 集成（`tests/pty.rs`）：openpty 起真实 rho 二进制 + vt100 屏幕网格断言，覆盖信号到记录链路（on_sigint → self-pipe → 信号线程 → Cancel：流式取消/双按 quit/确认取消）、灰提示出现与到期擦除、行回收、bash 超时表现。窄终端提示换行、宽字符/tab 边界等布局细节仍手工抽查。已知竞态：行回收后的新提示符存在毫秒级输入丢失窗口（见 maintainability-review） |
+| 终端交互 / 真实信号 | PTY 集成（`tests/pty.rs`）：openpty 起真实 rho 二进制 + vt100 屏幕网格断言，覆盖信号到记录链路（on_sigint → self-pipe → 信号线程 → Cancel：流式取消/双按 quit/确认取消）、灰提示出现与到期擦除、行回收、bash 超时表现。窄终端提示换行、宽字符/tab 边界等布局细节仍手工抽查。已知竞态：行回收后新提示符出现的毫秒级窗口内写入的首字节可能丢失（macOS 实测，定位在内核 PTY 层 slave 端 `tcsetattr(TCSADRAIN)` 与 master 写入并发；人工敲键撞不上），PTY 测试在提示符后稳定 50ms（`SETTLE`）再发输入 |
