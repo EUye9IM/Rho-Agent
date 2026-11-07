@@ -1,6 +1,8 @@
 //! REPL 退出语义、斜杠命令与供应商/模型切换规则（无网络、无 TTY）。
 
 use rho::chat::Session;
+use rho::commands;
+use rho::completion::CompletionProvider;
 use rho::config;
 use rho::provider;
 use rho::render::RenderEvent;
@@ -8,20 +10,31 @@ use rho::repl::{self, ReplExit};
 use rho::term::Cancel;
 use rho::ui::{ConfirmOutcome, ReadOutcome, ScriptedUi, Ui};
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+/// 测试用临时文件序号：仅用于需要验证真实文件加载的测试。
+static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 fn session_from(toml: &str) -> Session {
-    let path = std::env::temp_dir().join(format!(
-        "rho-repl-{}-{}.toml",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
-    ));
-    std::fs::write(&path, toml).unwrap();
-    let cfg = config::load(&Some(path.display().to_string())).unwrap();
-    let _ = std::fs::remove_file(path);
+    let cfg = config::load_str(toml, "<测试配置>").unwrap();
     let selection = config::resolve_selection(&cfg, None, None).unwrap();
     let adapter = provider::adapter_for(&selection.provider).unwrap();
     Session::new(cfg, selection, adapter, false)
+}
+
+/// 保留一个真实文件加载路径的护栏：报错文案带文件路径。
+#[test]
+fn file_load_error_mentions_path() {
+    let path = std::env::temp_dir().join(format!(
+        "rho-repl-{}-{}.toml",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::write(&path, "not valid toml =").unwrap();
+    let err = config::load(&Some(path.display().to_string())).unwrap_err();
+    let _ = std::fs::remove_file(&path);
+    assert!(err.contains(&path.display().to_string()), "error was {err}");
 }
 
 fn session() -> Session {
@@ -129,7 +142,10 @@ fn help_and_model_list_follow_current_provider() {
 #[test]
 fn help_hides_thinking_for_model_without_table() {
     let mut ui = ScriptedUi::new(
-        vec![ReadOutcome::Line("/help".into()), ReadOutcome::Line("/exit".into())],
+        vec![
+            ReadOutcome::Line("/help".into()),
+            ReadOutcome::Line("/exit".into()),
+        ],
         vec![],
     );
     let cancel = Cancel::new();
@@ -239,7 +255,10 @@ max_output = 100
 #[test]
 fn unavailable_provider_is_marked_in_listing() {
     let mut ui = ScriptedUi::new(
-        vec![ReadOutcome::Line("/provider".into()), ReadOutcome::Line("/exit".into())],
+        vec![
+            ReadOutcome::Line("/provider".into()),
+            ReadOutcome::Line("/exit".into()),
+        ],
         vec![],
     );
     let cancel = Cancel::new();
@@ -280,7 +299,7 @@ max_output = 100
 struct FatalUi;
 
 impl Ui for FatalUi {
-    fn read_line(&mut self) -> ReadOutcome {
+    fn read_line(&mut self, _completer: Arc<dyn CompletionProvider>) -> ReadOutcome {
         ReadOutcome::Eof
     }
 
@@ -382,4 +401,53 @@ fn submitted_line_clears_arm() {
     assert!(!ui.rendered.is_empty());
     // 空行回车也清掉武装，所以第三个 Ctrl-C 只能重新武装。
     assert_eq!(ui.hints, vec![true, false, true, false, false]);
+}
+
+#[test]
+fn completion_follows_model_switch() {
+    let mut session = session_from(
+        r#"
+[providers.mock]
+protocol = "openai_chat"
+base_url = "http://127.0.0.1:1"
+
+[models."mock/a"]
+context_window = 1000
+max_output = 100
+thinking_default = "low"
+
+[models."mock/a".thinking]
+low = { thinking = { type = "enabled" } }
+high = { thinking = { type = "enabled" } }
+
+[models."mock/b"]
+context_window = 1000
+max_output = 100
+thinking_default = "medium"
+
+[models."mock/b".thinking]
+medium = { thinking = { type = "enabled" } }
+"#,
+    );
+
+    let first = commands::completion_provider(&session);
+    assert_eq!(
+        replacements(first.complete("/thinking ", 10)),
+        vec!["high", "low"]
+    );
+
+    session.switch_model("mock/b").unwrap();
+    let second = commands::completion_provider(&session);
+    assert_eq!(
+        replacements(second.complete("/thinking ", 10)),
+        vec!["medium"]
+    );
+}
+
+fn replacements(completion: rho::completion::Completion) -> Vec<String> {
+    completion
+        .candidates
+        .into_iter()
+        .map(|candidate| candidate.replacement)
+        .collect()
 }

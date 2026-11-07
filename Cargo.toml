@@ -1,8 +1,7 @@
 [package]
 name = "rho"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-rust-version = "1.75"
 description = "Lightweight local agent REPL for resource-constrained devices"
 license = "MIT"
 
@@ -20,17 +19,14 @@ serde_json = "1"
 toml = { version = "0.8", features = ["preserve_order"] }
 indexmap = { version = "2.7", features = ["serde"] }
 ureq = { version = "2.10", default-features = false, features = ["tls"] }
-# 直接依赖 rustls + pem：ureq tls feature 硬编码 webpki-roots 且无 SSL_CERT_FILE 支持，
-# 需自建 ClientConfig（AgentBuilder::tls_config）实现覆盖；NO_PROXY 亦需自行读环境变量分流
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-rustls-pemfile = "2"
-webpki-roots = "0.26"
 rustyline = { version = "14", default-features = false, features = ["custom-bindings"] }
 libc = "0.2"
 unicode-width = "0.1"
 
 [dev-dependencies]
-indexmap = { version = "2.7", features = ["serde"] }
+# PTY 集成测试：终端模拟 + 屏幕网格断言（仅测试用，不进发布产物）
+portable-pty = "0.9"
+vt100 = "0.18"
 
 [profile.release]
 opt-level = "z"

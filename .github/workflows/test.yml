@@ -20,19 +20,15 @@ concurrency:
 
 jobs:
   test:
-    name: tests (${{ matrix.rust }})
+    name: tests
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: [stable, "1.75.0"]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         run: |
-          rustup toolchain install ${{ matrix.rust }} --profile minimal
-          rustup default ${{ matrix.rust }}
+          rustup toolchain install stable --profile minimal
+          rustup default stable
           rustc --version
           cargo --version
 
@@ -44,9 +40,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-test-${{ matrix.rust }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-test-stable-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-test-${{ matrix.rust }}-
+            ${{ runner.os }}-cargo-test-stable-
             ${{ runner.os }}-cargo-test-
 
       - name: Build
@@ -54,6 +50,20 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-targets --locked
+
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --all --check
 
   clippy:
     name: clippy
@@ -71,8 +81,11 @@ jobs:
 
   build:
     name: build (x86_64-musl)
-    if: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v') }}
-    needs: [test, clippy]
+    # PR 也跑 build：master 的分支保护把 build (x86_64-musl) 设为 required check，
+    # 只在 master/tag 跑会让 PR 一直停在 failing merge requirements。
+    # publish 步骤自身仍只匹配 master/tag；来自 fork 的 PR 由 GitHub 降级 token 权限。
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v') }}
+    needs: [test, clippy, fmt]
     runs-on: ubuntu-latest
     permissions:
       contents: write

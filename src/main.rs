@@ -15,6 +15,7 @@ pub struct Args {
     pub model: Option<String>,
     pub thinking: Option<String>,
     pub yes: bool,
+    pub version: bool,
 }
 
 /// 退出码：0 正常 / 1 REPL 无法继续的内部错误 / 2 配置或用法错误（含 stdin 非 TTY）。
@@ -26,10 +27,15 @@ fn main() -> ExitCode {
     let args = match parse_args(std::env::args().skip(1).collect()) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("用法错误：{e}\n用法：rho [--config <path>] [--provider <id>] [--model <id>] [--thinking <level>] [--yes]");
+            eprintln!("用法错误：{e}\n用法：rho [--config <path>] [--provider <id>] [--model <id>] [--thinking <level>] [--yes] [--version]");
             return ExitCode::from(EXIT_USAGE);
         }
     };
+
+    if args.version {
+        println!("rho {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
 
     let code = run(args);
     ExitCode::from(code)
@@ -47,14 +53,15 @@ fn run(args: Args) -> u8 {
 
     // --thinking 非法（不属于所选模型档位）在构造 Session 前校验（exit 2）；
     // 合法则写入 selection.thinking（唯一真值源）。
-    let mut selection = match config::resolve_selection(&cfg, args.provider.as_deref(), args.model.as_deref()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{e}");
-            return EXIT_USAGE;
-        }
-    };
-    if let Err(e) = resolve_thinking(&cfg, &mut selection, args.thinking.as_deref()) {
+    let mut selection =
+        match config::resolve_selection(&cfg, args.provider.as_deref(), args.model.as_deref()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{e}");
+                return EXIT_USAGE;
+            }
+        };
+    if let Err(e) = resolve_thinking(&mut selection, args.thinking.as_deref()) {
         eprintln!("{e}");
         return EXIT_USAGE;
     }
@@ -100,38 +107,28 @@ fn run(args: Args) -> u8 {
 
 /// 解析 --thinking：None → 保持 selection.thinking（模型 thinking_default）；
 /// Some(档位) → 须属该模型档位表，写入 selection.thinking。
-fn resolve_thinking(
-    _cfg: &config::Config,
-    selection: &mut config::Selection,
-    cli: Option<&str>,
-) -> Result<(), String> {
+fn resolve_thinking(selection: &mut config::Selection, cli: Option<&str>) -> Result<(), String> {
     let Some(level) = cli else { return Ok(()) };
-    let levels: Vec<&str> = selection
-        .model
-        .thinking
-        .keys()
-        .map(String::as_str)
-        .collect();
-    if levels.is_empty() {
-        return Err(format!(
-            "模型 {} 未声明思考档位，不能使用 --thinking {level}",
-            selection.model_id
-        ));
+    // 与 Session::switch_thinking 共用判定（config::thinking_level_err）；CLI 文案附加提示。
+    match config::thinking_level_err(&selection.model, &selection.model_id, level) {
+        Some(e) => Err(format!("{e}，不能使用 --thinking {level}")),
+        None => {
+            selection.thinking = Some(level.to_string());
+            Ok(())
+        }
     }
-    if !selection.model.thinking.contains_key(level) {
-        return Err(format!(
-            "无效思考档位 `{level}`（模型 {}）；可选：{}",
-            selection.model_id,
-            levels.join(", ")
-        ));
-    }
-    selection.thinking = Some(level.to_string());
-    Ok(())
 }
 
 /// 手写参数解析：支持 `--flag value` 与 `--flag=value`；未知参数/重复 flag/带值的 --yes 报错。
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
-    let mut args = Args { config: None, provider: None, model: None, thinking: None, yes: false };
+    let mut args = Args {
+        config: None,
+        provider: None,
+        model: None,
+        thinking: None,
+        yes: false,
+        version: false,
+    };
     let mut it = argv.into_iter().peekable();
     while let Some(a) = it.next() {
         let (flag, inline): (&str, Option<String>) = match a.split_once('=') {
@@ -139,31 +136,53 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
             None => (a.as_str(), None),
         };
         let mut take_value = || -> Result<String, String> {
-            inline.clone().map(Ok).unwrap_or_else(|| {
-                it.next().ok_or_else(|| format!("缺少 {flag} 的值"))
-            })
+            inline
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(|| it.next().ok_or_else(|| format!("缺少 {flag} 的值")))
         };
         match flag {
             "--config" => {
-                if args.config.is_some() { return Err("--config 重复".into()); }
+                if args.config.is_some() {
+                    return Err("--config 重复".into());
+                }
                 args.config = Some(take_value()?);
             }
             "--provider" => {
-                if args.provider.is_some() { return Err("--provider 重复".into()); }
+                if args.provider.is_some() {
+                    return Err("--provider 重复".into());
+                }
                 args.provider = Some(take_value()?);
             }
             "--model" => {
-                if args.model.is_some() { return Err("--model 重复".into()); }
+                if args.model.is_some() {
+                    return Err("--model 重复".into());
+                }
                 args.model = Some(take_value()?);
             }
             "--thinking" => {
-                if args.thinking.is_some() { return Err("--thinking 重复".into()); }
+                if args.thinking.is_some() {
+                    return Err("--thinking 重复".into());
+                }
                 args.thinking = Some(take_value()?);
             }
             "--yes" => {
-                if inline.is_some() { return Err("--yes 不接受值".into()); }
-                if args.yes { return Err("--yes 重复".into()); }
+                if inline.is_some() {
+                    return Err("--yes 不接受值".into());
+                }
+                if args.yes {
+                    return Err("--yes 重复".into());
+                }
                 args.yes = true;
+            }
+            "--version" | "-V" => {
+                if inline.is_some() {
+                    return Err("--version 不接受值".into());
+                }
+                if args.version {
+                    return Err("--version 重复".into());
+                }
+                args.version = true;
             }
             other => return Err(format!("未知参数 {other}")),
         }
@@ -177,7 +196,8 @@ mod tests {
 
     #[test]
     fn parse_basic() {
-        let a = parse_args(["--provider".into(), "deepseek".into(), "--yes".into()].to_vec()).unwrap();
+        let a =
+            parse_args(["--provider".into(), "deepseek".into(), "--yes".into()].to_vec()).unwrap();
         assert_eq!(a.provider.as_deref(), Some("deepseek"));
         assert!(a.yes);
     }
@@ -189,6 +209,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_version_flags() {
+        assert!(parse_args(["--version".into()].to_vec()).unwrap().version);
+        assert!(parse_args(["-V".into()].to_vec()).unwrap().version);
+        assert!(parse_args(["--version=1".into()].to_vec()).is_err());
+        assert!(parse_args(["--version".into(), "-V".into()].to_vec()).is_err());
+    }
+
+    #[test]
     fn parse_rejects_unknown() {
         assert!(parse_args(["--clap".into()].to_vec()).is_err());
     }
@@ -196,7 +224,16 @@ mod tests {
     #[test]
     fn parse_rejects_duplicate() {
         assert!(parse_args(["--yes".into(), "--yes".into()].to_vec()).is_err());
-        assert!(parse_args(["--provider".into(), "a".into(), "--provider".into(), "b".into()].to_vec()).is_err());
+        assert!(parse_args(
+            [
+                "--provider".into(),
+                "a".into(),
+                "--provider".into(),
+                "b".into()
+            ]
+            .to_vec()
+        )
+        .is_err());
     }
 
     #[test]
@@ -204,4 +241,3 @@ mod tests {
         assert!(parse_args(["--yes=false".into()].to_vec()).is_err());
     }
 }
-

@@ -4,7 +4,7 @@
 
 [English](README.md) | **简体中文**
 
-`rho` 是一个跑在终端里的轻量本地 agent。单 crate、单二进制（分发建议使用 musl 静态构建），使用阻塞 I/O + 线程，面向资源受限的 Linux 设备。你在 REPL 里对话，它从兼容 OpenAI Chat Completions 的供应商（默认 DeepSeek）流式返回结果，并能通过 `bash` 工具执行命令——执行前要过 allowlist 判定和人工确认。
+`rho` 是一个跑在终端里的轻量本地 agent。单 crate、单二进制（分发建议使用 musl 静态构建），使用阻塞 I/O + 线程，面向资源受限的 Linux 设备。你在 REPL 里对话，它从兼容 OpenAI Chat Completions 的供应商（默认 DeepSeek）流式返回结果，也可通过配置使用 OpenAI Responses 协议，并能通过 `bash` 工具执行命令——执行前要过 allowlist 判定和人工确认。
 
 ## 愿景
 
@@ -15,17 +15,28 @@ rho 要做一个运行在资源受限 Linux 设备上的本地 agent：单二进
 ## 特性
 
 - **轻** —— 单 crate 单二进制，使用阻塞 I/O + 线程，release 开启 `strip` + LTO + `panic = "abort"`。
-- **配置驱动** —— 供应商、模型、思考档位都由数据声明；同协议族接入新供应商只加配置。
+- **配置驱动** —— 供应商、模型、思考档位都由数据声明；支持 `openai_chat` 与 `openai_responses`，切换协议只改配置。
 - **流式 + 思考可见** —— 正文逐块输出；`reasoning_content` 以暗淡色实时展示，默认只留在本地，仅当供应商配置 `compat.echo_reasoning = true` 时随历史回传。
 - **只有一个工具：`bash`** —— 前台执行 `bash -c <命令>`，每次调用启动新的 shell，单次超时后按进程组逐级终止。
-- **可预测的 Ctrl-C** —— 第一次取消当前流式/工具/确认，第二次退出；空闲提示符下两次空行 Ctrl-C（2 秒内）同样退出，第一次会在输入行尾显示灰色提示。对话历史在任何时刻都保持协议合法（工具调用必有对应结果）。
+- **可预测的 Ctrl-C** —— 第一次取消当前流式/工具/确认，立即回到提示符（取消标志在逐块之间轮询生效；连接停滞无数据时，后台读取在下一块数据到达或空闲超时后结束），第二次退出；空闲提示符下两次空行 Ctrl-C（2 秒内）同样退出，第一次会在输入行尾显示灰色提示。对话历史在任何时刻都保持协议合法（工具调用必有对应结果）。
+- **Tab 补全** —— 补全斜杠命令名以及 `/model`、`/provider`、`/thinking` 的参数，候选来自当前会话状态；切换供应商或模型后自动刷新。
 - **严格配置校验** —— 未知字段、悬空引用、缺失必填字段一律硬报错并给出配置路径（TOML 语法错误另带行号），退出码 2。
 
 ## 环境要求
 
 - Linux：`x86_64`、`aarch64` 或 `armv7`（建议分发 musl 静态构建）。
-- 构建需要 Rust 1.75+（MSRV）。CI 会同时测试 1.75 与 stable。
+- 构建需要较新的 stable Rust 工具链（CI 在 stable 上测试）。
 - 需要交互式 TTY：stdin 非 TTY 时以退出码 2 结束。rho 以 REPL 方式运行。
+
+## 安装
+
+安装最新 x86_64 musl 产物到 `~/.local/bin`：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/EUye9IM/Rho-Agent/master/install.sh | sh
+```
+
+安装脚本会先校验 release 的 SHA-256，再安装二进制。若 `~/.local/bin` 不在 `PATH` 中，请自行加入。下载使用 `curl`，遵循标准代理环境变量。
 
 ## 构建
 
@@ -77,8 +88,9 @@ rho --yes            # 自动放行所有 bash 调用
 | `--model <id>` | 初始模型（须为 `provider/model` 形式，覆盖配置默认）。 |
 | `--thinking <level>` | 初始思考档位（须属于所选模型）。 |
 | `--yes` | 跳过所有 `bash` 确认。 |
+| `--version`、`-V` | 打印 rho 版本并退出。 |
 
-用户配置只认 `--config`，未提供时使用内置配置。环境变量只用于 `${VAR}` header 展开。会话工作目录恒为进程启动目录，全程不可修改。
+用户配置只认 `--config`，未提供时使用内置配置。认证 header 中的 `${VAR}` 从环境变量展开；`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与 `NO_PROXY` 控制代理路由。会话工作目录恒为进程启动目录，全程不可修改。
 
 ### REPL 命令
 
@@ -104,7 +116,7 @@ system_prompt    = "你是 rho，一个轻量本地运维助手。"  # 省略则
 max_tool_steps   = 25
 
 [providers.deepseek]
-protocol = "openai_chat"                        # 当前实现的协议族
+protocol = "openai_chat"                        # openai_chat 或 openai_responses
 base_url = "https://api.deepseek.com"
 
 [providers.deepseek.auth]
@@ -133,7 +145,8 @@ max_output_bytes = 16384
 
 要点：
 
-- 模型 id 全局唯一且必须带供应商前缀（`deepseek/deepseek-v4-pro`），前缀须对应已声明的供应商；上游 `model` 字段默认取第一个 `/` 之后的部分。
+- 模型 id 全局唯一且必须带供应商前缀（`deepseek/deepseek-v4-pro`），前缀须对应已声明的供应商；上游 `model` 字段默认取第一个 `/` 之后的部分，`max_output` 作为输出 token 上限一并发给上游。
+- `protocol` 支持 `openai_chat`（Chat Completions，`/chat/completions`）与 `openai_responses`（Responses，`/responses`）；后者把历史映射为 `input` items，并用 `max_output_tokens` 限制输出。
 - 认证 header 中的 `${VAR}` 在选择供应商时逐个展开：变量缺失只让该供应商不可用，不影响其他供应商——除非该供应商是被显式指定的。
 - 思考档位的值是 JSON 对象片段，请求时顶层合并进 body；档位名由配置自定义。
 - 校验严格：未知字段、悬空引用、缺失必填字段直接拒绝启动（退出码 2，并给出配置路径；TOML 语法错误另带行号）。
@@ -151,15 +164,16 @@ max_output_bytes = 16384
 
 > **安全边界。** allowlist 做字符串匹配，是免确认的便捷门槛；真正的安全边界是运行 `rho` 的用户权限。子进程完全继承父进程环境变量，模型用一条 `env` 就能读出 `DEEPSEEK_API_KEY`。请以你愿意让其执行命令的用户身份运行 `rho`，并只在信任的主机上使用。
 
-其他限制：每轮对话最多 `max_tool_steps` 次模型发起的工具调用（默认 25，拒绝/失败/参数错误的调用同样计数）；stdout 与 stderr 各自上限 `max_output_bytes`，保留头尾两段并标注省略字节数；超时后对整个进程组 SIGTERM，2 秒后 SIGKILL。HTTP 错误直接展示；历史按原样发送，会话超出模型窗口时上游会失败，此时用 `/clear` 重开。
+其他限制：每轮对话最多 `max_tool_steps` 次模型发起的工具调用（默认 25，拒绝/失败/参数错误的调用同样计数）；stdout 与 stderr 各自上限 `max_output_bytes`，保留头尾两段并标注省略字节数；超时后对整个进程组 SIGTERM，2 秒后 SIGKILL。每次请求把模型的 `max_output` 作为上游输出 token 上限发送。SSE 单行上限 1 MiB，单轮响应体累计上限 32 MiB，超出即按错误结束本轮。HTTP 错误直接展示；历史按原样发送，会话超出模型窗口时上游会失败，此时用 `/clear` 重开。
 
 ## 测试
 
 ```sh
+cargo fmt --all --check
 cargo test --all-targets --locked
 ```
 
-CI 在每次 push 到 `master` 或 `dev`、以及每个 PR 上，用 Rust 1.75（MSRV）与 stable 跑测试。测试使用本地 mock：协议层用 `TcpListener` 手写本地 SSE mock，REPL/agent loop 用脚本化的 `Ui` 实现驱动真实主循环。`term.rs` 里从信号到记录这一段，以及真实终端交互，靠手工验收。
+CI 在每次 push 到 `master` 或 `dev`、以及每个 PR 上，用 stable Rust 跑格式检查、clippy 和测试。测试使用本地 mock：协议层用 `TcpListener` 手写本地 SSE mock，REPL/agent loop 用脚本化的 `Ui` 实现驱动真实主循环。`term.rs` 里从信号到记录这一段，以及真实终端交互，由 PTY 集成测试覆盖（openpty 驱动真实二进制，屏幕断言走 vt100 网格）。
 
 ## 许可
 
