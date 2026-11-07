@@ -28,6 +28,16 @@ Implementation: [docs/architecture.md](docs/architecture.md).
 - A recent stable Rust toolchain to build (CI tests on stable).
 - An interactive TTY — `rho` requires one and exits with code 2 when stdin is not a TTY. It runs as a REPL.
 
+## Install
+
+Install the latest x86_64 musl release to `~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/EUye9IM/Rho-Agent/master/install.sh | sh
+```
+
+The installer verifies the release checksum before installing. Add `~/.local/bin` to `PATH` if it is not already there. Download traffic uses `curl`, so standard proxy environment variables apply.
+
 ## Build
 
 ```sh

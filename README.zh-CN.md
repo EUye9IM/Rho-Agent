@@ -28,6 +28,16 @@ rho 要做一个运行在资源受限 Linux 设备上的本地 agent：单二进
 - 构建需要较新的 stable Rust 工具链（CI 在 stable 上测试）。
 - 需要交互式 TTY：stdin 非 TTY 时以退出码 2 结束。rho 以 REPL 方式运行。
 
+## 安装
+
+安装最新 x86_64 musl 产物到 `~/.local/bin`：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/EUye9IM/Rho-Agent/master/install.sh | sh
+```
+
+安装脚本会先校验 release 的 SHA-256，再安装二进制。若 `~/.local/bin` 不在 `PATH` 中，请自行加入。下载使用 `curl`，遵循标准代理环境变量。
+
 ## 构建
 
 ```sh
