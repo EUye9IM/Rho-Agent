@@ -89,6 +89,7 @@ rho --yes            # auto-approve every `bash` call
 | `--model <id>` | Initial model (must be `provider/model`, overrides config default). |
 | `--thinking <level>` | Initial thinking level (must exist for the chosen model). |
 | `--yes` | Skip all `bash` confirmations. |
+| `--version`, `-V` | Print the rho version and exit. |
 
 User config comes only from `--config`; otherwise the built-in config is used. `${VAR}` in auth headers is expanded from the environment. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` control proxy routing. The working directory is fixed to the directory `rho` was started in.
 

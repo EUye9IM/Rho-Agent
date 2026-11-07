@@ -88,6 +88,7 @@ rho --yes            # 自动放行所有 bash 调用
 | `--model <id>` | 初始模型（须为 `provider/model` 形式，覆盖配置默认）。 |
 | `--thinking <level>` | 初始思考档位（须属于所选模型）。 |
 | `--yes` | 跳过所有 `bash` 确认。 |
+| `--version`、`-V` | 打印 rho 版本并退出。 |
 
 用户配置只认 `--config`，未提供时使用内置配置。认证 header 中的 `${VAR}` 从环境变量展开；`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与 `NO_PROXY` 控制代理路由。会话工作目录恒为进程启动目录，全程不可修改。
 

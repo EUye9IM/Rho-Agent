@@ -15,6 +15,7 @@ pub struct Args {
     pub model: Option<String>,
     pub thinking: Option<String>,
     pub yes: bool,
+    pub version: bool,
 }
 
 /// 退出码：0 正常 / 1 REPL 无法继续的内部错误 / 2 配置或用法错误（含 stdin 非 TTY）。
@@ -26,10 +27,15 @@ fn main() -> ExitCode {
     let args = match parse_args(std::env::args().skip(1).collect()) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("用法错误：{e}\n用法：rho [--config <path>] [--provider <id>] [--model <id>] [--thinking <level>] [--yes]");
+            eprintln!("用法错误：{e}\n用法：rho [--config <path>] [--provider <id>] [--model <id>] [--thinking <level>] [--yes] [--version]");
             return ExitCode::from(EXIT_USAGE);
         }
     };
+
+    if args.version {
+        println!("rho {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
 
     let code = run(args);
     ExitCode::from(code)
@@ -121,6 +127,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         model: None,
         thinking: None,
         yes: false,
+        version: false,
     };
     let mut it = argv.into_iter().peekable();
     while let Some(a) = it.next() {
@@ -168,6 +175,15 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                 }
                 args.yes = true;
             }
+            "--version" | "-V" => {
+                if inline.is_some() {
+                    return Err("--version 不接受值".into());
+                }
+                if args.version {
+                    return Err("--version 重复".into());
+                }
+                args.version = true;
+            }
             other => return Err(format!("未知参数 {other}")),
         }
     }
@@ -190,6 +206,14 @@ mod tests {
     fn parse_inline_value() {
         let a = parse_args(["--config=/tmp/x.toml".into()].to_vec()).unwrap();
         assert_eq!(a.config.as_deref(), Some("/tmp/x.toml"));
+    }
+
+    #[test]
+    fn parse_version_flags() {
+        assert!(parse_args(["--version".into()].to_vec()).unwrap().version);
+        assert!(parse_args(["-V".into()].to_vec()).unwrap().version);
+        assert!(parse_args(["--version=1".into()].to_vec()).is_err());
+        assert!(parse_args(["--version".into(), "-V".into()].to_vec()).is_err());
     }
 
     #[test]
