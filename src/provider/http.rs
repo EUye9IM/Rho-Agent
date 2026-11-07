@@ -1,8 +1,7 @@
-//! HTTP 基础设施：TLS 根配置（SSL_CERT_FILE 覆盖）、代理环境变量分流（NO_PROXY）、
-//! 按 base_url 缓存 ureq::Agent（TLS 根与连接池复用）、错误体截断与读取上限。
+//! HTTP 基础设施：代理环境变量分流（NO_PROXY）、按 base_url 缓存 ureq::Agent、
+//! 错误体截断与读取上限。
 
 use std::collections::HashMap;
-use std::io::BufReader;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -15,34 +14,6 @@ pub(super) const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 pub(super) const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 /// HTTP 错误体最多读取的字节数（仅供展示，之后还会按字符截断）。
 pub(super) const MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
-
-/// 自建 TLS 配置：默认编入 webpki-roots；设置 SSL_CERT_FILE 时**覆盖**默认根。
-fn tls_config() -> Result<rustls::ClientConfig, String> {
-    let mut roots = rustls::RootCertStore::empty();
-    match std::env::var("SSL_CERT_FILE") {
-        Ok(path) => {
-            let file = std::fs::File::open(&path)
-                .map_err(|e| format!("无法读取 SSL_CERT_FILE={path}：{e}"))?;
-            let mut reader = BufReader::new(file);
-            let certs = rustls_pemfile::certs(&mut reader)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("解析 SSL_CERT_FILE={path} 失败：{e}"))?;
-            if certs.is_empty() {
-                return Err(format!("SSL_CERT_FILE={path} 中没有可用证书"));
-            }
-            for cert in certs {
-                roots
-                    .add(cert)
-                    .map_err(|e| format!("加载 SSL_CERT_FILE={path} 的证书失败：{e}"))?;
-            }
-        }
-        Err(_) => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
-    }
-
-    Ok(rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth())
-}
 
 fn host_of_url(url: &str) -> Option<&str> {
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
@@ -107,8 +78,7 @@ fn proxy_for(url: &str) -> Result<Option<ureq::Proxy>, String> {
     proxy_with(url, |name| std::env::var(name).ok())
 }
 
-/// 按 `base_url` 缓存 `ureq::Agent`：TLS 根与连接池都随之复用，
-/// 避免每轮请求重读 `SSL_CERT_FILE`、重解析 PEM、丢掉 keep-alive 连接。
+/// 按 `base_url` 缓存 `ureq::Agent`：连接池随之复用，避免每轮请求丢掉 keep-alive 连接。
 pub(super) fn agent_for(base_url: &str) -> Result<Arc<ureq::Agent>, String> {
     static CACHE: OnceLock<Mutex<HashMap<String, Arc<ureq::Agent>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -129,12 +99,10 @@ pub(super) fn agent_for(base_url: &str) -> Result<Arc<ureq::Agent>, String> {
 }
 
 fn build_agent(base_url: &str) -> Result<ureq::Agent, String> {
-    let tls = tls_config()?;
     let mut builder = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         // 空闲读超时：等待响应头与读取响应体共用这一个上限。
-        .timeout_read(IDLE_TIMEOUT)
-        .tls_config(Arc::new(tls));
+        .timeout_read(IDLE_TIMEOUT);
     if let Some(proxy) = proxy_for(base_url)? {
         builder = builder.proxy(proxy);
     }

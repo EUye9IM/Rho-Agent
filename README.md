@@ -79,7 +79,7 @@ rho --yes            # auto-approve every `bash` call
 | `--thinking <level>` | Initial thinking level (must exist for the chosen model). |
 | `--yes` | Skip all `bash` confirmations. |
 
-User config comes only from `--config`; otherwise the built-in config is used. `${VAR}` in auth headers is expanded from the environment. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` control proxy routing; `SSL_CERT_FILE`, when set, replaces the built-in TLS roots. The working directory is fixed to the directory `rho` was started in.
+User config comes only from `--config`; otherwise the built-in config is used. `${VAR}` in auth headers is expanded from the environment. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` control proxy routing. The working directory is fixed to the directory `rho` was started in.
 
 ### REPL commands
 

@@ -78,7 +78,7 @@ rho --yes            # 自动放行所有 bash 调用
 | `--thinking <level>` | 初始思考档位（须属于所选模型）。 |
 | `--yes` | 跳过所有 `bash` 确认。 |
 
-用户配置只认 `--config`，未提供时使用内置配置。认证 header 中的 `${VAR}` 从环境变量展开；`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与 `NO_PROXY` 控制代理路由；设置 `SSL_CERT_FILE` 时，它会替换内置 TLS 根证书。会话工作目录恒为进程启动目录，全程不可修改。
+用户配置只认 `--config`，未提供时使用内置配置。认证 header 中的 `${VAR}` 从环境变量展开；`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与 `NO_PROXY` 控制代理路由。会话工作目录恒为进程启动目录，全程不可修改。
 
 ### REPL 命令
 

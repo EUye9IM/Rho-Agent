@@ -44,8 +44,8 @@ src/
     mod.rs       ProviderAdapter trait（Send+Sync，Arc 共享）、FinishReason / ChunkOutcome、
                  按 Provider 构造、流式请求工作线程（取消/超时/字节上限、首字节看门狗）
     common.rs    适配器共用：模型名解析、默认 header、thinking 片段合并
-    http.rs      TLS 根配置（SSL_CERT_FILE 覆盖）、代理环境变量分流（NO_PROXY）、
-                 按 base_url 缓存 ureq::Agent（TLS 根与连接池复用）、错误体截断
+    http.rs      代理环境变量分流（NO_PROXY）、
+                 按 base_url 缓存 ureq::Agent（连接池复用）、错误体截断
     openai.rs    openai_chat：/chat/completions、messages、max_tokens、reasoning_content
                  （echo_reasoning 构造时注入）、`[DONE]` 结束标记
     openai_responses.rs
