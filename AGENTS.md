@@ -70,18 +70,21 @@ qemu-x86_64 -cpu qemu64 ./rho --config <https-config>
 
 ```text
 main → config
-     → repl → chat → provider → sse
-                   ├→ tools → term
-                   ├→ ui → render
-                   └→ message / render / term
+     → repl → commands → chat → provider → sse
+            │             ├→ tools → term
+            │             └→ ui → completion / render
+            └→ ui → completion / render
 
 chat 与 provider 共享 message；provider 不再依赖 chat。
+completion 只定义补全协议；commands 生成候选，ui 只适配 rustyline。
 ```
 
 关键规则：
 
 - `render.rs` 只提供纯格式化函数，不直接写终端。
 - `ui` 模块（`ui/mod.rs`）负责终端输出；生产实现 `TermUi`，测试用 `ScriptedUi`（`ui/scripted.rs`）。
+- 斜杠命令的元数据、解析、执行集中在 `commands.rs`；`repl` 只负责退出语义与把 `CommandEffect` 交给 Ui。
+- 补全协议在 `completion.rs`（`CompletionProvider`）；`repl` 每次 `read_line` 前用 `commands::completion_provider(&session)` 注入当前快照。`ui/helper.rs` 只做 rustyline 适配，不持有命令知识。
 - 不要在 `render` / `chat` 里直接 `println!`。
 - `provider` 每轮请求在工作线程读取 HTTP 流，经 `mpsc` 回主线程；不要引入 tokio/reqwest。
 - `message::Msg` 是协议无关的内部消息模型；Chat Completions 字段映射留在 `provider/openai.rs`，Responses 映射留在 `provider/openai_responses.rs`。
@@ -103,7 +106,7 @@ chat 与 provider 共享 message；provider 不再依赖 chat。
 
 改动行为时补对应层测试：
 
-- 纯单元：`sse.rs`、`config`、`tools` 判定/截断、`render`
+- 纯单元：`sse.rs`、`config`、`tools` 判定/截断、`render`、`commands` 补全候选
 - 协议映射：`provider::openai`（Chat Completions）与 `provider::openai_responses`（Responses）
 - agent loop + 工具：`ScriptedUi` + `StreamLauncher` / `ToolRunner` 注入
 - HTTP/SSE：`tests/e2e_mock.rs` 的本地 mock 服务

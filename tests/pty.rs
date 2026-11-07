@@ -381,6 +381,24 @@ fn double_ctrl_c_at_empty_prompt_exits_zero() {
 }
 
 #[test]
+fn tab_completes_slash_commands() {
+    let config = write_config("http://127.0.0.1:1");
+    let mut rho = PtyRho::spawn(&config);
+
+    rho.expect_screen("rho>", SCREEN_TIMEOUT);
+    std::thread::sleep(SETTLE);
+    rho.send(b"/he");
+    rho.send(b"\t");
+    rho.expect_screen("/help", SCREEN_TIMEOUT);
+
+    // 清掉补全后的输入行，再正常退出。
+    rho.send(b"\x03");
+    std::thread::sleep(SETTLE);
+    rho.send_line("/exit");
+    assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
+}
+
+#[test]
 fn single_ctrl_c_hint_expires_after_window() {
     let config = write_config("http://127.0.0.1:1");
     let mut rho = PtyRho::spawn(&config);

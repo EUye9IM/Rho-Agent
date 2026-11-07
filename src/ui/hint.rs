@@ -1,18 +1,10 @@
-//! Ctrl-C 双按灰提示子系统：武装窗口常量、Hinter/高亮、期限线程与到期擦除。
-//! 由 `TermUi`（ui 模块）组装；只负责提示的显示与到期擦除，行回收由 TermUi 处理。
+//! Ctrl-C 双按灰提示子系统：武装窗口常量、提示状态、期限线程与到期擦除。
+//! 由 `TermUi`（ui 模块）组装；只负责提示状态与到期擦除，行回收由 TermUi 处理。
 
-use crate::render;
-use std::borrow::Cow;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-
-use rustyline::completion::Completer;
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
-use rustyline::validate::Validator;
-use rustyline::{Context, Helper};
 
 /// 提示符下 Ctrl-C 双按窗口：两次空行 Ctrl-C 间隔小于它才退出。
 /// `repl` 用同一个常量判定退出，`TermUi` 用它到期撤掉灰提示。
@@ -96,8 +88,13 @@ impl HintArm {
         self.ready.notify_all();
     }
 
-    fn armed(&self) -> bool {
+    pub(super) fn armed(&self) -> bool {
         self.armed.load(Ordering::SeqCst)
+    }
+
+    /// `Hinter` 每次重绘时更新当前提示行是否为空。
+    pub(super) fn set_line_empty(&self, empty: bool) {
+        self.line_empty.store(empty, Ordering::SeqCst);
     }
 
     /// `TermUi::read_line` 前后切换：期限线程只在 `readline` 期间动终端。
@@ -125,7 +122,7 @@ impl HintArm {
     /// `refresh_line_with_msg`（空行回车 / Ctrl-D）不调 `hint()`，标志可能短时残留；
     /// 但 `reclaim_width` 只在 `Interrupted` 里快照，那时本次 `readline` 的首个
     /// `refresh_line` 已经重算过一遍，所以不会用到残留值。
-    fn mark_layout_hint(&self, shown: bool) {
+    pub(super) fn mark_layout_hint(&self, shown: bool) {
         self.layout_hint.store(shown, Ordering::SeqCst);
     }
 
@@ -142,42 +139,6 @@ impl HintArm {
         let _ = out.write_all(b"\x1b[J").and_then(|()| out.flush());
     }
 }
-
-/// rustyline helper：只在武装窗口内的空行上给出灰色提示。
-pub(super) struct HintHelper {
-    hint: Arc<HintArm>,
-}
-
-impl HintHelper {
-    pub(super) fn new(hint: Arc<HintArm>) -> Self {
-        Self { hint }
-    }
-}
-
-impl Completer for HintHelper {
-    type Candidate = String;
-}
-
-impl Hinter for HintHelper {
-    type Hint = String;
-
-    fn hint(&self, line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
-        let empty = line.is_empty();
-        let show = empty && self.hint.armed();
-        self.hint.line_empty.store(empty, Ordering::SeqCst);
-        self.hint.mark_layout_hint(show);
-        show.then(|| CTRL_C_HINT.to_string())
-    }
-}
-
-impl Highlighter for HintHelper {
-    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-        Cow::Owned(render::dim(hint))
-    }
-}
-
-impl Validator for HintHelper {}
-impl Helper for HintHelper {}
 
 /// 提示期限线程：到点撤销武装并擦掉灰提示。
 /// rustyline 只在按键时重绘，从别的线程推动整行重绘会把提示符顶到下一行（留一行空白），

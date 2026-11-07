@@ -3,6 +3,7 @@
 //! 覆盖：取消/退出各粒度、占位补齐、错误路径与配对不变式。
 
 use rho::chat::{AssistantMsg, Msg, Session, StreamLauncher, ToolCall, ToolRunner, TurnEnd};
+use rho::completion::CompletionProvider;
 use rho::config::{self, BashToolConfig, Provider};
 use rho::provider::{self, ProviderAdapter, StreamEvent};
 use rho::term::Cancel;
@@ -203,7 +204,7 @@ impl FailingUi {
 }
 
 impl Ui for FailingUi {
-    fn read_line(&mut self) -> ReadOutcome {
+    fn read_line(&mut self, _completer: Arc<dyn CompletionProvider>) -> ReadOutcome {
         ReadOutcome::Eof
     }
 

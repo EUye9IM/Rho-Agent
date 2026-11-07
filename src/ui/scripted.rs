@@ -1,9 +1,11 @@
 //! 测试实现：预排输入 + 预排确认 + 收集渲染事件。
 //! 驱动 repl → agent loop → tools 全链路，无网络无 TTY。
 
+use crate::completion::CompletionProvider;
 use crate::render::RenderEvent;
 use crate::ui::{ConfirmOutcome, ReadOutcome, Ui};
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 pub struct ScriptedUi {
     pub inputs: VecDeque<ReadOutcome>,
@@ -25,7 +27,7 @@ impl ScriptedUi {
 }
 
 impl Ui for ScriptedUi {
-    fn read_line(&mut self) -> ReadOutcome {
+    fn read_line(&mut self, _completer: Arc<dyn CompletionProvider>) -> ReadOutcome {
         self.inputs.pop_front().unwrap_or(ReadOutcome::Eof)
     }
 

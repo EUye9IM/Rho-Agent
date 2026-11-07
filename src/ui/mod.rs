@@ -1,12 +1,14 @@
 //! 用户交互抽象：Ui trait + 生产实现 TermUi + 测试实现 ScriptedUi。
 //! Ui 不承载退出语义（退出由 REPL 层判定）；灰提示子系统在 `hint` 子模块。
 
+mod helper;
 mod hint;
 mod scripted;
 
 pub use hint::CTRL_C_WINDOW;
 pub use scripted::ScriptedUi;
 
+use crate::completion::CompletionProvider;
 use crate::render::{self, RenderEvent};
 use std::fmt;
 use std::io::{IsTerminal, Write};
@@ -21,7 +23,8 @@ use rustyline::{
     RepeatCount,
 };
 
-use hint::{HintArm, HintHelper};
+use helper::ReplHelper;
+use hint::HintArm;
 
 /// 提示符。宽度按字节数算（纯 ASCII）。
 const PROMPT: &str = "rho> ";
@@ -82,7 +85,8 @@ pub enum ConfirmOutcome {
 }
 
 pub trait Ui {
-    fn read_line(&mut self) -> ReadOutcome;
+    /// 读取一行输入。补全提供者按调用注入，生命周期仅限本次读取。
+    fn read_line(&mut self, completer: Arc<dyn CompletionProvider>) -> ReadOutcome;
     fn confirm(&mut self, cwd: &str, cmd: &str) -> ConfirmOutcome;
     fn print(&mut self, ev: &RenderEvent);
 
@@ -156,7 +160,7 @@ pub struct TermUi {
     reclaim_width: Option<usize>,
 }
 
-type Editor = rustyline::Editor<HintHelper, DefaultHistory>;
+type Editor = rustyline::Editor<ReplHelper, DefaultHistory>;
 
 impl TermUi {
     pub fn new() -> Result<Self, TermUiInitError> {
@@ -165,12 +169,15 @@ impl TermUi {
                 "stdin 不是 TTY，rho 只支持交互式 REPL".into(),
             ));
         }
-        let mut editor: Editor = rustyline::Editor::new()
+        let config = rustyline::Config::builder()
+            .completion_type(rustyline::CompletionType::List)
+            .build();
+        let mut editor: Editor = rustyline::Editor::with_config(config)
             .map_err(|e| TermUiInitError::Init(format!("初始化终端失败：{e}")))?;
         let line_empty = Arc::new(AtomicBool::new(false));
         let line_width = Arc::new(AtomicUsize::new(0));
         let hint = Arc::new(HintArm::new(std::io::stdout().is_terminal()));
-        editor.set_helper(Some(HintHelper::new(hint.clone())));
+        editor.set_helper(Some(ReplHelper::new(hint.clone())));
         editor.bind_sequence(
             KeyEvent::new('\x03', Modifiers::NONE),
             EventHandler::Conditional(Box::new(CtrlCHandler {
@@ -232,7 +239,10 @@ impl TermUi {
 }
 
 impl Ui for TermUi {
-    fn read_line(&mut self) -> ReadOutcome {
+    fn read_line(&mut self, completer: Arc<dyn CompletionProvider>) -> ReadOutcome {
+        if let Some(helper) = self.editor.helper_mut() {
+            helper.set_completer(completer);
+        }
         self.reclaim_prompt_rows();
         self.hint.set_reading(true);
         let outcome = match self.editor.readline(PROMPT) {

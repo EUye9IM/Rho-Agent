@@ -1,6 +1,8 @@
 //! REPL 退出语义、斜杠命令与供应商/模型切换规则（无网络、无 TTY）。
 
 use rho::chat::Session;
+use rho::commands;
+use rho::completion::CompletionProvider;
 use rho::config;
 use rho::provider;
 use rho::render::RenderEvent;
@@ -9,6 +11,7 @@ use rho::term::Cancel;
 use rho::ui::{ConfirmOutcome, ReadOutcome, ScriptedUi, Ui};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// 测试用临时文件序号：仅用于需要验证真实文件加载的测试。
 static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -296,7 +299,7 @@ max_output = 100
 struct FatalUi;
 
 impl Ui for FatalUi {
-    fn read_line(&mut self) -> ReadOutcome {
+    fn read_line(&mut self, _completer: Arc<dyn CompletionProvider>) -> ReadOutcome {
         ReadOutcome::Eof
     }
 
@@ -398,4 +401,53 @@ fn submitted_line_clears_arm() {
     assert!(!ui.rendered.is_empty());
     // 空行回车也清掉武装，所以第三个 Ctrl-C 只能重新武装。
     assert_eq!(ui.hints, vec![true, false, true, false, false]);
+}
+
+#[test]
+fn completion_follows_model_switch() {
+    let mut session = session_from(
+        r#"
+[providers.mock]
+protocol = "openai_chat"
+base_url = "http://127.0.0.1:1"
+
+[models."mock/a"]
+context_window = 1000
+max_output = 100
+thinking_default = "low"
+
+[models."mock/a".thinking]
+low = { thinking = { type = "enabled" } }
+high = { thinking = { type = "enabled" } }
+
+[models."mock/b"]
+context_window = 1000
+max_output = 100
+thinking_default = "medium"
+
+[models."mock/b".thinking]
+medium = { thinking = { type = "enabled" } }
+"#,
+    );
+
+    let first = commands::completion_provider(&session);
+    assert_eq!(
+        replacements(first.complete("/thinking ", 10)),
+        vec!["high", "low"]
+    );
+
+    session.switch_model("mock/b").unwrap();
+    let second = commands::completion_provider(&session);
+    assert_eq!(
+        replacements(second.complete("/thinking ", 10)),
+        vec!["medium"]
+    );
+}
+
+fn replacements(completion: rho::completion::Completion) -> Vec<String> {
+    completion
+        .candidates
+        .into_iter()
+        .map(|candidate| candidate.replacement)
+        .collect()
 }
