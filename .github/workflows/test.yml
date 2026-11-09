@@ -82,9 +82,10 @@ jobs:
   build:
     name: build (x86_64-musl)
     # PR 也跑 build：master 的分支保护把 build (x86_64-musl) 设为 required check，
-    # 只在 master/tag 跑会让 PR 一直停在 failing merge requirements。
-    # publish 步骤自身仍只匹配 master/tag；来自 fork 的 PR 由 GitHub 降级 token 权限。
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v') }}
+    # 只在 tag 跑会让 PR 一直停在 failing merge requirements。
+    # dev 推送也跑：发布 rolling nightly。master 推送不再构建（合入前的 PR 已验证同一内容）。
+    # publish 步骤：nightly 只匹配 dev，版本 release 只匹配 tag；来自 fork 的 PR 由 GitHub 降级 token 权限。
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/tags/v') }}
     needs: [test, clippy, fmt]
     runs-on: ubuntu-latest
     permissions:
@@ -138,7 +139,7 @@ jobs:
           retention-days: 14
 
       - name: Publish rolling nightly
-        if: github.ref == 'refs/heads/master'
+        if: github.ref == 'refs/heads/dev'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
