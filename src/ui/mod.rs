@@ -155,6 +155,8 @@ pub struct TermUi {
     line_empty: Arc<AtomicBool>,
     line_width: Arc<AtomicUsize>,
     hint: Arc<HintArm>,
+    /// 渲染事件到终端文本的有状态格式化器（思考块样式成对开关）。
+    renderer: render::Renderer,
     fatal: Option<String>,
     /// 上一次 `readline` 被 Ctrl-C 中断时那一块内容的显示宽度：下一次读取前收回。
     reclaim_width: Option<usize>,
@@ -195,6 +197,7 @@ impl TermUi {
             line_empty,
             line_width,
             hint,
+            renderer: render::Renderer::new(),
             fatal: None,
             reclaim_width: None,
         })
@@ -231,6 +234,19 @@ impl TermUi {
         }
     }
 
+    /// 把上一轮可能开着的思考块收尾（写关闭序列），否则提示符会继承暗淡色。
+    /// 与思考增量一样不经 TTY 判定：开着的 `\x1b[2m` 写到了哪个流，就在哪个流补 `\x1b[0m`。
+    fn reset_style(&mut self) {
+        let reset = self.renderer.reset();
+        if reset.is_empty() {
+            return;
+        }
+        let mut out = std::io::stdout();
+        if let Err(e) = out.write_all(reset.as_bytes()).and_then(|()| out.flush()) {
+            self.set_fatal(format!("渲染输出失败：{e}"));
+        }
+    }
+
     fn set_fatal(&mut self, msg: impl Into<String>) {
         if self.fatal.is_none() {
             self.fatal = Some(msg.into());
@@ -243,6 +259,8 @@ impl Ui for TermUi {
         if let Some(helper) = self.editor.helper_mut() {
             helper.set_completer(completer);
         }
+        // 交还终端画提示符前先收尾上一轮残留的思考块。
+        self.reset_style();
         self.reclaim_prompt_rows();
         self.hint.set_reading(true);
         let outcome = match self.editor.readline(PROMPT) {
@@ -293,25 +311,18 @@ impl Ui for TermUi {
 
     fn print(&mut self, ev: &RenderEvent) {
         let result = (|| -> std::io::Result<()> {
-            let mut out = std::io::stdout().lock();
-            match ev {
-                RenderEvent::ReasoningDelta(s) => write!(out, "{}", render::dim(s))?,
-                RenderEvent::TextDelta(s) => write!(out, "{s}")?,
-                RenderEvent::LineBreak => writeln!(out)?,
-                RenderEvent::ToolCall(cmd) => write!(out, "\n{}\n", render::tool_call_line(cmd))?,
-                RenderEvent::ToolResult(content) => {
-                    writeln!(out, "{}", render::tool_result_block(content))?
-                }
-                RenderEvent::Error(msg) => {
-                    out.flush()?;
-                    // 错误走 stderr（与渲染流分离）；写失败与渲染同路径进 fatal，
-                    // 不用可能 panic 的 eprintln!。
-                    let mut err = std::io::stderr().lock();
-                    writeln!(err, "错误：{msg}")?;
-                    err.flush()?;
-                }
+            let out = self.renderer.event(ev);
+            // 渲染流与错误流分开；先写并 flush stdout，保证错误出现在已输出的内容之后。
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(out.stdout.as_bytes())?;
+            stdout.flush()?;
+            if !out.stderr.is_empty() {
+                // 错误走 stderr；写失败与渲染同路径进 fatal，不用可能 panic 的 eprintln!。
+                let mut stderr = std::io::stderr().lock();
+                stderr.write_all(out.stderr.as_bytes())?;
+                stderr.flush()?;
             }
-            out.flush()
+            Ok(())
         })();
         if let Err(e) = result {
             self.set_fatal(format!("渲染输出失败：{e}"));
@@ -337,6 +348,8 @@ impl Drop for TermUi {
         // 前提：中断到 drop 之间没有其他输出，否则上移落点会比块首低一行，
         // 既留下块首行、又擦掉中间那段输出。
         self.reclaim_prompt_rows();
+        // Ctrl-C 中途退出等路径不会再调用 `read_line`：退出前再做一次收尾。
+        self.reset_style();
         self.hint.stop();
     }
 }

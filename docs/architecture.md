@@ -58,7 +58,8 @@ src/
   sse.rs         SSE 行解析器（纯函数，可夹具测试；单行有字节上限，完整行与未终结残留同样适用）
   tools.rs       bash 执行：进程组 spawn、超时升级、双 drain 管道读取、
                  输出截断、allowlist + 元字符判定
-  render.rs      纯格式化函数：思考暗淡色、正文原样、工具行、带左边栏的工具结果、截断标注
+  render.rs      有状态渲染器 Renderer + RenderEvent：思考块暗淡色、正文原样、工具行、
+                 带左边栏的工具结果；返回待写文本，不直接写终端
                  （颜色固定使用 ANSI 转义，暗色终端下仍可用）
   repl.rs        REPL 循环、Ctrl-C 语义；斜杠命令委托给 commands，输出经 Ui
   term.rs        终端信号处理（SIGINT、进程组信号）
@@ -69,7 +70,7 @@ src/
     scripted.rs  测试实现 ScriptedUi（预排输入与确认、收集渲染事件）
 ```
 
-依赖方向为 `repl → commands/chat/ui`；`commands → chat/completion`，`chat → provider → sse/message`，`ui → completion/render`。`completion` 只定义补全协议，`ui` 只把候选适配到 rustyline；`commands` 持有命令与候选语义，`repl` 负责按调用注入当前快照。`Msg`/`AssistantMsg`/`ToolCall` 放在 `message.rs`，chat 与 provider 都只依赖这个共享模型，provider 不再反向依赖 chat。`config` 被各层读取，处于依赖关系底层。`render` 提供纯格式化函数，由 `repl`/`chat`/`ui` 调用；`ui` 把格式化结果写入终端。
+依赖方向为 `repl → commands/chat/ui`；`commands → chat/completion`，`chat → provider → sse/message`，`ui → completion/render`。`completion` 只定义补全协议，`ui` 只把候选适配到 rustyline；`commands` 持有命令与候选语义，`repl` 负责按调用注入当前快照。`Msg`/`AssistantMsg`/`ToolCall` 放在 `message.rs`，chat 与 provider 都只依赖这个共享模型，provider 不再反向依赖 chat。`config` 被各层读取，处于依赖关系底层。`render` 提供有状态渲染器（`Renderer`）与 `RenderEvent`：`chat` 只产生 `RenderEvent`，`ui` 持有 `Renderer` 把事件序列化为待写文本，按标准输出/标准错误分流写入终端。
 
 ## 三、关键数据类型
 
@@ -141,7 +142,7 @@ enum ConfirmOutcome {
 - **rustyline 输入路径**：rustyline 原始模式会接管 SIGINT，Ctrl-C 由 rustyline 返回 `Interrupted`，REPL 层直接处理（清行/进入双按窗口）。这条路径属于按键输入；信号线程只处理活动操作（流式/工具/确认）的 SIGINT。两套路径在时间上互斥，计数保持唯一；`readline` 返回后到下一次关掉 ISIG 之间有一段 cooked 模式缝隙，落在缝隙里的 Ctrl-C 会被记成当前轮的 cancel，切轮时按旧轮单条记录作废（见五）。
 - **Ui trait 只负责输入、确认和输出**：退出有两条路径——① REPL 层判定（`/exit`、`Eof`、空行 Ctrl-C 双按）发生在回合之间的输入阶段，此时没有进行中的调用，直接退出；② 活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测，按占位规则收尾、完成工具进程清理后以 `ChatResult` 的 `Err(Quit)` 上抛退出。`Quit` 只承载路径 ② 的回合内传播。
 
-- 生产实现 `TermUi`：rustyline 后端；`confirm` 用可中断读取（保持 ISIG，Ctrl-C 产生 SIGINT 唤醒读取并返回 `Cancelled`；记录由信号线程统一维护）。stdin 是否为 TTY 的检查在 `TermUi::new` 里做，`main` 只接收检查结果。
+- 生产实现 `TermUi`：rustyline 后端；`confirm` 用可中断读取（保持 ISIG，Ctrl-C 产生 SIGINT 唤醒读取并返回 `Cancelled`；记录由信号线程统一维护）。stdin 是否为 TTY 的检查在 `TermUi::new` 里做，`main` 只接收检查结果。`TermUi` 持有 `Renderer` 驱动事件渲染，并在每次 `read_line` 开头（画提示符前）调用 `Renderer::reset` 收尾上一轮可能残留的思考块，避免暗淡色跨到提示符；Ctrl-C 双按退出不再经过 `read_line`，由 `Drop` 再做一次收尾。
 - 双按提示：`ui::helper::ReplHelper` 实现 `Hinter`/`Highlighter`，武装时在空行上返回暗淡色提示（`render::dim`），由下一次 `readline` 的重绘显示；`CTRL_C_WINDOW` 常量由 `ui` 模块提供，`repl` 用同一常量判定退出。到期由 `rho-hint` 线程撤掉提示：它只向 stdout 写一个“擦到屏幕末尾”的序列（`\x1b[J`），不移动光标，因此 rustyline 的位置模型（提示符末尾、输入行空）保持不变，也不会把提示符顶到下一行；用 `\x1b[J` 而不是 `\x1b[K` 是因为窄终端下提示会换到下一行，只擦当前行会留下尾巴。动手前提由 `should_erase_hint` 判定——处于 `readline` 期间、提示行当前为空（`Hinter` 每次重绘时更新）、stdout 是 TTY，否则只撤销武装不碰终端。判定与写入之间主线程可能已经开始重绘，因此这是尽力而为的擦除，两个方向（没擦干净 / 擦掉了刚画出的新提示）都可能发生；下一次按键重绘会自愈。
 - 被 Ctrl-C 中断的输入不提交，而 rustyline 每次 `readline` 结束都会补一个换行（`Editor::readline_with` 的 `term.writeln()`），于是会在回滚区留下提示符 + 已输入内容（以及布局里的灰提示）组成的块。`CtrlCHandler` 在中断时记下输入行的显示宽度（`unicode-width`），块宽再加上 `Hinter` 记下的“最后一次布局里是否含灰提示”；`TermUi` 结合 `TIOCGWINSZ` 的列数算出回收时要上移的行数：`1 + 宽度 / 列数`——宽度刚好是列数整数倍时 rustyline 会自己补一个换行（`calculate_position` 的 `col == cols` 分支 → `refresh` 的 “generate our own newline on line wrap”），所以行数比内容高度多一，不能用向上取整。下一次 `read_line` 开始时用“`\x1b[{N}A\r\x1b[J`（上移 N 行、擦到屏幕末尾）”把这块收回重用；双按退出时在 `Drop` 里同样收回。这样打字后按 Ctrl-C 是原地清空，不多占行。`\x1b[J` 依赖“提示符块永远是最后一段输出”这个不变式：块高于屏幕时视口里全是块自己的行，`\x1b[{N}A` 被终端钳制到顶行，擦掉的仍只是块内容。stdout 不是 TTY 时不动光标。宽字符或制表符正好落在换列边界时行数会少算一行（`unicode-width` 不算 tab 的制表位展开），宁可留残影也不多上移（多上移会擦掉历史输出）。
 - 到期擦除只动屏幕、不改 rustyline 缓存的 layout，所以“布局里含不含灰提示”的标志不能在到期时清零：下次中断的 `move_cursor_to_end` 仍会把光标移到含提示的 `layout.end`，回收行数要跟着布局走，否则会少上移一行。
