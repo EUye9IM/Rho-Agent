@@ -290,7 +290,6 @@ impl Session {
 
         let mut final_msg: Option<AssistantMsg> = None;
         let mut error: Option<String> = None;
-        let mut reasoning_seen = false;
 
         loop {
             let ev = match handle.recv(Duration::from_millis(100)) {
@@ -316,15 +315,11 @@ impl Session {
             }
             match ev {
                 StreamEvent::Delta { text, reasoning } => {
+                    // 块间过渡（思考→正文的折行与样式收尾）由渲染器负责。
                     if let Some(r) = reasoning {
                         emit(ui, RenderEvent::ReasoningDelta(r));
-                        reasoning_seen = true;
                     }
                     if let Some(t) = text {
-                        if reasoning_seen {
-                            emit(ui, RenderEvent::LineBreak);
-                            reasoning_seen = false;
-                        }
                         emit(ui, RenderEvent::TextDelta(t));
                     }
                 }

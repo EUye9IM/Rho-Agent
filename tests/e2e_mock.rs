@@ -966,7 +966,7 @@ fn repl_adds_line_break_after_done_response() {
 }
 
 #[test]
-fn line_break_is_rendered_between_reasoning_and_text() {
+fn reasoning_delta_precedes_text_delta() {
     let mut response = String::new();
     response.push_str(&sse(&json!({
         "choices": [{ "delta": { "reasoning_content": "think" } }]
@@ -987,20 +987,16 @@ fn line_break_is_rendered_between_reasoning_and_text() {
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done));
 
+    // 思考→正文的折行由渲染器负责，chat 只按到达顺序发增量事件。
     let reasoning = ui
         .rendered
         .iter()
         .position(|e| matches!(e, RenderEvent::ReasoningDelta(s) if s == "think"))
-        .unwrap();
-    let line_break = ui
-        .rendered
-        .iter()
-        .position(|e| matches!(e, RenderEvent::LineBreak))
         .unwrap();
     let text = ui
         .rendered
         .iter()
         .position(|e| matches!(e, RenderEvent::TextDelta(s) if s == "answer"))
         .unwrap();
-    assert!(reasoning < line_break && line_break < text);
+    assert!(reasoning < text);
 }
