@@ -102,6 +102,19 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "rho") | .version')
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag v$tag 与 Cargo.toml 版本 $version 不一致" >&2
+            exit 1
+          fi
+          echo "tag v$tag matches Cargo.toml version $version"
+
       - name: Install musl tools
         run: |
           sudo apt-get update
