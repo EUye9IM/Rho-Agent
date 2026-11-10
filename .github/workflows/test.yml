@@ -81,16 +81,28 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
   build:
-    name: build (x86_64-musl)
-    # PR 也跑 build：master 的分支保护把 build (x86_64-musl) 设为 required check，
-    # 只在 tag 跑会让 PR 一直停在 failing merge requirements。
-    # dev 推送也跑：发布 rolling nightly。master 只经 PR 合入，不单独触发 push 运行。
-    # publish 步骤：nightly 只匹配 dev，版本 release 只匹配 tag；来自 fork 的 PR 由 GitHub 降级 token 权限。
+    # matrix.name 决定 check 名称：master 的分支保护把 build (x86_64-musl) 设为 required check，
+    # 新增架构会让它的 check 名称保持 build (x86_64-musl)。
+    # PR 也跑 build：只在 tag 跑会让 PR 一直停在 failing merge requirements。
+    # dev 推送也跑：产物上传 artifact，由 publish job 统一发布 rolling nightly。
+    name: build (${{ matrix.name }})
     if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/tags/v') }}
     needs: [test, clippy, fmt]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64-musl
+            target: x86_64-unknown-linux-musl
+            cc: musl-gcc
+            cflags: "-march=x86-64 -mtune=generic"
+            rustflags: "-C target-cpu=x86-64"
+          - name: aarch64-musl
+            target: aarch64-unknown-linux-musl
+            cc: aarch64-linux-musl-gcc
+            cflags: "-march=armv8-a -mtune=generic"
+            rustflags: "-C target-cpu=generic"
     steps:
       - uses: actions/checkout@v4
 
@@ -98,7 +110,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustup target add x86_64-unknown-linux-musl
+          rustup target add ${{ matrix.target }}
           rustc --version
           cargo --version
 
@@ -115,27 +127,47 @@ jobs:
           fi
           echo "tag v$tag matches Cargo.toml version $version"
 
-      - name: Install musl tools
+      - name: Install musl toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-          musl-gcc --version
+          set -eu
+          cc='${{ matrix.cc }}'
+          if [ "$cc" = musl-gcc ]; then
+            # Ubuntu 的 musl-tools 只提供 host 架构（x86_64）的 musl-gcc。
+            sudo apt-get update
+            sudo apt-get install -y musl-tools
+            musl-gcc --version
+          else
+            # 其它架构用 musl.cc 预编译交叉工具链，目录/前缀为 <triple>-cross。
+            prefix="${cc%-gcc}"
+            curl -fsSL --retry 3 -o /tmp/musl-cross.tgz \
+              "https://musl.cc/${prefix}-cross.tgz"
+            sudo tar -xzf /tmp/musl-cross.tgz -C /opt
+            echo "/opt/${prefix}-cross/bin" >> "$GITHUB_PATH"
+            "/opt/${prefix}-cross/bin/$cc" --version
+          fi
+
+      - name: Export cross env
+        run: |
+          # 固定基线：x86_64 目标机没有 AVX/AVX2，aarch64 目标机按 armv8-a。
+          # 只设目标专用的 CC/CFLAGS/CXXFLAGS，避免串到 host 编译。
+          key=$(printf '%s' '${{ matrix.target }}' | tr '-' '_')
+          {
+            echo "CC_${key}=${{ matrix.cc }}"
+            echo "CFLAGS_${key}=${{ matrix.cflags }}"
+            echo "CXXFLAGS_${key}=${{ matrix.cflags }}"
+            echo "RUSTFLAGS=${{ matrix.rustflags }}"
+          } >> "$GITHUB_ENV"
 
       - name: Build release
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CFLAGS_x86_64_unknown_linux_musl: "-march=x86-64 -mtune=generic"
-          CXXFLAGS_x86_64_unknown_linux_musl: "-march=x86-64 -mtune=generic"
-          RUSTFLAGS: "-C target-cpu=x86-64"
         run: |
-          cargo build --release --locked --target x86_64-unknown-linux-musl
-          ls -lh target/x86_64-unknown-linux-musl/release/rho
-          file target/x86_64-unknown-linux-musl/release/rho
+          cargo build --release --locked --target ${{ matrix.target }}
+          ls -lh target/${{ matrix.target }}/release/rho
+          file target/${{ matrix.target }}/release/rho
 
       - name: Package
         run: |
           set -eu
-          target=x86_64-unknown-linux-musl
+          target=${{ matrix.target }}
           mkdir -p dist
           tar -C target/$target/release -czf dist/rho-$target.tar.gz rho
           cd dist
@@ -145,12 +177,32 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rho-x86_64-unknown-linux-musl
+          name: rho-${{ matrix.target }}
           path: |
-            dist/rho-x86_64-unknown-linux-musl.tar.gz
-            dist/rho-x86_64-unknown-linux-musl.tar.gz.sha256
+            dist/rho-${{ matrix.target }}.tar.gz
+            dist/rho-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
           retention-days: 14
+
+  publish:
+    name: publish
+    # nightly 只匹配 dev，版本 release 只匹配 tag；来自 fork 的 PR 由 GitHub 降级 token 权限。
+    if: ${{ github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/tags/v') }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -lh dist
 
       - name: Publish rolling nightly
         if: github.ref == 'refs/heads/dev'
@@ -159,20 +211,18 @@ jobs:
         run: |
           set -euo pipefail
           tag=nightly
-          asset=rho-x86_64-unknown-linux-musl.tar.gz
-          checksum=${asset}.sha256
 
-          # 让 nightly tag 始终指向最新 master commit。
+          # 让 nightly tag 始终指向最新 commit。
           git tag -f "$tag" "$GITHUB_SHA"
           git push --force origin "refs/tags/$tag"
 
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "dist/$asset" "dist/$checksum" --clobber
+            gh release upload "$tag" dist/rho-*.tar.gz dist/rho-*.tar.gz.sha256 --clobber
             gh release edit "$tag" \
               --title "Nightly" \
               --notes "Rolling nightly build from ${GITHUB_SHA:0:7}"
           else
-            gh release create "$tag" "dist/$asset" "dist/$checksum" \
+            gh release create "$tag" dist/rho-*.tar.gz dist/rho-*.tar.gz.sha256 \
               --target "$GITHUB_SHA" \
               --prerelease \
               --title "Nightly" \
@@ -186,16 +236,14 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          asset=rho-x86_64-unknown-linux-musl.tar.gz
-          checksum=${asset}.sha256
 
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "dist/$asset" "dist/$checksum" --clobber
+            gh release upload "$tag" dist/rho-*.tar.gz dist/rho-*.tar.gz.sha256 --clobber
             gh release edit "$tag" \
               --title "$tag" \
               --notes "Release $tag"
           else
-            gh release create "$tag" "dist/$asset" "dist/$checksum" \
+            gh release create "$tag" dist/rho-*.tar.gz dist/rho-*.tar.gz.sha256 \
               --target "$GITHUB_SHA" \
               --title "$tag" \
               --generate-notes

@@ -30,7 +30,7 @@ Implementation: [docs/architecture.md](docs/architecture.md).
 
 ## Install
 
-Install the latest x86_64 musl release to `~/.local/bin`:
+Install the latest musl release to `~/.local/bin` (`x86_64` and `aarch64`):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/EUye9IM/Rho-Agent/master/install.sh | sh
@@ -52,8 +52,8 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release --locked --target x86_64-unknown-linux-musl
 
 # aarch64 / armv7 use the same command after installing the target and a
-# suitable cross linker/toolchain, e.g. aarch64-linux-gnu-gcc or
-# arm-linux-gnueabihf-gcc:
+# suitable musl cross toolchain, e.g. aarch64-linux-musl-gcc or
+# arm-linux-musleabihf-gcc from musl.cc:
 rustup target add aarch64-unknown-linux-musl
 cargo build --release --locked --target aarch64-unknown-linux-musl
 rustup target add armv7-unknown-linux-musleabihf
