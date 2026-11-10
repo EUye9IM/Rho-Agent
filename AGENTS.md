@@ -22,7 +22,12 @@
 
 - 日常开发在 `dev` 分支，不要直接提交/推送到 `master`。功能分支从 `dev` 开，PR 目标也是 `dev`。
 - `master` 作为稳定分支；发布时由用户确认后再合并 `dev` → `master`。
-- 版本发布：更新 `Cargo.toml` / `Cargo.lock` 的版本，打 annotated tag `vX.Y.Z`，推送 tag。CI 会构建并创建 GitHub Release。
+- 发布节奏（仓库根 `release.toml`：`allow-branch = ["dev"]`、`push = false`、`publish = false`、`tag = false`）：
+  1. 工作区干净时，在 `dev` 上跑 `cargo release <major|minor|patch> --execute`（先去掉 `--execute` 看 dry-run）。它只写 `Cargo.toml` + `Cargo.lock` 并在本地提交，不推送、不发 crates.io、不打 tag。
+  2. 推送 `dev`，开 `dev` → `master` 的 PR 并合并。
+  3. 在 GitHub 上给 master 的合并提交创建 tag `vX.Y.Z`（若用 CLI：`git tag -a vX.Y.Z && git push origin vX.Y.Z`）。tag 版本必须等于 `Cargo.toml` 版本，否则 CI 失败。
+  4. tag 推送后 CI 自动构建 `x86_64-musl` + `aarch64-musl`，并创建/更新 GitHub Release。
+- `cargo release` 来自第三方工具 `cargo-release`，不是仓库依赖，需自行安装。
 - 未经明确要求，不要：
   - `scp` 或安装新二进制到目标机
   - 替换目标机上的 `/usr/local/bin/rho`
