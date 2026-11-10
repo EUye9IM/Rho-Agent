@@ -22,6 +22,7 @@
 
 - 日常开发在 `dev` 分支，不要直接提交/推送到 `master`。功能分支从 `dev` 开，PR 目标也是 `dev`。
 - `master` 作为稳定分支；发布时由用户确认后再合并 `dev` → `master`。
+- CI：PR 只跑 test/fmt/clippy，不构建（构建太慢）；`build` 在 dev 推送与 tag 上跑。master 的 required checks 不应包含 `build`，否则 `dev` → `master` 的 PR 会卡在 Expected。
 - 发布节奏（仓库根 `release.toml`：`allow-branch = ["dev"]`、`push = false`、`publish = false`、`tag = false`）：
   1. 工作区干净时，在 `dev` 上跑 `cargo release <major|minor|patch> --execute`（先去掉 `--execute` 看 dry-run）。它只写 `Cargo.toml` + `Cargo.lock` 并在本地提交，不推送、不发 crates.io、不打 tag。
   2. 推送 `dev`，开 `dev` → `master` 的 PR 并合并。
