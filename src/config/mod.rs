@@ -5,6 +5,9 @@ mod validate;
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 pub use expand::expand_headers;
 pub use expand::warn_plaintext_secrets;
@@ -132,23 +135,75 @@ pub struct Selection {
     pub thinking: Option<String>, // 档位名；无 thinking 表则 None
 }
 
-/// 加载配置：`--config` 提供则完全替换内置默认（不合并）；未提供用内置默认。
+/// 内置默认配置的 TOML 源（`--init` 原样写出）。
+pub const BUILTIN_TOML: &str = include_str!("default.toml");
+
+/// 默认配置文件路径：`$XDG_CONFIG_HOME/rho/config.toml`；
+/// `XDG_CONFIG_HOME` 未设置或为空时用 `$HOME/.config/rho/config.toml`。
+pub fn default_config_path() -> Option<PathBuf> {
+    default_config_path_from(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn default_config_path_from(
+    xdg_config_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home.filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(xdg).join("rho").join("config.toml"));
+    }
+    home.filter(|v| !v.is_empty()).map(|home| {
+        PathBuf::from(home)
+            .join(".config")
+            .join("rho")
+            .join("config.toml")
+    })
+}
+
+/// 加载配置：`--config` 优先；否则读默认路径（存在时）；都没有则用内置默认。
+/// 任一来源都完全替换内置默认（不合并）。
 pub fn load(path: &Option<String>) -> Result<Config, String> {
     match path {
-        Some(p) => load_file(p),
-        None => load_builtin(),
+        Some(p) => load_file(Path::new(p)),
+        None => match default_config_path() {
+            Some(p) if p.exists() => load_file(&p),
+            _ => load_builtin(),
+        },
     }
 }
 
-fn load_file(path: &str) -> Result<Config, String> {
-    let source =
-        std::fs::read_to_string(path).map_err(|e| format!("无法读取配置文件 {path}：{e}"))?;
+/// 把内置配置写到 `path`（`--init`）。目标已存在时报错，不覆盖。
+pub fn write_builtin_config(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("无法创建目录 {}：{e}", parent.display()))?;
+    }
+    // create_new：目标已存在时以 AlreadyExists 失败，避免覆盖。
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => {
+                format!("配置文件已存在，未覆盖：{}", path.display())
+            }
+            _ => format!("无法写入配置文件 {}：{e}", path.display()),
+        })?;
+    file.write_all(BUILTIN_TOML.as_bytes())
+        .map_err(|e| format!("无法写入配置文件 {}：{e}", path.display()))
+}
+
+fn load_file(path: &Path) -> Result<Config, String> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| format!("无法读取配置文件 {}：{e}", path.display()))?;
     // 报错文案带文件路径而非通用标签。
-    parse_and_validate(&source, path)
+    parse_and_validate(&source, &path.display().to_string())
 }
 
 fn load_builtin() -> Result<Config, String> {
-    parse_and_validate(include_str!("default.toml"), "<内置默认配置>")
+    parse_and_validate(BUILTIN_TOML, "<内置默认配置>")
 }
 
 /// 从 TOML 字符串构建已验证的 Config（测试入口：无需临时文件）。
@@ -360,6 +415,10 @@ pub fn models_in_order(cfg: &Config) -> impl Iterator<Item = (&String, &Model)> 
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
+
     #[test]
     fn protocol_parses_known_values() {
         assert_eq!(Protocol::parse("openai_chat"), Some(Protocol::OpenAiChat));
@@ -368,5 +427,37 @@ mod tests {
             Some(Protocol::OpenAiResponses)
         );
         assert_eq!(Protocol::parse("anthropic_messages"), None);
+    }
+
+    #[test]
+    fn default_path_prefers_xdg_then_home() {
+        assert_eq!(
+            default_config_path_from(Some("/xdg".into()), Some("/home/u".into())),
+            Some(PathBuf::from("/xdg/rho/config.toml"))
+        );
+        // XDG_CONFIG_HOME 为空字符串时回退 HOME。
+        assert_eq!(
+            default_config_path_from(Some("".into()), Some("/home/u".into())),
+            Some(PathBuf::from("/home/u/.config/rho/config.toml"))
+        );
+        assert_eq!(default_config_path_from(None, None), None);
+    }
+
+    #[test]
+    fn write_builtin_config_writes_once_then_refuses() {
+        let dir = std::env::temp_dir().join(format!(
+            "rho-init-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        let path = dir.join("nested").join("config.toml");
+
+        write_builtin_config(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), BUILTIN_TOML);
+
+        let err = write_builtin_config(&path).unwrap_err();
+        assert!(err.contains("已存在"), "error was {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

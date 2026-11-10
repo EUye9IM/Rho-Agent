@@ -76,6 +76,7 @@ rho> 看看 /var/log 下的磁盘占用
 
 ```sh
 rho --config ./rho.toml --model deepseek/deepseek-v4-pro --thinking low
+rho --init           # 生成默认配置文件到 ~/.config/rho/config.toml
 rho --yes            # 自动放行所有 bash 调用
 ```
 
@@ -88,9 +89,10 @@ rho --yes            # 自动放行所有 bash 调用
 | `--model <id>` | 初始模型（须为 `provider/model` 形式，覆盖配置默认）。 |
 | `--thinking <level>` | 初始思考档位（须属于所选模型）。 |
 | `--yes` | 跳过所有 `bash` 确认。 |
+| `--init` | 把内置配置写到 `--config` 路径或默认路径；目标已存在时报错不覆盖。 |
 | `--version`、`-V` | 打印 rho 版本并退出。 |
 
-用户配置只认 `--config`，未提供时使用内置配置。认证 header 中的 `${VAR}` 从环境变量展开；`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与 `NO_PROXY` 控制代理路由。会话工作目录恒为进程启动目录，全程不可修改。
+配置来源优先级：`--config <path>` > 默认路径 `$XDG_CONFIG_HOME/rho/config.toml`（未设置时 `$HOME/.config/rho/config.toml`）> 内置配置。默认路径文件不存在时回退内置配置，存在但解析/校验失败则报错（退出码 2）。`rho --init` 一次性写出完整的内置配置，供你在此基础上增量修改。认证 header 中的 `${VAR}` 从环境变量展开；`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与 `NO_PROXY` 控制代理路由。会话工作目录恒为进程启动目录，全程不可修改。
 
 ### REPL 命令
 

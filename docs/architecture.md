@@ -32,7 +32,7 @@ src/
   lib.rs         库入口（集成测试经此访问 crate；bin 只是壳）
   main.rs        参数解析（手写）、退出码、组装启动
   config/        配置加载与严格校验
-    mod.rs       结构定义、内置默认配置（include_str! + 解析）
+    mod.rs       结构定义、配置来源解析（--config > 默认路径 > 内置）、--init 写出内置配置、内置默认配置（include_str! + 解析）
     validate.rs  悬空引用 / 前缀对应 / 取值校验，一次收集全部语义错误并报告配置路径
     expand.rs    header 值 ${VAR} 展开；明文密钥告警
   message.rs     与协议解耦的消息模型 Msg / AssistantMsg / ToolCall（chat 与 provider 共用）
@@ -223,7 +223,7 @@ struct State { count: u32 /*当前轮 Ctrl-C 次数*/, prev_quit: bool }
 ## 六、错误与退出码
 
 ```
-exit 2：参数用法错误（含 stdin 非 TTY）、配置解析/校验失败、显式指定的供应商 key 不齐全、隐式选择时无任何可用供应商（含缺失变量列表）
+exit 2：参数用法错误（含 stdin 非 TTY、`--init` 目标已存在）、配置解析/校验失败、显式指定的供应商 key 不齐全、隐式选择时无任何可用供应商（含缺失变量列表）
 exit 1：REPL 无法继续的内部运行时错误（终端 I/O 失败等——agent loop 在流收尾与逐个工具调用前检查，发现即停止后续请求/执行并按占位规则收尾）；panic=abort 下 panic 直接 abort，exit 1 用于其他 REPL 内部错误
 exit 0：/exit、空闲态 Ctrl-C 双按、Ctrl-D（均正常退出）
 ```

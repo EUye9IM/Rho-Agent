@@ -2,7 +2,7 @@ name: test
 
 on:
   push:
-    # master 只经 PR 合入，PR 已跑全套；master 推送不再触发。
+    # master 只经 PR 合入，master 推送不再触发；构建由 dev 推送和 tag 覆盖。
     branches: [dev]
     tags: ["v*"]
   pull_request:
@@ -81,12 +81,12 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
   build:
-    # matrix.name 决定 check 名称：master 的分支保护把 build (x86_64-musl) 设为 required check，
-    # 新增架构会让它的 check 名称保持 build (x86_64-musl)。
-    # PR 也跑 build：只在 tag 跑会让 PR 一直停在 failing merge requirements。
-    # dev 推送也跑：产物上传 artifact，由 publish job 统一发布 rolling nightly。
+    # 只在 workflow_dispatch / dev 推送 / tag 上构建：
+    # - dev 推送：产物上传 artifact，由 publish job 统一发布 rolling nightly。
+    # - tag：发布版本 release。
+    # PR 不构建（太慢）；dev 推送已构建过待合并的提交，发布仍由 tag 全量构建兜底。
     name: build (${{ matrix.name }})
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/tags/v') }}
     needs: [test, clippy, fmt]
     runs-on: ${{ matrix.os }}
     strategy:
@@ -177,7 +177,7 @@ jobs:
 
   publish:
     name: publish
-    # nightly 只匹配 dev，版本 release 只匹配 tag；来自 fork 的 PR 由 GitHub 降级 token 权限。
+    # nightly 只匹配 dev，版本 release 只匹配 tag；PR 上不触发。
     if: ${{ github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/tags/v') }}
     needs: build
     runs-on: ubuntu-latest

@@ -1,0 +1,7 @@
+# cargo-release 配置：发布只做本地的版本提交。
+# 版本 bump 在 dev 上完成，推送、crates.io 发布、打 tag 都在此关闭；
+# tag 由 dev 合入 master 后在 GitHub 上补打，CI 据此自动创建 Release。
+allow-branch = ["dev"]
+push = false
+publish = false
+tag = false

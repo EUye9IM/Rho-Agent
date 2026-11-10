@@ -6,6 +6,7 @@ use rho::provider;
 use rho::repl::{self, ReplExit};
 use rho::term;
 use rho::ui;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 /// CLI 参数（手写解析）。
@@ -15,6 +16,7 @@ pub struct Args {
     pub model: Option<String>,
     pub thinking: Option<String>,
     pub yes: bool,
+    pub init: bool,
     pub version: bool,
 }
 
@@ -27,7 +29,7 @@ fn main() -> ExitCode {
     let args = match parse_args(std::env::args().skip(1).collect()) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("用法错误：{e}\n用法：rho [--config <path>] [--provider <id>] [--model <id>] [--thinking <level>] [--yes] [--version]");
+            eprintln!("用法错误：{e}\n用法：rho [--config <path>] [--provider <id>] [--model <id>] [--thinking <level>] [--yes] [--init] [--version]");
             return ExitCode::from(EXIT_USAGE);
         }
     };
@@ -37,8 +39,30 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    if args.init {
+        return match init_config(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(EXIT_USAGE)
+            }
+        };
+    }
+
     let code = run(args);
     ExitCode::from(code)
+}
+
+/// `--init`：把内置配置写到 `--config` 指定路径或默认路径；目标已存在则报错不覆盖。
+fn init_config(args: &Args) -> Result<(), String> {
+    let path = match &args.config {
+        Some(p) => PathBuf::from(p),
+        None => config::default_config_path()
+            .ok_or_else(|| "无法确定默认配置路径：HOME 与 XDG_CONFIG_HOME 均未设置".to_string())?,
+    };
+    config::write_builtin_config(&path)?;
+    println!("已生成配置文件：{}", path.display());
+    Ok(())
 }
 
 /// 组装启动：加载配置 → 选择 provider/model → 构造 TermUi（TTY 检查在此）→ 进 REPL。
@@ -127,6 +151,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         model: None,
         thinking: None,
         yes: false,
+        init: false,
         version: false,
     };
     let mut it = argv.into_iter().peekable();
@@ -175,6 +200,15 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                 }
                 args.yes = true;
             }
+            "--init" => {
+                if inline.is_some() {
+                    return Err("--init 不接受值".into());
+                }
+                if args.init {
+                    return Err("--init 重复".into());
+                }
+                args.init = true;
+            }
             "--version" | "-V" => {
                 if inline.is_some() {
                     return Err("--version 不接受值".into());
@@ -214,6 +248,35 @@ mod tests {
         assert!(parse_args(["-V".into()].to_vec()).unwrap().version);
         assert!(parse_args(["--version=1".into()].to_vec()).is_err());
         assert!(parse_args(["--version".into(), "-V".into()].to_vec()).is_err());
+    }
+
+    #[test]
+    fn parse_init_flag() {
+        assert!(parse_args(["--init".into()].to_vec()).unwrap().init);
+        assert!(parse_args(["--init=1".into()].to_vec()).is_err());
+        assert!(parse_args(["--init".into(), "--init".into()].to_vec()).is_err());
+    }
+
+    #[test]
+    fn init_writes_config_and_refuses_overwrite() {
+        let dir = std::env::temp_dir().join(format!("rho-main-init-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("rho.toml");
+        let args = Args {
+            config: Some(path.display().to_string()),
+            provider: None,
+            model: None,
+            thinking: None,
+            yes: false,
+            init: true,
+            version: false,
+        };
+
+        init_config(&args).unwrap();
+        assert!(path.exists());
+        assert!(init_config(&args).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
