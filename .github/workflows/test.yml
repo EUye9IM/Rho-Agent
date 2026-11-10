@@ -2,7 +2,8 @@ name: test
 
 on:
   push:
-    # master 只经 PR 合入，master 推送不再触发；构建由 dev 推送和 tag 覆盖。
+    # master 只经 PR 合入，master 推送不再触发。
+    # dev 推送只构建；test/fmt/clippy 在 PR 与 tag 上跑（见下方 job 条件）。
     branches: [dev]
     tags: ["v*"]
   pull_request:
@@ -20,8 +21,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 分工，避免同一提交在 push 与 PR 上重复跑同一批 job：
+  # - test/fmt/clippy：PR 与 tag（dev 推送不测试）。
+  # - build：dev 推送与 tag（PR 不构建）。
   test:
     name: tests
+    if: ${{ github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +59,7 @@ jobs:
 
   fmt:
     name: fmt
+    if: ${{ github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -68,6 +74,7 @@ jobs:
 
   clippy:
     name: clippy
+    if: ${{ github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -81,13 +88,11 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
   build:
-    # 只在 workflow_dispatch / dev 推送 / tag 上构建：
-    # - dev 推送：产物上传 artifact，由 publish job 统一发布 rolling nightly。
-    # - tag：发布版本 release。
-    # PR 不构建（太慢）；dev 推送已构建过待合并的提交，发布仍由 tag 全量构建兜底。
+    # dev 推送：只构建，产物上传 artifact，由 publish job 发布 rolling nightly。
+    # tag：构建版本 release（test/fmt/clippy 同时跑，publish 会在它们通过后才发）。
+    # PR 不构建（太慢）。
     name: build (${{ matrix.name }})
     if: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/tags/v') }}
-    needs: [test, clippy, fmt]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -177,9 +182,10 @@ jobs:
 
   publish:
     name: publish
-    # nightly 只匹配 dev，版本 release 只匹配 tag；PR 上不触发。
-    if: ${{ github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/tags/v') }}
-    needs: build
+    # nightly 只匹配 dev（dev 推送没有 test，build 成功即发）；
+    # 版本 release 只匹配 tag，且要求 test/fmt/clippy/build 全成功。
+    if: ${{ always() && needs.build.result == 'success' && (github.ref == 'refs/heads/dev' || (startsWith(github.ref, 'refs/tags/v') && needs.test.result == 'success' && needs.fmt.result == 'success' && needs.clippy.result == 'success')) }}
+    needs: [test, fmt, clippy, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
