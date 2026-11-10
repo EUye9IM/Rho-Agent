@@ -30,7 +30,7 @@ rho 要做一个运行在资源受限 Linux 设备上的本地 agent：单二进
 
 ## 安装
 
-安装最新 x86_64 musl 产物到 `~/.local/bin`：
+安装最新 musl 产物到 `~/.local/bin`（支持 `x86_64` 与 `aarch64`）：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/EUye9IM/Rho-Agent/master/install.sh | sh
@@ -51,8 +51,8 @@ cargo build --release --locked
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --locked --target x86_64-unknown-linux-musl
 
-# aarch64 / armv7 需先安装 target 和对应的 cross linker/toolchain
-# （如 aarch64-linux-gnu-gcc、arm-linux-gnueabihf-gcc），然后执行同样的命令：
+# aarch64 / armv7 需先安装 target 和对应的 musl 交叉工具链
+# （如 musl.cc 的 aarch64-linux-musl-gcc、arm-linux-musleabihf-gcc），再执行同样的命令：
 rustup target add aarch64-unknown-linux-musl
 cargo build --release --locked --target aarch64-unknown-linux-musl
 rustup target add armv7-unknown-linux-musleabihf
