@@ -95,7 +95,8 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 
 ## 配置语义
 
-- `--config <path>` 是唯一外部配置入口；不读环境变量配置文件，不做默认路径发现。
+- 配置来源优先级：`--config <path>` > 默认路径 `$XDG_CONFIG_HOME/rho/config.toml`（未设时 `$HOME/.config/rho/config.toml`）> 内置配置。默认路径文件不存在时用内置配置，存在但非法则报错。
+- `rho --init` 把内置配置写到 `--config` 路径或默认路径，目标已存在时报错不覆盖（exit 2）。
 - 外部配置**完全替换**内置配置，不合并。
 - 严格校验：未知字段、悬空引用、缺失必填项都报错；语义错误一次收集全部，TOML 语法/反序列化错误按首个报告。
 - `${VAR}` 只用于 header 值展开；缺失变量报错；明文密钥要告警。

@@ -77,6 +77,7 @@ Pick a non-default provider, model or thinking level, or skip confirmations:
 
 ```sh
 rho --config ./rho.toml --model deepseek/deepseek-v4-pro --thinking low
+rho --init           # write the default config to ~/.config/rho/config.toml
 rho --yes            # auto-approve every `bash` call
 ```
 
@@ -89,9 +90,10 @@ rho --yes            # auto-approve every `bash` call
 | `--model <id>` | Initial model (must be `provider/model`, overrides config default). |
 | `--thinking <level>` | Initial thinking level (must exist for the chosen model). |
 | `--yes` | Skip all `bash` confirmations. |
+| `--init` | Write the built-in config to the `--config` path or the default path; refuses to overwrite an existing file. |
 | `--version`, `-V` | Print the rho version and exit. |
 
-User config comes only from `--config`; otherwise the built-in config is used. `${VAR}` in auth headers is expanded from the environment. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` control proxy routing. The working directory is fixed to the directory `rho` was started in.
+Config source priority: `--config <path>` > the default path `$XDG_CONFIG_HOME/rho/config.toml` (or `$HOME/.config/rho/config.toml` when unset) > the built-in config. A missing default-path file falls back to the built-in config; an existing one that fails to parse or validate is an error (exit code 2). `rho --init` writes the full built-in config for you to edit incrementally. `${VAR}` in auth headers is expanded from the environment. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` control proxy routing. The working directory is fixed to the directory `rho` was started in.
 
 ### REPL commands
 
