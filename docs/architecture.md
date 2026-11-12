@@ -49,7 +49,11 @@ src/
                  按 Provider 构造、流式请求工作线程（取消/超时/字节上限、首字节看门狗）
     common.rs    适配器共用：模型名解析、默认 header、thinking 片段合并
     http.rs      代理环境变量分流（NO_PROXY）、
-                 按 base_url 缓存 ureq::Agent（连接池复用）、错误体截断
+                 按 base_url 缓存 ureq::Agent（连接池复用）、错误体截断、
+                 给 Agent 注入 DoH 解析器
+    dns.rs       DoH 解析器：配置的端点优先，按顺序查 A/AAAA；端点全部失败
+                 才回退系统解析器，结果按应答 TTL 缓存
+                 （Android/Termux 等系统解析器不可用的环境靠它解析域名）
     openai.rs    openai_chat：/chat/completions、messages、max_tokens、reasoning_content
                  （echo_reasoning 构造时注入）、`[DONE]` 结束标记
     openai_responses.rs
@@ -239,6 +243,7 @@ exit 0：/exit、空闲态 Ctrl-C 双按、Ctrl-D（均正常退出）
 | `render` 格式 / `ui::prompt_rows`（回收时上移的行数）/ `ui::should_erase_hint` / `repl::within_window`（双按窗口） | 纯单元测试，无 TTY |
 | `commands` 补全候选与命令文案 / `ui::helper` 的 Pair 适配 | 纯单元测试，无 TTY；`tests/repl_flow.rs` 覆盖模型切换后的候选刷新 |
 | `provider::openai` / `provider::openai_responses` 解析 | 单元测试：构造 JSON chunk/事件 → `ChunkOutcome` / `TurnAcc` |
+| `provider::dns` 报文与回退 | 单元 + 本地 mock：假 DoH 服务（std TcpListener 手写 HTTP），覆盖 A/AAAA、压缩指针、NXDOMAIN、端点失败转移、TTL 缓存；报文编解码与 `config::parse_dns_endpoint` 为纯单元测试 |
 | agent loop + tools | 集成：`Session` 的 launcher/tool_runner 注入边界 + `ScriptedUi`，无网络无进程驱动分支（取消/退出各粒度、占位补齐、错误路径、配对不变式；时序用 channel 握手控制）；`tools::run_bash` 直接验证输出捕获/截断/超时 |
 | provider + HTTP 层 | 集成：本地 mock SSE 服务（std TcpListener 手写），测协议映射与流读取 |
 | 端到端工具循环 | 集成：mock SSE 服务驱动多轮真实 HTTP 请求，验证占位 Tool 消息的配对/顺序/第二次请求序列化（含 echo_reasoning） |

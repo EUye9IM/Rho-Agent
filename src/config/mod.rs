@@ -1,5 +1,6 @@
 //! 配置模型：加载、严格校验、`${VAR}` 展开、供应商启用。
 
+mod dns;
 mod expand;
 mod validate;
 
@@ -9,6 +10,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+pub use dns::parse_endpoint as parse_dns_endpoint;
 pub use expand::expand_headers;
 pub use expand::warn_plaintext_secrets;
 pub use validate::{validate, ValidationError};
@@ -47,6 +49,9 @@ pub struct Config {
     pub models: OrderedMap<Model>,
     #[serde(default)]
     pub tools: ToolsConfig,
+    /// DoH 端点：配置后按声明顺序优先解析，全部失败才回退系统解析器。
+    #[serde(default)]
+    pub dns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -441,6 +446,24 @@ mod tests {
             Some(PathBuf::from("/home/u/.config/rho/config.toml"))
         );
         assert_eq!(default_config_path_from(None, None), None);
+    }
+
+    #[test]
+    fn dns_endpoints_load_and_validate() {
+        let src = format!(
+            "dns = [\"https://223.5.5.5/dns-query\", \"https://[2400:3200::1]/dns-query\"]\n{BUILTIN_TOML}"
+        );
+        let cfg = load_str(&src, "t").unwrap();
+        assert_eq!(cfg.dns.len(), 2);
+        assert_eq!(cfg.dns[0], "https://223.5.5.5/dns-query");
+
+        // 每个端点单独校验，路径写到 dns.<下标>。
+        let bad = format!(
+            "dns = [\"https://223.5.5.5/dns-query\", \"https://dns.alidns.com/dns-query\"]\n{BUILTIN_TOML}"
+        );
+        let err = load_str(&bad, "t").unwrap_err();
+        assert!(err.contains("dns.1"), "error was {err}");
+        assert!(err.contains("IP 字面量"), "error was {err}");
     }
 
     #[test]

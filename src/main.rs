@@ -75,6 +75,9 @@ fn run(args: Args) -> u8 {
         }
     };
 
+    // DoH 解析器：配置了 dns 时优先使用（端点在配置里声明，校验已通过）。
+    provider::init_dns(&cfg.dns);
+
     // --thinking 非法（不属于所选模型档位）在构造 Session 前校验（exit 2）；
     // 合法则写入 selection.thinking（唯一真值源）。
     let mut selection =

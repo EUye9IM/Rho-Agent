@@ -1,5 +1,9 @@
 default_provider = "deepseek"
 max_tool_steps = 25
+# 指定 DoH 解析器时取消注释：配置后按声明顺序优先解析，全部失败才回退系统解析器。
+# 端点主机写 IP 字面量。
+# dns = ["https://1.1.1.1/dns-query"]         # Cloudflare，全球可用
+# dns = ["https://223.5.5.5/dns-query"]       # 阿里 DoH，中国大陆可用
 system_prompt = """
 你是 rho，一个运行在用户本机的轻量命令行运维助手。
 你可以使用 bash 工具执行命令来完成任务；执行前先简短说明目的，结果保持简洁。

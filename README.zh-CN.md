@@ -116,6 +116,7 @@ default_provider = "deepseek"
 default_model    = "deepseek/deepseek-v4-pro"   # 与 default_provider 冲突时以模型为准
 system_prompt    = "你是 rho，一个轻量本地运维助手。"  # 省略则请求不含 system 消息
 max_tool_steps   = 25
+dns              = ["https://223.5.5.5/dns-query"]  # 可选：优先使用的 DoH 解析器
 
 [providers.deepseek]
 protocol = "openai_chat"                        # openai_chat 或 openai_responses
@@ -151,6 +152,7 @@ max_output_bytes = 16384
 - `protocol` 支持 `openai_chat`（Chat Completions，`/chat/completions`）与 `openai_responses`（Responses，`/responses`）；后者把历史映射为 `input` items，并用 `max_output_tokens` 限制输出。
 - 认证 header 中的 `${VAR}` 在选择供应商时逐个展开：变量缺失只让该供应商不可用，不影响其他供应商——除非该供应商是被显式指定的。
 - 思考档位的值是 JSON 对象片段，请求时顶层合并进 body；档位名由配置自定义。
+- `dns` 是可选的 DoH 端点列表，配置后按声明顺序优先解析，端点全部失败才回退系统解析器；端点主机必须是 IP 字面量（形如 `https://223.5.5.5/dns-query`，IPv6 写成 `https://[2400:3200::1]/dns-query`）。成功结果按应答 TTL 缓存。Android/Termux 没有 `/etc/resolv.conf`，musl 静态构建的域名解析依赖这一项。
 - 校验严格：未知字段、悬空引用、缺失必填字段直接拒绝启动（退出码 2，并给出配置路径；TOML 语法错误另带行号）。
 
 ## `bash` 工具与安全模型

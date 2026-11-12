@@ -1,6 +1,7 @@
 //! HTTP 基础设施：代理环境变量分流（NO_PROXY）、按 base_url 缓存 ureq::Agent、
-//! 错误体截断与读取上限。
+//! 错误体截断与读取上限、DoH 解析器接线。
 
+use super::dns;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -99,10 +100,13 @@ pub(super) fn agent_for(base_url: &str) -> Result<Arc<ureq::Agent>, String> {
 }
 
 fn build_agent(base_url: &str) -> Result<ureq::Agent, String> {
+    let resolver = dns::resolver();
     let mut builder = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         // 空闲读超时：等待响应头与读取响应体共用这一个上限。
-        .timeout_read(IDLE_TIMEOUT);
+        .timeout_read(IDLE_TIMEOUT)
+        // 配置了 dns 时优先走 DoH 端点，失败再回退系统解析器（见 provider::dns）。
+        .resolver(move |netloc: &str| resolver.resolve(netloc));
     if let Some(proxy) = proxy_for(base_url)? {
         builder = builder.proxy(proxy);
     }

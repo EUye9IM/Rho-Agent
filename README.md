@@ -117,6 +117,7 @@ default_provider = "deepseek"
 default_model    = "deepseek/deepseek-v4-pro"   # wins over default_provider on conflict
 system_prompt    = "You are rho, a lightweight local ops assistant."  # omit to send no system message
 max_tool_steps   = 25
+dns              = ["https://223.5.5.5/dns-query"]  # optional: preferred DoH resolver
 
 [providers.deepseek]
 protocol = "openai_chat"                        # openai_chat or openai_responses
@@ -152,6 +153,7 @@ Rules worth knowing:
 - `protocol` accepts `openai_chat` (Chat Completions, `/chat/completions`) or `openai_responses` (Responses, `/responses`). The Responses adapter maps history to `input` items and uses `max_output_tokens`.
 - `${VAR}` in auth headers is expanded per provider. A missing variable marks that provider unavailable; other providers keep working, unless that provider was explicitly requested.
 - Thinking levels are JSON object fragments merged into the top level of the request body. Level names are yours to choose.
+- `dns` lists optional DoH endpoints used first, in order; the system resolver takes over only when every endpoint fails. The endpoint host must be an IP literal (`https://223.5.5.5/dns-query`; IPv6 uses `https://[2400:3200::1]/dns-query`). Answers are cached for their TTL. Android/Termux has no `/etc/resolv.conf`, so musl static builds rely on this entry to resolve names.
 - Validation is strict: unknown fields, dangling references and missing required fields abort startup with exit code 2 and the config path; TOML syntax errors also include a line number.
 
 ## The `bash` tool and its safety model

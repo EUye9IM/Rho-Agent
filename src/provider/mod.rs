@@ -2,9 +2,12 @@
 //! TLS/代理/Agent 缓存等 HTTP 基础设施在 `http` 子模块。
 
 mod common;
+mod dns;
 mod http;
 mod openai;
 mod openai_responses;
+
+pub use dns::init as init_dns;
 
 pub use openai::OpenAiChatAdapter;
 pub use openai_responses::OpenAiResponsesAdapter;
