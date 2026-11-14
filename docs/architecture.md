@@ -54,8 +54,9 @@ src/
     dns.rs       DoH 解析器：配置的端点优先，按顺序查 A/AAAA；端点全部失败
                  才回退系统解析器，结果按应答 TTL 缓存
                  （Android/Termux 等系统解析器不可用的环境靠它解析域名）
-    openai.rs    openai_chat：/chat/completions、messages、max_tokens、reasoning_content
+    openai.rs    openai_chat：/chat/completions、messages、reasoning_content
                  （echo_reasoning 构造时注入）、`[DONE]` 结束标记、
+                 输出上限字段按 legacy_max_tokens 选 max_tokens / max_completion_tokens、
                  usage 解析（含 stream_options.include_usage 与缓存命中字段）
     openai_responses.rs
                  openai_responses：/responses、input items、max_output_tokens、
@@ -145,7 +146,7 @@ trait ProviderAdapter: Send + Sync {
     fn parse_chunk(&self, chunk: &Value, acc: &mut TurnAcc) -> ChunkOutcome;
 }
 // 适配器按 Provider 构造（adapter_for(&Provider) -> Result<Arc<dyn ProviderAdapter>, String>）：
-// compat 开关（echo_reasoning / stream_usage）构造时注入；Session 长期持有 Arc，每轮 clone 一份按值传给 worker
+// compat 开关（echo_reasoning / stream_usage / legacy_max_tokens）构造时整份注入；Session 长期持有 Arc，每轮 clone 一份按值传给 worker
 // （thread::spawn + detach 取消语义需 'static，不能借引用）；/provider 切换时重建。
 // Protocol::parse 决定 openai_chat / openai_responses；未知协议返回可展示的 Err。
 ```
@@ -226,7 +227,7 @@ loop {
 - **历史即上下文**：历史（`Vec<Msg>`）原样序列化进请求；窗口超限时展示错误并提示 `/clear`。
 - **回合状态栏**：`Session::turn` 拆成薄包装与 `turn_inner`，包装层在本回合结束时发一条 `RenderEvent::Status`；fatal 与 `Err(Quit)` 路径不发。用量只是 `turn_inner` 的局部变量（每次成功的请求覆盖），不进会话状态；轮次由 `history` 中 `Msg::User` 的条数派生，`/clear` 后自然归零。斜杠命令不产生状态栏。
 - **usage 采集**：Chat Completions 在 `build_body` 里按 `compat.stream_usage` 发 `stream_options.include_usage`；usage 通常出现在 `choices` 为空的末尾 chunk，因此适配器在判空之前读取，缓存命中取 `prompt_tokens_details.cached_tokens` 或 DeepSeek 的 `prompt_cache_hit_tokens`。Responses 从 `response.completed` 的 `usage.input_tokens_details.cached_tokens` 取。worker 在 `Final` 之前发 `Usage`，主线程只在收到 `Final` 时采纳，保证失败或取消的请求不会污染状态栏。
-- **reasoning 随历史回传由 `compat.echo_reasoning` 决定**：打开时序列化进 assistant 消息，关闭时丢弃（适配层职责）；`CompatConfig` 默认与 OpenAI 标准一致（不回传），内置 DeepSeek 配置显式打开。
+- **reasoning 随历史回传由 `compat.echo_reasoning` 决定**：打开时序列化进 assistant 消息，关闭时丢弃（适配层职责）；`CompatConfig` 默认与 OpenAI 标准一致（不回传、发 `max_completion_tokens`、带流式用量），内置 DeepSeek 配置显式打开 `echo_reasoning` 与 `legacy_max_tokens`。
 - **两条退出路径**：REPL 层将 `/exit` 命令、空行 Ctrl-C 双按、`Eof`（Ctrl-D）映射为退出——判定发生在输入阶段（回合之间），直接退出；活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测，先完成剩余调用占位补齐与工具进程清理再退出。
 
 ## 五、线程与取消（term.rs / repl.rs）

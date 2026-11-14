@@ -150,10 +150,11 @@ base_url = "https://api.deepseek.com"
 headers = { Authorization = "Bearer ${DEEPSEEK_API_KEY}" }
 
 [providers.deepseek.compat]
-# Non-standard behavior: DeepSeek asks for reasoning_content to be echoed with
-# tool-enabled requests. Turn this off for OpenAI, which has no such field.
-echo_reasoning = true
-stream_usage   = true                            # send stream_options.include_usage (default true)
+# Non-standard behavior of this provider. Everything here defaults to the OpenAI
+# standard; the built-in config turns on what DeepSeek needs.
+legacy_max_tokens = true                         # send max_tokens instead of max_completion_tokens
+echo_reasoning    = true                         # echo reasoning_content back with tool-enabled requests
+stream_usage      = true                         # send stream_options.include_usage (default true)
 
 [models."deepseek/deepseek-v4-pro"]
 context_window   = 1000000
@@ -173,6 +174,7 @@ Rules worth knowing:
 - Model ids are global and must carry a provider prefix (`deepseek/deepseek-v4-pro`); the prefix must match a declared provider. The upstream `model` field defaults to the part after the first `/`.
 - `protocol` accepts `openai_chat` (Chat Completions, `/chat/completions`) or `openai_responses` (Responses, `/responses`). The Responses adapter maps history to `input` items and uses `max_output_tokens`.
 - `${VAR}` in auth headers is expanded per provider. A missing variable marks that provider unavailable; other providers keep working, unless that provider was explicitly requested.
+- `compat` holds wire-format differences from the OpenAI standard, per provider: `legacy_max_tokens` sends the old `max_tokens` field instead of `max_completion_tokens`, `echo_reasoning` sends `reasoning_content` back with history (OpenAI reasoning models return no chain-of-thought and have no such field), `stream_usage` requests `stream_options.include_usage` so the status line has usage data. Omitting the section means OpenAI-standard behavior; the built-in DeepSeek config enables the first two.
 - Thinking levels are JSON object fragments merged into the top level of the request body. Level names are yours to choose.
 - `dns` lists optional DoH endpoints used first, in order; the system resolver takes over only when every endpoint fails. The endpoint host must be an IP literal (`https://223.5.5.5/dns-query`; IPv6 uses `https://[2400:3200::1]/dns-query`). Answers are cached for their TTL. Android/Termux has no `/etc/resolv.conf`, so musl static builds rely on this entry to resolve names.
 - Validation is strict: unknown fields, dangling references and missing required fields abort startup with exit code 2 and the config path; TOML syntax errors also include a line number.

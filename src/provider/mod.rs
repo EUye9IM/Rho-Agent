@@ -154,10 +154,7 @@ pub trait ProviderAdapter: Send + Sync {
 /// protocol 不认识则报"不支持"（可展示错误，非 panic）。
 pub fn adapter_for(provider: &Provider) -> Result<Arc<dyn ProviderAdapter>, String> {
     match Protocol::parse(&provider.protocol) {
-        Some(Protocol::OpenAiChat) => Ok(Arc::new(OpenAiChatAdapter::new(
-            provider.compat.echo_reasoning,
-            provider.compat.stream_usage,
-        ))),
+        Some(Protocol::OpenAiChat) => Ok(Arc::new(OpenAiChatAdapter::new(provider.compat.clone()))),
         Some(Protocol::OpenAiResponses) => Ok(Arc::new(OpenAiResponsesAdapter::new())),
         None => Err(format!(
             "不支持的协议族：{}（支持 openai_chat、openai_responses）",

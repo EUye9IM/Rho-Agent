@@ -83,6 +83,11 @@ pub struct CompatConfig {
     /// 不支持的供应商可设为 false，此时上游不返回用量，状态栏没有用量与命中率段。
     #[serde(default = "default_true")]
     pub stream_usage: bool,
+    /// 非标准：输出上限用旧字段 `max_tokens`。
+    /// 默认发 OpenAI 标准的 `max_completion_tokens`；只认旧字段的供应商
+    /// （如 DeepSeek）打开它。
+    #[serde(default)]
+    pub legacy_max_tokens: bool,
 }
 
 impl Default for CompatConfig {
@@ -90,6 +95,7 @@ impl Default for CompatConfig {
         Self {
             echo_reasoning: false,
             stream_usage: true,
+            legacy_max_tokens: false,
         }
     }
 }
@@ -455,9 +461,12 @@ mod tests {
         let deepseek = &cfg.providers["deepseek"];
         assert!(deepseek.compat.echo_reasoning);
         assert!(deepseek.compat.stream_usage);
-        // CompatConfig 默认值保持 OpenAI 标准：不回传思考内容，带流式用量。
+        assert!(deepseek.compat.legacy_max_tokens);
+        // CompatConfig 默认值保持 OpenAI 标准：不回传思考内容、带流式用量、
+        // 用 max_completion_tokens。
         assert!(!CompatConfig::default().echo_reasoning);
         assert!(CompatConfig::default().stream_usage);
+        assert!(!CompatConfig::default().legacy_max_tokens);
     }
 
     #[test]

@@ -19,8 +19,9 @@ base_url = "https://api.deepseek.com"
 headers = { Authorization = "Bearer ${DEEPSEEK_API_KEY}" }
 
 [providers.deepseek.compat]
-# 非标准行为：带 tools 的请求按 DeepSeek 文档把 reasoning_content 随历史回传；
-# OpenAI 没有该字段，换供应商时改回 false。
+# 非标准行为：DeepSeek 只认 max_tokens，且带 tools 的请求要回传 reasoning_content。
+# 换到 OpenAI 时把这两项删除或改回 false。
+legacy_max_tokens = true
 echo_reasoning = true
 stream_usage = true
 

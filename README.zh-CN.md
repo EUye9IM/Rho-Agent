@@ -149,10 +149,11 @@ base_url = "https://api.deepseek.com"
 headers = { Authorization = "Bearer ${DEEPSEEK_API_KEY}" }
 
 [providers.deepseek.compat]
-# 非标准行为：DeepSeek 要求在带 tools 的请求里回传 reasoning_content。
-# 换到 OpenAI 时改回 false（OpenAI 没有该字段）。
-echo_reasoning = true
-stream_usage   = true                            # 发送 stream_options.include_usage（默认开启）
+# 该供应商与 OpenAI 标准不一致的线上格式。这里每一项默认都是 OpenAI 行为，
+# 内置配置只为 DeepSeek 打开它需要的几项。
+legacy_max_tokens = true                         # 发 max_tokens 而不是 max_completion_tokens
+echo_reasoning    = true                         # 带 tools 的请求回传 reasoning_content
+stream_usage      = true                         # 发送 stream_options.include_usage（默认开启）
 
 [models."deepseek/deepseek-v4-pro"]
 context_window   = 1000000
@@ -173,6 +174,7 @@ max  = { thinking = { type = "enabled" }, reasoning_effort = "max" }
 - `protocol` 支持 `openai_chat`（Chat Completions，`/chat/completions`）与 `openai_responses`（Responses，`/responses`）；后者把历史映射为 `input` items，并用 `max_output_tokens` 限制输出。
 - 认证 header 中的 `${VAR}` 在选择供应商时逐个展开：变量缺失只让该供应商不可用，不影响其他供应商——除非该供应商是被显式指定的。
 - 思考档位的值是 JSON 对象片段，请求时顶层合并进 body；档位名由配置自定义。
+- `compat` 按供应商声明与 OpenAI 标准的差异：`legacy_max_tokens` 用旧字段 `max_tokens` 而不是 `max_completion_tokens`，`echo_reasoning` 把 `reasoning_content` 随历史回传（OpenAI 推理模型不返回思维链，也没这个字段），`stream_usage` 请求 `stream_options.include_usage` 让状态栏拿到用量。省略整段即 OpenAI 标准行为；内置 DeepSeek 配置打开了前两项。
 - `dns` 是可选的 DoH 端点列表，配置后按声明顺序优先解析，端点全部失败才回退系统解析器；端点主机必须是 IP 字面量（形如 `https://223.5.5.5/dns-query`，IPv6 写成 `https://[2400:3200::1]/dns-query`）。成功结果按应答 TTL 缓存。Android/Termux 没有 `/etc/resolv.conf`，musl 静态构建的域名解析依赖这一项。
 - 校验严格：未知字段、悬空引用、缺失必填字段直接拒绝启动（退出码 2，并给出配置路径；TOML 语法错误另带行号）。
 
