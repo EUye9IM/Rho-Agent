@@ -109,6 +109,29 @@ fn slash_commands_then_exit() {
 }
 
 #[test]
+fn leading_space_sends_the_line_as_input() {
+    // 命令的 `/` 必须紧贴行首：前导空白让本行按普通输入进一个回合。
+    let mut ui = ScriptedUi::new(vec![
+        ReadOutcome::Line(" /help".into()),
+        ReadOutcome::Line("  /exit".into()),
+        ReadOutcome::Line("/exit".into()),
+    ]);
+    let cancel = Cancel::new();
+    repl::run(&mut ui, session(), &cancel).unwrap();
+    // 两行都没执行命令：既没有 help 正文，也没有提前退出（否则第二条读不到）。
+    assert!(!ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, RenderEvent::TextDelta(t) if t.contains("命令："))));
+    let turns = ui
+        .rendered
+        .iter()
+        .filter(|e| matches!(e, RenderEvent::Status(_)))
+        .count();
+    assert_eq!(turns, 2);
+}
+
+#[test]
 fn help_and_model_list_follow_current_provider() {
     let mut ui = ScriptedUi::new(vec![
         ReadOutcome::Line("/help".into()),

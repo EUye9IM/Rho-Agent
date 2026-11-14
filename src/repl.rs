@@ -57,7 +57,9 @@ pub fn run(ui: &mut dyn Ui, mut session: Session, cancel: &Cancel) -> Result<(),
                 if trimmed.is_empty() {
                     continue;
                 }
-                if trimmed.starts_with('/') {
+                // 命令的 `/` 必须紧贴行首：行首留空白就让整行按普通输入发送，
+                // 这样 `/home/x` 这类路径可以直接交给模型。
+                if line.starts_with('/') {
                     let result = handle_command(ui, &mut session, trimmed);
                     check_fatal(ui)?;
                     if cancel.is_quit() {

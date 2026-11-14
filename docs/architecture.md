@@ -75,7 +75,8 @@ src/
                  提示符/输入/工具调用着色、带左边栏的工具结果
                  （成功绿、失败红、打断黄）、回合状态栏单行；返回待写文本，
                  不直接写终端（颜色固定使用 ANSI 转义，暗色终端下仍可用）
-  repl.rs        REPL 循环、Ctrl-C 语义；斜杠命令委托给 commands，输出经 Ui
+  repl.rs        REPL 循环、Ctrl-C 语义；`/` 紧贴行首的输入才当命令，
+                 其余（含行首留空白的行）作为普通输入交给 agent loop
   term.rs        终端信号处理（SIGINT、进程组信号）
   ui/
     mod.rs       Ui trait + 生产实现 TermUi（rustyline）；负责终端输出
@@ -174,7 +175,7 @@ enum ReadOutcome {
 }
 ```
 
-- 退出语义：`read_line` 只返回 `Line`/`Interrupted`/`Eof`；`/exit` 作为普通 `Line` 由 REPL 层解析为退出（斜杠命令由 commands.rs 解析）。空行 Ctrl-C 返回 `Interrupted`；REPL 层按 2 秒双按窗口判定——窗口内第二次才退出，第一次只武装并在提示符行尾显示灰提示，编辑中（`line_empty: false`）按 Ctrl-C 清行并撤销武装，任何提交的行（含空行）都清掉武装。
+- 退出语义：`read_line` 只返回 `Line`/`Interrupted`/`Eof`；`/exit` 作为普通 `Line` 由 REPL 层解析为退出（斜杠命令由 commands.rs 解析）。命令判定用**原始行**：首字符就是 `/` 才进 commands，否则即使 trim 后以 `/` 开头也作为普通输入发送（发送前 `trim` 掉首尾空白），所以 `/home/x` 这类路径加一个前导空格就能交给模型。空行 Ctrl-C 返回 `Interrupted`；REPL 层按 2 秒双按窗口判定——窗口内第二次才退出，第一次只武装并在提示符行尾显示灰提示，编辑中（`line_empty: false`）按 Ctrl-C 清行并撤销武装，任何提交的行（含空行）都清掉武装。
 - **Ctrl-C 的唯一记录生产者是专用信号线程**（活动操作）：终端保持 ISIG，Ctrl-C 产生 SIGINT，经 self-pipe（socketpair）由信号线程在锁内追加记录；记录只由信号线程追加，计数只有一份。
 - **rustyline 输入路径**：rustyline 原始模式会接管 SIGINT，Ctrl-C 由 rustyline 返回 `Interrupted`，REPL 层直接处理（清行/进入双按窗口）。这条路径属于按键输入；信号线程只处理活动操作（流式/工具）的 SIGINT。两套路径在时间上互斥，计数保持唯一；`readline` 返回后到下一次关掉 ISIG 之间有一段 cooked 模式缝隙，落在缝隙里的 Ctrl-C 会被记成当前轮的 cancel，切轮时按旧轮单条记录作废（见五）。
 - **Ui trait 只负责输入和输出**：退出有两条路径——① REPL 层判定（`/exit`、`Eof`、空行 Ctrl-C 双按）发生在回合之间的输入阶段，此时没有进行中的调用，直接退出；② 活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测，按占位规则收尾、完成工具进程清理后以 `ChatResult` 的 `Err(Quit)` 上抛退出。`Quit` 只承载路径 ② 的回合内传播。

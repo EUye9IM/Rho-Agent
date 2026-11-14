@@ -113,6 +113,8 @@ Config source priority: `--config <path>` > the default path `$XDG_CONFIG_HOME/r
 
 Switching only affects subsequent requests; earlier history stays as recorded. If a `/provider` switch leaves the current model outside the new provider, the model resets to the first model declared by that provider and thinking resets to that model's `thinking_default`.
 
+A line is parsed as a command only when `/` sits in the very first column. Leave one space in front and the whole line is sent to the model as an ordinary message (leading and trailing whitespace is stripped before sending), so `/home/user/file` can be passed literally.
+
 ### Status line
 
 Every turn ends with one dim line:

@@ -89,7 +89,7 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 
 - `render.rs` 只提供纯格式化函数，不直接写终端。
 - `ui` 模块（`ui/mod.rs`）负责终端输出；生产实现 `TermUi`，测试用 `ScriptedUi`（`ui/scripted.rs`）。
-- 斜杠命令的元数据、解析、执行集中在 `commands.rs`；`repl` 只负责退出语义与把 `CommandEffect` 交给 Ui。
+- 斜杠命令的元数据、解析、执行集中在 `commands.rs`；`repl` 只负责退出语义与把 `CommandEffect` 交给 Ui。命令判定看原始行首字符：`/` 必须紧贴第 0 列，行首留空白就当普通输入发送。
 - 补全协议在 `completion.rs`（`CompletionProvider`）；`repl` 每次 `read_line` 前用 `commands::completion_provider(&session)` 注入当前快照。`ui/helper.rs` 只做 rustyline 适配，不持有命令知识。
 - 不要在 `render` / `chat` 里直接 `println!`。
 - `provider` 每轮请求在工作线程读取 HTTP 流，经 `mpsc` 回主线程；不要引入 tokio/reqwest。
