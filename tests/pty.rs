@@ -108,8 +108,8 @@ fn start_mock(respond: impl FnOnce(&mut TcpStream) + Send + 'static) -> MockServ
 }
 
 /// tool_calls 响应（触发 bash 执行）：一条 bash 调用后 finish。
-fn tool_call_response(command: &str) -> impl FnOnce(&mut TcpStream) + Send {
-    let args = serde_json::json!({ "command": command }).to_string();
+fn tool_call_response(command: &str, timeout: u64) -> impl FnOnce(&mut TcpStream) + Send {
+    let args = serde_json::json!({ "command": command, "timeout": timeout }).to_string();
     let chunk1 = serde_json::json!({
         "choices": [{
             "delta": {
@@ -180,9 +180,6 @@ headers = {{ Authorization = "Bearer sk-pty-test" }}
 context_window = 10000
 max_output = 1000
 
-[tools.bash]
-timeout_seconds = 2
-max_output_bytes = 4096
 "#
         ),
     )
@@ -507,14 +504,14 @@ fn real_double_sigint_during_stream_quits() {
 /// bash 超时在真实终端的表现：超时标注 + 进程组终止后回提示符。
 #[test]
 fn bash_timeout_shows_annotation_and_returns_to_prompt() {
-    let server = start_mock(tool_call_response("sleep 30"));
+    let server = start_mock(tool_call_response("sleep 30", 2));
     let config = write_config(&server.base_url);
     let mut rho = PtyRho::spawn(&config);
 
     rho.expect_screen("rho>", SCREEN_TIMEOUT);
     rho.send_line("go");
-    // timeout_seconds = 2：SIGTERM→2s→SIGKILL，总等待 ≤ ~5s。
-    rho.expect_screen("已部分执行（超时）", Duration::from_secs(8));
+    // timeout=2：SIGTERM→2s→SIGKILL，总等待 ≤ ~5s。
+    rho.expect_screen("[status] timed_out", Duration::from_secs(8));
     // 超时结果喂回后继续请求（mock 单连接已关：第二次请求失败）——回提示符即收尾。
     rho.expect_screen("rho>", Duration::from_secs(8));
     std::thread::sleep(SETTLE);

@@ -1,17 +1,18 @@
 //! 端到端集成测试：本地 mock SSE 服务驱动真实 HTTP 请求 + 工具循环。
 
 use rho::chat::{Msg, Session, TurnEnd};
-use rho::config::{self, BashToolConfig};
+use rho::config;
 use rho::provider;
 use rho::render::RenderEvent;
 use rho::repl;
 use rho::term::Cancel;
-use rho::tools;
+use rho::tools::{BashTool, Tool, ToolContext};
 use rho::ui::{ReadOutcome, ScriptedUi};
 
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -305,9 +306,6 @@ base_url = "{base_url}"
 context_window = 10000
 max_output = 1000
 
-[tools.bash]
-timeout_seconds = 5
-max_output_bytes = 1024
 "#
     )
 }
@@ -380,12 +378,15 @@ fn full_tool_loop_with_mock_sse() {
     }
 
     let rendered = &ui.rendered;
-    assert!(rendered
-        .iter()
-        .any(|e| matches!(e, RenderEvent::ToolCall(c) if c == "echo hi")));
-    assert!(rendered
-        .iter()
-        .any(|e| matches!(e, RenderEvent::ToolResult(c) if c.contains("hi"))));
+    assert!(rendered.iter().any(|e| matches!(
+        e,
+        RenderEvent::ToolCall { name, summary }
+            if name == "bash" && summary == "echo hi"
+    )));
+    assert!(rendered.iter().any(|e| matches!(
+        e,
+        RenderEvent::ToolResult { display: Some(text), .. } if text.contains("hi")
+    )));
     assert!(rendered
         .iter()
         .any(|e| matches!(e, RenderEvent::TextDelta(t) if t == "done")));
@@ -532,49 +533,42 @@ low = { thinking = { type = "enabled" } }
     assert!(err.contains("provider 前缀"));
 }
 
+fn run_bash(command: &str, timeout: i64, cancel: &Cancel) -> rho::tools::ToolResult {
+    let ctx = ToolContext {
+        cwd: Path::new("."),
+        cancel,
+    };
+    BashTool.invoke(json!({"command": command, "timeout": timeout}), &ctx)
+}
+
 #[test]
 fn bash_captures_stdout_stderr_and_exit_code() {
-    let cfg = BashToolConfig {
-        timeout_seconds: 5,
-        max_output_bytes: 1024,
-    };
-    let out = tools::run_bash("printf hi; printf err >&2; exit 3", &cfg, &Cancel::new());
-    assert!(matches!(out.end, tools::BashEnd::Exited(3)));
-    assert!(out.content.contains("hi"));
-    assert!(out.content.contains("[stderr]"));
-    assert!(out.content.contains("err"));
-    assert!(out.content.contains("exit code 3"));
+    let out = run_bash("printf hi; printf err >&2; exit 3", 5, &Cancel::new());
+    assert_eq!(out.status, rho::tools::ToolStatus::Failure);
+    assert!(out.output.contains("[status] failed"));
+    assert!(out.output.contains("[exit_code] 3"));
+    assert!(out.output.contains("hi"));
+    assert!(out.output.contains("err"));
+    assert!(!out.output.contains("[stderr]"));
 }
 
 #[test]
 fn bash_timeout_terminates_group() {
-    let cfg = BashToolConfig {
-        timeout_seconds: 1,
-        max_output_bytes: 1024,
-    };
-    let started = std::time::Instant::now();
-    let out = tools::run_bash("sleep 30", &cfg, &Cancel::new());
-    assert!(matches!(out.end, tools::BashEnd::TimedOut));
-    assert!(out.content.contains("timed out"));
+    let started = Instant::now();
+    let out = run_bash("sleep 30", 1, &Cancel::new());
+    assert_eq!(out.status, rho::tools::ToolStatus::Failure);
+    assert!(out.output.contains("[status] timed_out"));
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 
 /// bash 已退出但后台子进程仍持有管道写端：drain 收尾有界，不等后台进程。
 #[test]
 fn bash_returns_bounded_when_background_child_holds_pipe() {
-    let cfg = BashToolConfig {
-        timeout_seconds: 5,
-        max_output_bytes: 1024,
-    };
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     // bash 立即退出；后台 sleep 30 继续持有 stdout 写端。
-    let out = tools::run_bash("echo hi; sleep 30 &", &cfg, &Cancel::new());
-    assert!(
-        matches!(out.end, tools::BashEnd::Exited(0)),
-        "end was {:?}",
-        out.end
-    );
-    assert!(out.content.contains("hi"));
+    let out = run_bash("echo hi; sleep 30 &", 5, &Cancel::new());
+    assert_eq!(out.status, rho::tools::ToolStatus::Success);
+    assert!(out.output.contains("hi"));
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "elapsed {:?}",
@@ -585,14 +579,10 @@ fn bash_returns_bounded_when_background_child_holds_pipe() {
 /// 超时清理的是进程组：后台子进程一并终止（否则 drain 管道不关闭，本测试无法收敛）。
 #[test]
 fn bash_timeout_kills_background_children_too() {
-    let cfg = BashToolConfig {
-        timeout_seconds: 1,
-        max_output_bytes: 1024,
-    };
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     // 前台 sleep 撑过超时；后台 sleep 与之同进程组。
-    let out = tools::run_bash("sleep 30 & sleep 30", &cfg, &Cancel::new());
-    assert!(matches!(out.end, tools::BashEnd::TimedOut));
+    let out = run_bash("sleep 30 & sleep 30", 1, &Cancel::new());
+    assert!(out.output.contains("[status] timed_out"));
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "elapsed {:?}",
@@ -603,23 +593,16 @@ fn bash_timeout_kills_background_children_too() {
 /// 取消路径与超时同样升级终止进程组。
 #[test]
 fn bash_cancel_terminates_group() {
-    let cfg = BashToolConfig {
-        timeout_seconds: 30,
-        max_output_bytes: 1024,
-    };
     let cancel = Cancel::new();
     let injector = cancel.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(200));
         injector.inject();
     });
-    let started = std::time::Instant::now();
-    let out = tools::run_bash("sleep 30 & sleep 30", &cfg, &cancel);
-    assert!(
-        matches!(out.end, tools::BashEnd::Cancelled),
-        "end was {:?}",
-        out.end
-    );
+    let started = Instant::now();
+    let out = run_bash("sleep 30 & sleep 30", 30, &cancel);
+    assert_eq!(out.status, rho::tools::ToolStatus::Interrupted);
+    assert!(out.output.contains("[status] interrupted"));
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "elapsed {:?}",
@@ -900,33 +883,30 @@ fn unknown_tool_result_is_rendered() {
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done));
-    assert!(ui
-        .rendered
-        .iter()
-        .any(|e| matches!(e, RenderEvent::ToolResult(c) if c.contains("未知工具：nope"))));
+    assert!(ui.rendered.iter().any(|e| matches!(
+        e,
+        RenderEvent::ToolResult { display: Some(text), .. }
+            if text.contains("未知工具：nope")
+    )));
 }
 
 #[test]
 fn bash_large_output_is_truncated_once_with_accurate_count() {
-    let cfg = BashToolConfig {
-        timeout_seconds: 10,
-        max_output_bytes: 200,
-    };
-    let out = tools::run_bash("yes x | head -c 100000", &cfg, &Cancel::new());
-    assert!(matches!(out.end, tools::BashEnd::Exited(0)));
-    assert!(out.content.contains("exit code 0"));
-    assert_eq!(out.content.matches("省略").count(), 1);
+    let out = run_bash("yes x | head -c 100000", 10, &Cancel::new());
+    assert_eq!(out.status, rho::tools::ToolStatus::Success);
+    assert!(out.output.contains("[status] completed"));
+    assert!(out.output.contains("[truncated] true"));
     let omitted: usize = out
-        .content
-        .split("省略 ")
+        .output
+        .split("[omitted_chars] ")
         .nth(1)
         .unwrap()
-        .split(' ')
+        .split('\n')
         .next()
         .unwrap()
         .parse()
         .unwrap();
-    assert!(omitted > 99_000, "omitted was {omitted}");
+    assert!(omitted > 49_000, "omitted was {omitted}");
 }
 
 #[test]

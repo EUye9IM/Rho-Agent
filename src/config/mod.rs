@@ -47,8 +47,6 @@ pub struct Config {
     pub max_tool_steps: Option<u32>,
     pub providers: OrderedMap<Provider>,
     pub models: OrderedMap<Model>,
-    #[serde(default)]
-    pub tools: ToolsConfig,
     /// DoH 端点：配置后按声明顺序优先解析，全部失败才回退系统解析器。
     #[serde(default)]
     pub dns: Vec<String>,
@@ -92,39 +90,6 @@ pub struct Model {
     /// (档位名, JSON 片段) — 顶层合并进请求 body
     #[serde(default)]
     pub thinking: BTreeMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ToolsConfig {
-    #[serde(default)]
-    pub bash: BashToolConfig,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BashToolConfig {
-    #[serde(default = "default_timeout")]
-    pub timeout_seconds: u64,
-    #[serde(default = "default_max_output")]
-    pub max_output_bytes: usize,
-}
-
-fn default_timeout() -> u64 {
-    120
-}
-
-fn default_max_output() -> usize {
-    16384
-}
-
-impl Default for BashToolConfig {
-    fn default() -> Self {
-        Self {
-            timeout_seconds: default_timeout(),
-            max_output_bytes: default_max_output(),
-        }
-    }
 }
 
 /// 启动后的会话选择（供应商启用 + 默认值冲突消解的结果）。

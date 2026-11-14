@@ -1,16 +1,16 @@
 //! agent loop 分支测试：`ScriptedLauncher` 注入预编排 `StreamEvent` +
-//! `ToolRunner` 预设结果驱动真实 `Session::turn`，无网络无进程。
+//! `ToolRegistry` 预设结果驱动真实 `Session::turn`，无网络无进程。
 //! 覆盖：取消/退出各粒度、占位补齐、错误路径与配对不变式。
 
-use rho::chat::{AssistantMsg, Msg, Session, StreamLauncher, ToolCall, ToolRunner, TurnEnd};
+use rho::chat::{AssistantMsg, Msg, Session, StreamLauncher, ToolCall, TurnEnd};
 use rho::completion::CompletionProvider;
-use rho::config::{self, BashToolConfig, Provider};
+use rho::config::{self, Provider};
 use rho::provider::{self, ProviderAdapter, StreamEvent};
 use rho::term::Cancel;
-use rho::tools::{BashEnd, BashOutput};
+use rho::tools::{Tool, ToolContext, ToolRegistry, ToolResult, ToolSpec, ToolStatus};
 use rho::ui::{ReadOutcome, ScriptedUi, Ui};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -137,33 +137,57 @@ impl StreamLauncher for ParkingLauncher {
     }
 }
 
-/// 预设结果 runner：固定输出，不启动任何进程。
-struct PresetRunner {
+fn test_spec() -> ToolSpec {
+    ToolSpec {
+        name: "bash".into(),
+        description: "测试工具".into(),
+        parameters: json!({"type": "object"}),
+    }
+}
+
+fn registry_with(tool: impl Tool + 'static) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register(tool);
+    registry
+}
+
+/// 预设结果工具：固定输出，不启动任何进程。
+struct PresetTool {
     output: String,
 }
 
-impl ToolRunner for PresetRunner {
-    fn run(&self, _command: &str, _cfg: &BashToolConfig, _cancel: &Cancel) -> BashOutput {
-        BashOutput {
-            content: self.output.clone(),
-            end: BashEnd::Exited(0),
+impl Tool for PresetTool {
+    fn spec(&self) -> ToolSpec {
+        test_spec()
+    }
+
+    fn invoke(&self, _args: Value, _ctx: &ToolContext<'_>) -> ToolResult {
+        ToolResult {
+            output: self.output.clone(),
+            display: None,
+            status: ToolStatus::Success,
         }
     }
 }
 
-/// 预设结果 runner：run 期间注入指定次数的 Ctrl-C（模拟执行中被取消/升级 quit）。
-struct InjectingRunner {
+/// 预设结果工具：invoke 期间注入指定次数的 Ctrl-C（模拟执行中被取消/升级 quit）。
+struct InjectingTool {
     injects: usize,
 }
 
-impl ToolRunner for InjectingRunner {
-    fn run(&self, _command: &str, _cfg: &BashToolConfig, cancel: &Cancel) -> BashOutput {
+impl Tool for InjectingTool {
+    fn spec(&self) -> ToolSpec {
+        test_spec()
+    }
+
+    fn invoke(&self, _args: Value, ctx: &ToolContext<'_>) -> ToolResult {
         for _ in 0..self.injects {
-            cancel.inject();
+            ctx.cancel.inject();
         }
-        BashOutput {
-            content: "partial\n[Command cancelled: 已部分执行（被取消，副作用已发生）]\n".into(),
-            end: BashEnd::Cancelled,
+        ToolResult {
+            output: "partial\n[Command cancelled: 已部分执行（被取消，副作用已发生）]\n".into(),
+            display: None,
+            status: ToolStatus::Interrupted,
         }
     }
 }
@@ -231,8 +255,8 @@ fn first_call_failures_do_not_block_rest() {
         vec![text_final("done")],
     ]));
     // 未知工具/参数错误不影响后续调用；c3 正常执行。
-    session.tool_runner = Arc::new(PresetRunner {
-        output: "hi\n[Command finished with exit code 0]".into(),
+    session.tools = registry_with(PresetTool {
+        output: "hi".into(),
     });
     let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
@@ -262,7 +286,7 @@ fn execution_cancel_keeps_partial_result() {
             call("c2", "bash", CMD),
         ])),
     )]]));
-    session.tool_runner = Arc::new(InjectingRunner { injects: 1 });
+    session.tools = registry_with(InjectingTool { injects: 1 });
     let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
@@ -284,7 +308,7 @@ fn quit_during_cleanup_exits_after_placeholders() {
         ])),
     )]]));
     // 执行中一次取消 + 清理期间升级第二次：收尾完成后退出。
-    session.tool_runner = Arc::new(InjectingRunner { injects: 2 });
+    session.tools = registry_with(InjectingTool { injects: 2 });
     let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
@@ -378,8 +402,8 @@ fn render_failure_mid_batch_placeholders_remaining_then_fatal() {
     )]]));
     // 第一次 print（ToolCall 行）成功，第二个调用的结果渲染开始失败。
     let mut ui = FailingUi::new(1);
-    session.tool_runner = Arc::new(PresetRunner {
-        output: "hi\n[Command finished with exit code 0]".into(),
+    session.tools = registry_with(PresetTool {
+        output: "hi".into(),
     });
     let cancel = Cancel::new();
 
@@ -416,4 +440,70 @@ fn invalid_tool_call_ids_are_rejected_before_submit() {
         // 非法 Assistant 不提交：历史只有用户输入。
         assert_eq!(session.history().len(), 1);
     }
+}
+
+#[test]
+fn non_object_and_invalid_tool_args_are_counted_failures() {
+    let mut session = session();
+    session.launcher = Arc::new(ScriptedLauncher::new(vec![
+        vec![StreamEvent::Final(Box::new(assistant_with_calls(vec![
+            call("c1", "bash", "[]"),
+            call("c2", "bash", r#"{"command":"echo hi","extra":1}"#),
+            call("c3", "bash", r#"{}"#),
+        ])))],
+        vec![text_final("done")],
+    ]));
+    let mut ui = ScriptedUi::new(vec![]);
+    let cancel = Cancel::new();
+
+    let end = session.turn(&mut ui, &cancel, "go").unwrap();
+    assert!(matches!(end, TurnEnd::Done), "end was {end:?}");
+    assert!(tool_result_content(session.history(), 2).contains("arguments 必须是 JSON object"));
+    assert!(tool_result_content(session.history(), 3).contains("unknown field"));
+    assert!(tool_result_content(session.history(), 4).contains("missing field"));
+}
+
+#[test]
+fn builtin_write_read_edit_dispatch_through_registry() {
+    let mut session = session();
+    let path = std::env::temp_dir().join(format!(
+        "rho-agent-tools-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let path = path.display().to_string();
+    let write_args = json!({"path": path, "content": "hello\nworld\n"}).to_string();
+    let read_args = json!({"path": path}).to_string();
+    let edit_args = json!({
+        "path": path,
+        "edits": [{"old_text": "world", "new_text": "rho"}]
+    })
+    .to_string();
+
+    session.launcher = Arc::new(ScriptedLauncher::new(vec![
+        vec![StreamEvent::Final(Box::new(assistant_with_calls(vec![
+            call("c1", "write", &write_args),
+            call("c2", "read", &read_args),
+            call("c3", "edit", &edit_args),
+        ])))],
+        vec![text_final("done")],
+    ]));
+    let mut ui = ScriptedUi::new(vec![]);
+    let cancel = Cancel::new();
+
+    let end = session.turn(&mut ui, &cancel, "go").unwrap();
+    assert!(matches!(end, TurnEnd::Done), "end was {end:?}");
+    assert!(tool_result_content(session.history(), 2).contains("[action] created"));
+    assert!(tool_result_content(session.history(), 3).contains("[status] success"));
+    assert!(tool_result_content(session.history(), 4).contains("[replacements] 1"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\nrho\n");
+    assert!(ui.rendered.iter().any(|e| matches!(
+        e,
+        rho::render::RenderEvent::ToolResult { name, display: None, .. } if name == "read"
+    )));
+    let _ = std::fs::remove_file(&path);
 }

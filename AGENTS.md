@@ -15,7 +15,7 @@
 - 单 crate、单二进制
 - 阻塞 I/O + 线程，**不使用 async runtime**
 - 默认 DeepSeek；`protocol` 支持 `openai_chat` 与 `openai_responses`，供应商/模型/thinking 由 TOML 配置驱动
-- 只有一个 `bash` 工具，命令直接执行，带超时和进程组清理
+- 内置 `bash` / `read` / `write` / `edit` 四个工具；bash 直接执行命令，带超时和进程组清理
 - 分发目标是 Linux musl 静态二进制（x86_64 为主）
 
 ## 分支与发布
@@ -77,11 +77,11 @@ qemu-x86_64 -cpu qemu64 ./rho --config <https-config>
 ```text
 main → config
      → repl → commands → chat → provider → sse
-            │             ├→ tools → term
+            │             ├→ tools (bash/read/write/edit) → term
             │             └→ ui → completion / render
             └→ ui → completion / render
 
-chat 与 provider 共享 message；provider 不再依赖 chat。
+chat 与 provider 共享 message；provider 不再依赖 chat；provider 只依赖 tools 的 ToolSpec。
 completion 只定义补全协议；commands 生成候选，ui 只适配 rustyline。
 ```
 
@@ -94,10 +94,10 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 - 不要在 `render` / `chat` 里直接 `println!`。
 - `provider` 每轮请求在工作线程读取 HTTP 流，经 `mpsc` 回主线程；不要引入 tokio/reqwest。
 - `message::Msg` 是协议无关的内部消息模型；Chat Completions 字段映射留在 `provider/openai.rs`，Responses 映射留在 `provider/openai_responses.rs`。
-- bash 工具定义只在 `tool_spec.rs` 维护；各 adapter 只负责映射成自己的 wire format，不要复制 schema。
+- 每个工具在 `src/tools/<tool>.rs` 自己维护 schema、`deny_unknown_fields` 参数结构、语义校验和执行；`src/tools/mod.rs` 只保留 Tool trait、通用结果类型和注册表。各 adapter 只负责把 `ToolSpec` 映射成自己的 wire format，不要复制 schema。
 - `ProviderAdapter::parse_chunk` 返回 `ChunkOutcome`；流结束标记与 `finish_reason` 的提交资格判定留在 provider worker。
 - 工具循环必须保证历史协议合法：所有 `tool_calls` 都要有对应 `Tool` 消息占位。
-- 取消语义、进程组清理的行为以 `docs/architecture.md` 和现有代码为准，不要简化成“杀直接子进程”或“只 drop 连接”。bash 调用由 `chat` 编排，`tools` 只负责执行。
+- 取消语义、进程组清理的行为以 `docs/architecture.md` 和现有代码为准，不要简化成“杀直接子进程”或“只 drop 连接”。`chat` 只做注册表查找、JSON object 校验、状态控制和历史配对；参数语义与执行归各工具。
 
 ## 配置语义
 
@@ -113,9 +113,9 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 
 改动行为时补对应层测试：
 
-- 纯单元：`sse.rs`、`config`、`tools` 判定/截断、`render`、`commands` 补全候选
+- 纯单元：`sse.rs`、`config`、`tools` 参数校验/截断/文件边界、`render`、`commands` 补全候选
 - 协议映射：`provider::openai`（Chat Completions）与 `provider::openai_responses`（Responses）
-- agent loop + 工具：`ScriptedUi` + `StreamLauncher` / `ToolRunner` 注入
+- agent loop + 工具：`ScriptedUi` + `StreamLauncher` / `Session.tools` 注册表注入
 - HTTP/SSE：`tests/e2e_mock.rs` 的本地 mock 服务
 - REPL：`tests/repl_flow.rs`
 
@@ -136,9 +136,10 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 ## 工具与安全
 
 - `bash` 命令直接执行；安全边界是运行 `rho` 的用户权限，不要把它描述成沙箱。
-- 工具输出 stdout/stderr 各自有上限，只截断一次并保留省略字节数。
+- bash 的 stdout/stderr 合并到同一个 pipe，只保留末尾 50,000 个字符；`[omitted_chars]` 记录丢弃字符数。
 - 超时和取消都走进程组 SIGTERM → 2s → SIGKILL；不要只杀直接子进程。
-- 不要新增第二个工具，除非用户明确要求。
+- `read` / `write` / `edit` 的路径、文本校验和文件上限在工具内部；不要把这些规则漏到 `chat` 或 `render`。
+- 新增工具必须实现 `Tool` 并注册到 `ToolRegistry`；不要在 `chat` 里按工具名分支。
 
 ## 文档规则
 

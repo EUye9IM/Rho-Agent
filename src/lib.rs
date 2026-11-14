@@ -15,6 +15,5 @@ pub mod render;
 pub mod repl;
 pub mod sse;
 pub mod term;
-pub mod tool_spec;
 pub mod tools;
 pub mod ui;

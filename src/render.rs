@@ -4,6 +4,8 @@
 //! 各自只输出一次 ANSI（思考块一次 `\x1b[2m` … 一次 `\x1b[0m`），不随每个 delta
 //! 重复包裹。它只返回要写的文本，不直接写终端；去向由 `ui` 决定。
 
+use crate::tools::ToolStatus;
+
 /// 渲染事件（agent loop → ui.print 的载荷；具体形态实现期定）。
 #[derive(Debug)]
 pub enum RenderEvent {
@@ -13,10 +15,14 @@ pub enum RenderEvent {
     TextDelta(String),
     /// 确保行首的折行（回合结束时由 `repl` 补，避免正文块贴住提示符）
     LineBreak,
-    /// 工具调用行：`→ bash: <命令>`
-    ToolCall(String),
-    /// 工具结果（带左边栏显示，截断处标注省略字节数）
-    ToolResult(String),
+    /// 工具调用行：`→ <工具名>: <摘要>`
+    ToolCall { name: String, summary: String },
+    /// 工具结果：display 为 None 时不展示结果体；status 决定样式。
+    ToolResult {
+        name: String,
+        display: Option<String>,
+        status: ToolStatus,
+    },
     /// 错误展示（轮内错误，回 REPL）
     Error(String),
 }
@@ -30,27 +36,33 @@ pub fn dim(s: &str) -> String {
     format!("{DIM_OPEN}{s}{DIM_CLOSE}")
 }
 
-/// 工具调用单行：`→ bash: <命令>`。
-pub fn tool_call_line(cmd: &str) -> String {
-    format!("→ bash: {cmd}")
+/// 工具调用单行：`→ <工具名>: <摘要>`。
+pub fn tool_call_line(name: &str, summary: &str) -> String {
+    format!("→ {name}: {summary}")
 }
 
-/// 工具结果带左边栏显示，空白行不补尾随空格。
-pub fn tool_result_block(content: &str) -> String {
-    if content.is_empty() {
-        return "  │ （无输出）".to_string();
+/// 工具结果带左边栏显示，空白行不补尾随空格；失败/打断使用固定 ANSI 样式。
+pub fn tool_result_block(content: &str, status: ToolStatus) -> String {
+    let body = if content.is_empty() {
+        "  │ （无输出）".to_string()
+    } else {
+        content
+            .lines()
+            .map(|line| {
+                if line.is_empty() {
+                    "  │".to_string()
+                } else {
+                    format!("  │ {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    match status {
+        ToolStatus::Success => body,
+        ToolStatus::Failure => format!("\x1b[31m{body}\x1b[0m"),
+        ToolStatus::Interrupted => format!("\x1b[33m{body}\x1b[0m"),
     }
-    content
-        .lines()
-        .map(|line| {
-            if line.is_empty() {
-                "  │".to_string()
-            } else {
-                format!("  │ {line}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// 一次事件产生的输出，按流向分开：`stdout` 走渲染流，`stderr` 走错误流。
@@ -108,16 +120,22 @@ impl Renderer {
             RenderEvent::LineBreak => {
                 out.stdout.push('\n');
             }
-            RenderEvent::ToolCall(cmd) => {
+            RenderEvent::ToolCall { name, summary } => {
                 self.close(&mut out.stdout);
                 out.stdout.push('\n');
-                out.stdout.push_str(&tool_call_line(cmd));
+                out.stdout.push_str(&tool_call_line(name, summary));
                 out.stdout.push('\n');
             }
-            RenderEvent::ToolResult(content) => {
+            RenderEvent::ToolResult {
+                name: _,
+                display,
+                status,
+            } => {
                 self.close(&mut out.stdout);
-                out.stdout.push_str(&tool_result_block(content));
-                out.stdout.push('\n');
+                if let Some(content) = display {
+                    out.stdout.push_str(&tool_result_block(content, *status));
+                    out.stdout.push('\n');
+                }
             }
             RenderEvent::Error(msg) => {
                 self.close(&mut out.stdout);
@@ -161,22 +179,36 @@ mod tests {
 
     #[test]
     fn tool_call_line_format() {
-        assert_eq!(tool_call_line("ls"), "→ bash: ls");
+        assert_eq!(tool_call_line("bash", "ls"), "→ bash: ls");
     }
 
     #[test]
     fn result_block_uses_left_rail() {
-        assert_eq!(tool_result_block("a\nb"), "  │ a\n  │ b");
+        assert_eq!(
+            tool_result_block("a\nb", ToolStatus::Success),
+            "  │ a\n  │ b"
+        );
     }
 
     #[test]
     fn result_block_handles_empty_output() {
-        assert_eq!(tool_result_block(""), "  │ （无输出）");
+        assert_eq!(tool_result_block("", ToolStatus::Success), "  │ （无输出）");
     }
 
     #[test]
     fn result_block_keeps_blank_lines() {
-        assert_eq!(tool_result_block("a\n\nb"), "  │ a\n  │\n  │ b");
+        assert_eq!(
+            tool_result_block("a\n\nb", ToolStatus::Success),
+            "  │ a\n  │\n  │ b"
+        );
+    }
+
+    #[test]
+    fn failure_result_is_red() {
+        assert_eq!(
+            tool_result_block("x", ToolStatus::Failure),
+            "\x1b[31m  │ x\x1b[0m"
+        );
     }
 
     fn stdout(r: &Rendered) -> &str {
@@ -217,14 +249,21 @@ mod tests {
     fn tool_call_closes_reasoning_first() {
         let mut r = Renderer::new();
         r.event(&RenderEvent::ReasoningDelta("想".into()));
-        let out = r.event(&RenderEvent::ToolCall("ls".into()));
+        let out = r.event(&RenderEvent::ToolCall {
+            name: "bash".into(),
+            summary: "ls".into(),
+        });
         assert_eq!(stdout(&out), "\x1b[0m\n→ bash: ls\n");
     }
 
     #[test]
     fn tool_result_uses_left_rail_and_newline() {
         let mut r = Renderer::new();
-        let out = r.event(&RenderEvent::ToolResult("a\nb".into()));
+        let out = r.event(&RenderEvent::ToolResult {
+            name: "bash".into(),
+            display: Some("a\nb".into()),
+            status: ToolStatus::Success,
+        });
         assert_eq!(stdout(&out), "  │ a\n  │ b\n");
     }
 

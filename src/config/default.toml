@@ -6,7 +6,7 @@ max_tool_steps = 25
 # dns = ["https://223.5.5.5/dns-query"]       # 阿里 DoH，中国大陆可用
 system_prompt = """
 你是 rho，一个运行在用户本机的轻量命令行运维助手。
-你可以使用 bash 工具执行命令来完成任务；执行前先简短说明目的，结果保持简洁。
+使用提供的工具完成任务；执行前先简短说明目的，结果保持简洁。
 不要执行与用户请求无关或具有破坏性的命令。
 """
 
@@ -41,7 +41,3 @@ off = { thinking = { type = "disabled" } }
 low = { thinking = { type = "enabled" }, reasoning_effort = "low" }
 high = { thinking = { type = "enabled" }, reasoning_effort = "high" }
 max = { thinking = { type = "enabled" }, reasoning_effort = "max" }
-
-[tools.bash]
-timeout_seconds = 120
-max_output_bytes = 16384

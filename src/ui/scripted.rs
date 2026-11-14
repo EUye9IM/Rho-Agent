@@ -34,8 +34,19 @@ impl Ui for ScriptedUi {
             RenderEvent::ReasoningDelta(s) => RenderEvent::ReasoningDelta(s.clone()),
             RenderEvent::TextDelta(s) => RenderEvent::TextDelta(s.clone()),
             RenderEvent::LineBreak => RenderEvent::LineBreak,
-            RenderEvent::ToolCall(s) => RenderEvent::ToolCall(s.clone()),
-            RenderEvent::ToolResult(s) => RenderEvent::ToolResult(s.clone()),
+            RenderEvent::ToolCall { name, summary } => RenderEvent::ToolCall {
+                name: name.clone(),
+                summary: summary.clone(),
+            },
+            RenderEvent::ToolResult {
+                name,
+                display,
+                status,
+            } => RenderEvent::ToolResult {
+                name: name.clone(),
+                display: display.clone(),
+                status: *status,
+            },
             RenderEvent::Error(s) => RenderEvent::Error(s.clone()),
         });
     }

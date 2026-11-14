@@ -127,13 +127,6 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<ValidationError>> {
             errs.push(err("max_tool_steps", "必须大于 0"));
         }
     }
-    if cfg.tools.bash.timeout_seconds == 0 {
-        errs.push(err("tools.bash.timeout_seconds", "必须大于 0"));
-    }
-    if cfg.tools.bash.max_output_bytes == 0 {
-        errs.push(err("tools.bash.max_output_bytes", "必须大于 0"));
-    }
-
     for (i, endpoint) in cfg.dns.iter().enumerate() {
         if let Err(e) = parse_dns_endpoint(endpoint) {
             errs.push(err(format!("dns.{i}"), e));

@@ -22,6 +22,7 @@ use std::time::Duration;
 use crate::config::{Model, Protocol, Provider};
 use crate::message::{AssistantMsg, Msg, ToolCall};
 use crate::sse::SseParser;
+use crate::tools::ToolSpec;
 use serde_json::Value;
 
 use http::{agent_for, shorten, MAX_ERROR_BODY_BYTES, MAX_RESPONSE_BYTES};
@@ -136,6 +137,7 @@ pub trait ProviderAdapter: Send + Sync {
         model: &Model,
         model_id: &str,
         thinking: Option<&Value>,
+        tools: &[ToolSpec],
     ) -> Value;
     fn headers(&self, p: &Provider) -> Vec<(String, String)>;
     /// 原始载荷是否表示流结束（OpenAI Chat 的 `[DONE]`）。

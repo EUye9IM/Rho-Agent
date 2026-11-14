@@ -4,11 +4,11 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-`rho` is a small local agent that lives in your terminal. It is a single binary (musl static builds are the intended distribution form), uses blocking I/O and threads, and is built for resource-constrained Linux boxes. You talk to it in a REPL; it streams answers from an OpenAI Chat Completions–compatible provider (DeepSeek by default), with OpenAI Responses support available by configuration, and can run shell commands through a `bash` tool.
+`rho` is a small local agent that lives in your terminal. It is a single binary (musl static builds are the intended distribution form), uses blocking I/O and threads, and is built for resource-constrained Linux boxes. You talk to it in a REPL; it streams answers from an OpenAI Chat Completions–compatible provider (DeepSeek by default), with OpenAI Responses support available by configuration, and can run shell commands and read, write, or edit files through built-in tools.
 
 ## Vision
 
-rho should stay a small, predictable local agent for Linux boxes with limited resources: one binary, providers declared in TOML, one `bash` tool, and a REPL whose history stays valid through cancellation.
+rho should stay a small, predictable local agent for Linux boxes with limited resources: one binary, providers declared in TOML, four built-in tools for shell and file work, and a REPL whose history stays valid through cancellation.
 
 Implementation: [docs/architecture.md](docs/architecture.md).
 
@@ -17,7 +17,7 @@ Implementation: [docs/architecture.md](docs/architecture.md).
 - **Small by design** — one crate, one binary, blocking I/O + threads; `strip` + LTO + `panic = "abort"` in release.
 - **Config-driven providers** — providers, models and thinking levels are declared as data. `openai_chat` and `openai_responses` are both supported; switching protocol is configuration only.
 - **Streaming with visible reasoning** — text streams as it arrives; `reasoning_content` is rendered dimmed and stays local unless the provider sets `compat.echo_reasoning = true`.
-- **One tool: `bash`** — executed in the foreground as `bash -c <command>`, with a fresh shell per call and a per-call timeout that escalates to a process-group kill.
+- **Built-in tools** — `bash` runs in the foreground as `bash -c <command>` with a fresh shell, a per-call timeout, and process-group cleanup. `read` returns line-numbered text; `write` creates new files and parent directories; `edit` applies exact, sequential replacements and preserves the file's CRLF/LF style.
 - **Predictable Ctrl-C** — first Ctrl-C cancels the current stream/tool and returns you to the prompt (cancellation takes effect between chunks; if the connection stalls, the background reader ends once the next data arrives or the idle timeout hits), second one exits; at the idle prompt two empty-line Ctrl-C within two seconds exit (the first shows a gray hint). The conversation history is always left in a protocol-valid state.
 - **Tab completion** — slash command names and the arguments of `/model`, `/provider` and `/thinking` complete from the current session state; candidates refresh after a provider or model switch.
 - **Strict config validation** — unknown fields, dangling references and missing required fields fail loudly with the config path (TOML syntax errors also include a line number), exit code 2.
@@ -138,10 +138,6 @@ off  = { thinking = { type = "disabled" } }
 low  = { thinking = { type = "enabled" }, reasoning_effort = "low" }
 high = { thinking = { type = "enabled" }, reasoning_effort = "high" }
 max  = { thinking = { type = "enabled" }, reasoning_effort = "max" }
-
-[tools.bash]
-timeout_seconds  = 120
-max_output_bytes = 16384
 ```
 
 Rules worth knowing:
@@ -153,15 +149,18 @@ Rules worth knowing:
 - `dns` lists optional DoH endpoints used first, in order; the system resolver takes over only when every endpoint fails. The endpoint host must be an IP literal (`https://223.5.5.5/dns-query`; IPv6 uses `https://[2400:3200::1]/dns-query`). Answers are cached for their TTL. Android/Termux has no `/etc/resolv.conf`, so musl static builds rely on this entry to resolve names.
 - Validation is strict: unknown fields, dangling references and missing required fields abort startup with exit code 2 and the config path; TOML syntax errors also include a line number.
 
-## The `bash` tool and its safety model
+## Tools and safety model
 
-`rho` runs `bash -c <command>` in the foreground. Each call starts a fresh shell, so `cwd` and environment changes stay inside that call. Background processes started by a command keep running; chain `cd` and the command in one line if you need both.
+`rho` ships four tools. Their names, descriptions and JSON schemas are sent to the model; the model calls them with JSON arguments, and every call is paired with a tool result in the conversation history.
 
-Every command the model emits runs immediately.
+- **`bash`** runs `bash -c <command>` in the foreground. Each call starts a fresh shell, so `cwd` and environment changes stay inside that call. `timeout` is optional (seconds, default 120, maximum 300); `cwd` sets the initial directory (absolute or relative to rho's startup directory). stdout and stderr share one pipe, and only the last 50,000 Unicode characters are returned, with `[omitted_chars]` recording what was dropped. On timeout or Ctrl-C the whole process group is terminated (SIGTERM, then SIGKILL after 2s). Background processes started by a command keep running.
+- **`read`** returns text with real 1-based line numbers. It reads at most 2,000 lines and 50,000 characters of file content per call; `offset` is 0-based and `limit` is capped at 2,000. The whole file must be valid UTF-8 without NUL bytes. A single line over 50,000 characters is an error; use `sed`, `cut` or `fold` from `bash` for that case.
+- **`write`** creates a new file and any missing parent directories. It refuses to overwrite an existing file, directory or symlink, rejects NUL bytes, and writes the content as-is (no added newline, no line-ending conversion).
+- **`edit`** applies exact string replacements from an `edits` array in order. By default `old_text` must occur exactly once; `replace_all: true` replaces every match. Files are capped at 10 MiB and must be valid UTF-8 without NUL. The tool normalizes CRLF to LF for matching and writes back the detected dominant line-ending style. Each successful edit is written immediately; if a later edit fails, earlier edits stay on disk. A failed match reports the closest line and snippet when it is similar enough.
 
-> **Safety boundary.** `rho` executes whatever the model emits; the host's user permissions are the only security boundary. Child processes inherit the full environment, so the model can read `DEEPSEEK_API_KEY` via `env`. Run `rho` as a user you are willing to have execute commands, and use it only on hosts you trust it to read.
+Every valid tool call the model emits is executed. The host's user permissions are the only security boundary: `bash` inherits the full environment, and the file tools can read or modify anything that user can. Run `rho` as a user you are willing to have execute commands, and use it only on hosts you trust it to read.
 
-Other limits: at most `max_tool_steps` model-initiated tool calls per turn (default 25, counting failed calls too); stdout and stderr are each capped at `max_output_bytes` with the head and tail kept and the omitted byte count marked; a timeout kills the whole process group (SIGTERM, then SIGKILL after 2s). Each request sends the model's `max_output` as the upstream output token limit. SSE lines are capped at 1 MiB and a single response body at 32 MiB; exceeding either ends the turn with an error. HTTP errors are reported directly. History is sent as-is; when a conversation exceeds the model window, the upstream request fails and you need `/clear`.
+Other limits: at most `max_tool_steps` model-initiated tool calls per turn (default 25, counting invalid calls too). Each request sends the model's `max_output` as the upstream output token limit. SSE lines are capped at 1 MiB and a single response body at 32 MiB; exceeding either ends the turn with an error. HTTP errors are reported directly. History is sent as-is; when a conversation exceeds the model window, the upstream request fails and you need `/clear`.
 
 ## Testing
 
