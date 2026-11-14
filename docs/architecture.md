@@ -2,6 +2,9 @@
 
 本文描述 rho 当前的实现结构：单 crate、单二进制、模块边界少而清晰，阻塞 I/O + 线程。
 
+供应商协议与 OpenAI 标准的差异、各 `compat` 开关的含义和上游文档地址见
+[providers.md](providers.md)。
+
 ## 一、总体结构
 
 ```

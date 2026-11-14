@@ -143,11 +143,11 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 
 ## 文档规则
 
-- `docs/` 只放当前实现文档（`docs/architecture.md`）；不要新增设计文档、功能清单、流程/工作流文档，除非用户明确要求。
+- `docs/` 只放当前实现文档（`docs/architecture.md`、`docs/providers.md`）；不要新增设计文档、功能清单、流程/工作流文档，除非用户明确要求。`docs/providers.md` 记录供应商协议与 OpenAI 标准的差异、`compat` 开关与上游文档地址。
 - 文档只描述当前代码的实际行为。用正向陈述；不要用“不支持 / 不使用 / 没有 / 不做”来定义功能。必要的错误条件（非 TTY、超限、非法输入等）可以直接写。
 - 不写版本历史、变更记录、里程碑、状态横幅或“已完成 / 待发布”之类的过程信息。
 - 产品愿景和定位写在 `README.md` / `README.zh-CN.md`；两份 README 保持同步，并只链接 `docs/architecture.md`。
-- 行为或配置语义变化时，同步更新 README 和 architecture；不要留下指向已删除文档的引用。
+- 行为或配置语义变化时，同步更新 README、architecture 与（涉及供应商协议时）providers；不要留下指向已删除文档的引用。
 
 ## 提交
 
