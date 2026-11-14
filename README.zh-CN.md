@@ -113,7 +113,7 @@ rho --init           # 生成默认配置文件到 ~/.config/rho/config.toml
 default_provider = "deepseek"
 default_model    = "deepseek/deepseek-v4-pro"   # 与 default_provider 冲突时以模型为准
 system_prompt    = "你是 rho，一个轻量本地运维助手。"  # 省略则请求不含 system 消息
-max_tool_steps   = 25
+max_tool_steps   = 100
 dns              = ["https://223.5.5.5/dns-query"]  # 可选：优先使用的 DoH 解析器
 
 [providers.deepseek]
@@ -159,7 +159,7 @@ max  = { thinking = { type = "enabled" }, reasoning_effort = "max" }
 
 模型发出的每个合法工具调用都会执行。真正的安全边界是运行 `rho` 的用户权限：`bash` 继承完整环境变量，文件工具也能读写该用户可访问的任何路径。请以你愿意让其执行命令的用户身份运行 `rho`，并只在信任的主机上使用。
 
-其他限制：每轮对话最多 `max_tool_steps` 次模型发起的工具调用（默认 25，非法调用同样计数）。每次请求把模型的 `max_output` 作为上游输出 token 上限发送。SSE 单行上限 1 MiB，单轮响应体累计上限 32 MiB，超出即按错误结束本轮。HTTP 错误直接展示；历史按原样发送，会话超出模型窗口时上游会失败，此时用 `/clear` 重开。
+其他限制：每轮对话最多 `max_tool_steps` 次模型发起的工具调用（默认 100，非法调用同样计数）。每次请求把模型的 `max_output` 作为上游输出 token 上限发送。SSE 单行上限 1 MiB，单轮响应体累计上限 32 MiB，超出即按错误结束本轮。HTTP 错误直接展示；历史按原样发送，会话超出模型窗口时上游会失败，此时用 `/clear` 重开。
 
 ## 测试
 

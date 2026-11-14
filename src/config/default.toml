@@ -1,5 +1,5 @@
 default_provider = "deepseek"
-max_tool_steps = 25
+max_tool_steps = 100
 # 指定 DoH 解析器时取消注释：配置后按声明顺序优先解析，全部失败才回退系统解析器。
 # 端点主机写 IP 字面量。
 # dns = ["https://1.1.1.1/dns-query"]         # Cloudflare，全球可用

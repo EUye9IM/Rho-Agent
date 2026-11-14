@@ -15,7 +15,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::Duration;
 
-const DEFAULT_MAX_TOOL_STEPS: u32 = 25;
+const DEFAULT_MAX_TOOL_STEPS: u32 = 100;
 
 /// 取消/退出时未执行调用的占位文本。
 const CANCELLED_PLACEHOLDER: &str = "用户取消执行";

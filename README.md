@@ -114,7 +114,7 @@ The built-in config ships DeepSeek (`deepseek/deepseek-flash`, `deepseek/deepsee
 default_provider = "deepseek"
 default_model    = "deepseek/deepseek-v4-pro"   # wins over default_provider on conflict
 system_prompt    = "You are rho, a lightweight local ops assistant."  # omit to send no system message
-max_tool_steps   = 25
+max_tool_steps   = 100
 dns              = ["https://223.5.5.5/dns-query"]  # optional: preferred DoH resolver
 
 [providers.deepseek]
@@ -160,7 +160,7 @@ Rules worth knowing:
 
 Every valid tool call the model emits is executed. The host's user permissions are the only security boundary: `bash` inherits the full environment, and the file tools can read or modify anything that user can. Run `rho` as a user you are willing to have execute commands, and use it only on hosts you trust it to read.
 
-Other limits: at most `max_tool_steps` model-initiated tool calls per turn (default 25, counting invalid calls too). Each request sends the model's `max_output` as the upstream output token limit. SSE lines are capped at 1 MiB and a single response body at 32 MiB; exceeding either ends the turn with an error. HTTP errors are reported directly. History is sent as-is; when a conversation exceeds the model window, the upstream request fails and you need `/clear`.
+Other limits: at most `max_tool_steps` model-initiated tool calls per turn (default 100, counting invalid calls too). Each request sends the model's `max_output` as the upstream output token limit. SSE lines are capped at 1 MiB and a single response body at 32 MiB; exceeding either ends the turn with an error. HTTP errors are reported directly. History is sent as-is; when a conversation exceeds the model window, the upstream request fails and you need `/clear`.
 
 ## Testing
 
