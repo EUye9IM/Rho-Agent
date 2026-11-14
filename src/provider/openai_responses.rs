@@ -4,7 +4,7 @@ use super::common::{default_headers, merge_thinking, model_name};
 use super::{ChunkOutcome, FinishReason, ProviderAdapter, TurnAcc};
 use crate::config::{Model, Provider};
 use crate::message::Msg;
-use crate::tool_spec;
+use crate::tools::ToolSpec;
 use serde_json::{json, Value};
 
 pub struct OpenAiResponsesAdapter;
@@ -32,6 +32,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
         model: &Model,
         model_id: &str,
         thinking: Option<&Value>,
+        tools: &[ToolSpec],
     ) -> Value {
         let mut instructions: Vec<&str> = Vec::new();
         let mut input: Vec<Value> = Vec::new();
@@ -65,19 +66,24 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
             }
         }
 
-        let spec = tool_spec::bash();
+        let tools: Vec<Value> = tools
+            .iter()
+            .map(|spec| {
+                json!({
+                    "type": "function",
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": spec.parameters,
+                })
+            })
+            .collect();
         let mut body = json!({
             "model": model_name(model, model_id),
             "input": input,
             "stream": true,
             // 模型声明的输出上限直接编进请求，避免上游超长回复。
             "max_output_tokens": model.max_output,
-            "tools": [{
-                "type": "function",
-                "name": spec.name,
-                "description": spec.description,
-                "parameters": spec.parameters,
-            }]
+            "tools": tools,
         });
         if !instructions.is_empty() {
             body["instructions"] = json!(instructions.join("\n\n"));
@@ -400,7 +406,8 @@ mod tests {
             },
         ];
         let thinking = json!({ "reasoning": { "effort": "low" } });
-        let body = a.build_body(&hist, &model(), "p/m", Some(&thinking));
+        let tools = crate::tools::ToolRegistry::builtin().specs();
+        let body = a.build_body(&hist, &model(), "p/m", Some(&thinking), &tools);
         assert_eq!(body["model"], "m");
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_output_tokens"], 1);

@@ -68,8 +68,30 @@ impl Hinter for ReplHelper {
 }
 
 impl Highlighter for ReplHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        if line.is_empty() {
+            Cow::Borrowed(line)
+        } else {
+            Cow::Owned(render::input(line))
+        }
+    }
+
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> Cow<'b, str> {
+        Cow::Owned(render::prompt(prompt))
+    }
+
     fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
         Cow::Owned(render::dim(hint))
+    }
+
+    fn highlight_char(&self, line: &str, _pos: usize, _forced: bool) -> bool {
+        // 非空行需要整行重绘：rustyline 在 `highlight_char` 为 false 时直接写字符，
+        // 会绕过 `highlight`，输入行就不会着色。
+        !line.is_empty()
     }
 }
 
@@ -87,6 +109,20 @@ mod tests {
         fn complete(&self, _line: &str, _pos: usize) -> Completion {
             self.0.clone()
         }
+    }
+
+    #[test]
+    fn prompt_input_and_hint_are_styled() {
+        let helper = ReplHelper::new(Arc::new(HintArm::new(false)));
+        assert_eq!(
+            helper.highlight_prompt("rho> ", true).as_ref(),
+            "\x1b[1;36mrho> \x1b[0m"
+        );
+        assert_eq!(helper.highlight("ls", 2).as_ref(), "\x1b[36mls\x1b[0m");
+        assert_eq!(helper.highlight("", 0).as_ref(), "");
+        assert_eq!(helper.highlight_hint("hint").as_ref(), "\x1b[2mhint\x1b[0m");
+        assert!(helper.highlight_char("x", 1, false));
+        assert!(!helper.highlight_char("", 0, false));
     }
 
     #[test]

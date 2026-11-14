@@ -73,21 +73,9 @@ pub enum ReadOutcome {
     Eof,
 }
 
-/// bash 确认结果。
-#[derive(Debug)]
-pub enum ConfirmOutcome {
-    /// 执行
-    Yes,
-    /// 拒绝（y/N 默认 N），喂回模型
-    No,
-    /// Ctrl-C：取消当前回合（走 SIGINT 信号路径，计数由信号线程记录）
-    Cancelled,
-}
-
 pub trait Ui {
     /// 读取一行输入。补全提供者按调用注入，生命周期仅限本次读取。
     fn read_line(&mut self, completer: Arc<dyn CompletionProvider>) -> ReadOutcome;
-    fn confirm(&mut self, cwd: &str, cmd: &str) -> ConfirmOutcome;
     fn print(&mut self, ev: &RenderEvent);
 
     /// Ctrl-C 双按提示开关：`true` 在提示符行尾显示灰色提示，`false` 立刻撤掉。
@@ -142,11 +130,8 @@ impl ConditionalEventHandler for CtrlCHandler {
 /// 生产实现：rustyline 后端。
 ///
 /// - `stdin 非 TTY 拒绝启动`的检查在 `TermUi::new` 里做
-/// - `confirm` 保持 ISIG 的可中断读取：Ctrl-C 产生 SIGINT 唤醒阻塞的
-///   `libc::read` 返回 `EINTR`，转为 `Cancelled`（记录由专用信号线程追加，
-///   此处不自行追加，无双重计数）
 /// - REPL 输入态 Ctrl-C 由 rustyline 返回 Interrupted（其原始模式清 ISIG，
-///   与 confirm 的信号路径互斥，不会双重计数）
+///   信号线程只处理活动操作，不会双重计数）
 /// - 空行 Ctrl-C 的灰色双按提示由 helper 提供，到期由 `rho-hint` 线程擦掉
 /// - 每次 `readline` 收尾都会被 rustyline 的换行钉死一行（输入长时多行）：Ctrl-C 后
 ///   下一次读取前把这些行收回重用，输入过的内容也一并清掉，不另起新行
@@ -282,33 +267,6 @@ impl Ui for TermUi {
         outcome
     }
 
-    fn confirm(&mut self, cwd: &str, cmd: &str) -> ConfirmOutcome {
-        let result = (|| -> std::io::Result<()> {
-            let mut out = std::io::stdout().lock();
-            write!(
-                out,
-                "\n当前目录：{cwd}\n将执行 bash：\n  {cmd}\n执行？[y/N] "
-            )?;
-            out.flush()
-        })();
-        if let Err(e) = result {
-            self.set_fatal(format!("渲染输出失败：{e}"));
-            return ConfirmOutcome::No;
-        }
-        match read_confirm_line() {
-            Ok(Some(line)) => match line.trim().to_ascii_lowercase().as_str() {
-                "y" | "yes" => ConfirmOutcome::Yes,
-                _ => ConfirmOutcome::No,
-            },
-            Ok(None) => ConfirmOutcome::No,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => ConfirmOutcome::Cancelled,
-            Err(e) => {
-                self.set_fatal(format!("读取确认输入失败：{e}"));
-                ConfirmOutcome::No
-            }
-        }
-    }
-
     fn print(&mut self, ev: &RenderEvent) {
         let result = (|| -> std::io::Result<()> {
             let out = self.renderer.event(ev);
@@ -352,32 +310,6 @@ impl Drop for TermUi {
         self.reset_style();
         self.hint.stop();
     }
-}
-
-/// 直接读 stdin fd（不经 std 的 BufReader，避免吞掉后续输入）。
-/// 返回 Ok(None) 表示 EOF；Err(Interrupted) 表示被 SIGINT 打断。
-fn read_confirm_line() -> std::io::Result<Option<String>> {
-    let mut bytes = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        // SAFETY: fd 0 是 stdin；byte 是合法的 1 字节可写缓冲区。
-        let n = unsafe { libc::read(0, byte.as_mut_ptr().cast(), 1) };
-        if n < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if n == 0 {
-            if bytes.is_empty() {
-                return Ok(None);
-            }
-            break;
-        }
-        match byte[0] {
-            b'\n' => break,
-            b'\r' => {}
-            b => bytes.push(b),
-        }
-    }
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 #[cfg(test)]

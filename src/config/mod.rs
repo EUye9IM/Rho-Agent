@@ -1,5 +1,6 @@
 //! 配置模型：加载、严格校验、`${VAR}` 展开、供应商启用。
 
+mod dns;
 mod expand;
 mod validate;
 
@@ -9,6 +10,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+pub use dns::parse_endpoint as parse_dns_endpoint;
 pub use expand::expand_headers;
 pub use expand::warn_plaintext_secrets;
 pub use validate::{validate, ValidationError};
@@ -45,8 +47,9 @@ pub struct Config {
     pub max_tool_steps: Option<u32>,
     pub providers: OrderedMap<Provider>,
     pub models: OrderedMap<Model>,
+    /// DoH 端点：配置后按声明顺序优先解析，全部失败才回退系统解析器。
     #[serde(default)]
-    pub tools: ToolsConfig,
+    pub dns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,42 +90,6 @@ pub struct Model {
     /// (档位名, JSON 片段) — 顶层合并进请求 body
     #[serde(default)]
     pub thinking: BTreeMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ToolsConfig {
-    #[serde(default)]
-    pub bash: BashToolConfig,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BashToolConfig {
-    #[serde(default)]
-    pub allow: Vec<String>,
-    #[serde(default = "default_timeout")]
-    pub timeout_seconds: u64,
-    #[serde(default = "default_max_output")]
-    pub max_output_bytes: usize,
-}
-
-fn default_timeout() -> u64 {
-    120
-}
-
-fn default_max_output() -> usize {
-    16384
-}
-
-impl Default for BashToolConfig {
-    fn default() -> Self {
-        Self {
-            allow: Vec::new(),
-            timeout_seconds: default_timeout(),
-            max_output_bytes: default_max_output(),
-        }
-    }
 }
 
 /// 启动后的会话选择（供应商启用 + 默认值冲突消解的结果）。
@@ -441,6 +408,31 @@ mod tests {
             Some(PathBuf::from("/home/u/.config/rho/config.toml"))
         );
         assert_eq!(default_config_path_from(None, None), None);
+    }
+
+    #[test]
+    fn dns_endpoints_load_and_validate() {
+        let src = format!(
+            "dns = [\"https://223.5.5.5/dns-query\", \"https://[2400:3200::1]/dns-query\"]\n{BUILTIN_TOML}"
+        );
+        let cfg = load_str(&src, "t").unwrap();
+        assert_eq!(cfg.dns.len(), 2);
+        assert_eq!(cfg.dns[0], "https://223.5.5.5/dns-query");
+
+        // 每个端点单独校验，路径写到 dns.<下标>。
+        let bad = format!(
+            "dns = [\"https://223.5.5.5/dns-query\", \"https://dns.alidns.com/dns-query\"]\n{BUILTIN_TOML}"
+        );
+        let err = load_str(&bad, "t").unwrap_err();
+        assert!(err.contains("dns.1"), "error was {err}");
+        assert!(err.contains("IP 字面量"), "error was {err}");
+    }
+
+    #[test]
+    fn allowlist_config_is_rejected() {
+        let src = format!("{BUILTIN_TOML}\nallow = []\n");
+        let err = load_str(&src, "t").unwrap_err();
+        assert!(err.contains("allow"), "error was {err}");
     }
 
     #[test]

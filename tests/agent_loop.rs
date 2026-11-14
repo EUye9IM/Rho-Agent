@@ -1,16 +1,16 @@
 //! agent loop 分支测试：`ScriptedLauncher` 注入预编排 `StreamEvent` +
-//! `ToolRunner` 预设结果驱动真实 `Session::turn`，无网络无进程。
+//! `ToolRegistry` 预设结果驱动真实 `Session::turn`，无网络无进程。
 //! 覆盖：取消/退出各粒度、占位补齐、错误路径与配对不变式。
 
-use rho::chat::{AssistantMsg, Msg, Session, StreamLauncher, ToolCall, ToolRunner, TurnEnd};
+use rho::chat::{AssistantMsg, Msg, Session, StreamLauncher, ToolCall, TurnEnd};
 use rho::completion::CompletionProvider;
-use rho::config::{self, BashToolConfig, Provider};
+use rho::config::{self, Provider};
 use rho::provider::{self, ProviderAdapter, StreamEvent};
 use rho::term::Cancel;
-use rho::tools::{BashEnd, BashOutput};
-use rho::ui::{ConfirmOutcome, ReadOutcome, ScriptedUi, Ui};
+use rho::tools::{Tool, ToolContext, ToolRegistry, ToolResult, ToolSpec, ToolStatus};
+use rho::ui::{ReadOutcome, ScriptedUi, Ui};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -31,7 +31,7 @@ fn session() -> Session {
     let cfg = config::load_str(CONFIG_TOML, "<测试配置>").unwrap();
     let selection = config::resolve_selection(&cfg, None, None).unwrap();
     let adapter = provider::adapter_for(&selection.provider).unwrap();
-    Session::new(cfg, selection, adapter, false)
+    Session::new(cfg, selection, adapter)
 }
 
 fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
@@ -137,33 +137,57 @@ impl StreamLauncher for ParkingLauncher {
     }
 }
 
-/// 预设结果 runner：固定输出，不启动任何进程。
-struct PresetRunner {
+fn test_spec() -> ToolSpec {
+    ToolSpec {
+        name: "bash".into(),
+        description: "测试工具".into(),
+        parameters: json!({"type": "object"}),
+    }
+}
+
+fn registry_with(tool: impl Tool + 'static) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register(tool);
+    registry
+}
+
+/// 预设结果工具：固定输出，不启动任何进程。
+struct PresetTool {
     output: String,
 }
 
-impl ToolRunner for PresetRunner {
-    fn run(&self, _command: &str, _cfg: &BashToolConfig, _cancel: &Cancel) -> BashOutput {
-        BashOutput {
-            content: self.output.clone(),
-            end: BashEnd::Exited(0),
+impl Tool for PresetTool {
+    fn spec(&self) -> ToolSpec {
+        test_spec()
+    }
+
+    fn invoke(&self, _args: Value, _ctx: &ToolContext<'_>) -> ToolResult {
+        ToolResult {
+            output: self.output.clone(),
+            display: None,
+            status: ToolStatus::Success,
         }
     }
 }
 
-/// 预设结果 runner：run 期间注入指定次数的 Ctrl-C（模拟执行中被取消/升级 quit）。
-struct InjectingRunner {
+/// 预设结果工具：invoke 期间注入指定次数的 Ctrl-C（模拟执行中被取消/升级 quit）。
+struct InjectingTool {
     injects: usize,
 }
 
-impl ToolRunner for InjectingRunner {
-    fn run(&self, _command: &str, _cfg: &BashToolConfig, cancel: &Cancel) -> BashOutput {
+impl Tool for InjectingTool {
+    fn spec(&self) -> ToolSpec {
+        test_spec()
+    }
+
+    fn invoke(&self, _args: Value, ctx: &ToolContext<'_>) -> ToolResult {
         for _ in 0..self.injects {
-            cancel.inject();
+            ctx.cancel.inject();
         }
-        BashOutput {
-            content: "partial\n[Command cancelled: 已部分执行（被取消，副作用已发生）]\n".into(),
-            end: BashEnd::Cancelled,
+        ToolResult {
+            output: "partial\n[Command cancelled: 已部分执行（被取消，副作用已发生）]\n".into(),
+            display: None,
+            status: ToolStatus::Interrupted,
         }
     }
 }
@@ -189,15 +213,13 @@ const CMD: &str = r#"{"command":"echo hi"}"#;
 /// 前 N 次 print 正常，之后每次 print 都置位 fatal（模拟渲染 I/O 失败，如 EPIPE）。
 struct FailingUi {
     prints_left: usize,
-    confirms: std::collections::VecDeque<ConfirmOutcome>,
     fatal: Option<String>,
 }
 
 impl FailingUi {
-    fn new(prints_left: usize, confirms: Vec<ConfirmOutcome>) -> Self {
+    fn new(prints_left: usize) -> Self {
         Self {
             prints_left,
-            confirms: confirms.into(),
             fatal: None,
         }
     }
@@ -206,10 +228,6 @@ impl FailingUi {
 impl Ui for FailingUi {
     fn read_line(&mut self, _completer: Arc<dyn CompletionProvider>) -> ReadOutcome {
         ReadOutcome::Eof
-    }
-
-    fn confirm(&mut self, _cwd: &str, _cmd: &str) -> ConfirmOutcome {
-        self.confirms.pop_front().unwrap_or(ConfirmOutcome::No)
     }
 
     fn print(&mut self, _ev: &rho::render::RenderEvent) {
@@ -236,8 +254,11 @@ fn first_call_failures_do_not_block_rest() {
         ])))],
         vec![text_final("done")],
     ]));
-    // 未知工具/参数错误不进 gate；只有 c3 弹确认（拒绝，不执行）。
-    let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::No]);
+    // 未知工具/参数错误不影响后续调用；c3 正常执行。
+    session.tools = registry_with(PresetTool {
+        output: "hi".into(),
+    });
+    let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
@@ -246,7 +267,7 @@ fn first_call_failures_do_not_block_rest() {
     assert_eq!(session.history().len(), 6);
     assert!(tool_result_content(session.history(), 2).contains("未知工具：nope"));
     assert!(tool_result_content(session.history(), 3).contains("参数解析失败"));
-    assert_eq!(tool_result_content(session.history(), 4), "用户拒绝执行");
+    assert!(tool_result_content(session.history(), 4).contains("hi"));
     match &session.history()[5] {
         Msg::Assistant(a) => {
             assert_eq!(a.text.as_deref(), Some("done"));
@@ -254,25 +275,6 @@ fn first_call_failures_do_not_block_rest() {
         }
         other => panic!("unexpected {other:?}"),
     }
-}
-
-#[test]
-fn confirm_cancel_places_placeholders_for_remaining() {
-    let mut session = session();
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![StreamEvent::Final(
-        Box::new(assistant_with_calls(vec![
-            call("c1", "bash", CMD),
-            call("c2", "bash", CMD),
-        ])),
-    )]]));
-    let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::Cancelled]);
-    let cancel = Cancel::new();
-
-    let end = session.turn(&mut ui, &cancel, "go").unwrap();
-    assert!(matches!(end, TurnEnd::Cancelled), "end was {end:?}");
-    assert_eq!(session.history().len(), 4);
-    assert_eq!(tool_result_content(session.history(), 2), "用户取消执行");
-    assert_eq!(tool_result_content(session.history(), 3), "用户取消执行");
 }
 
 #[test]
@@ -284,8 +286,8 @@ fn execution_cancel_keeps_partial_result() {
             call("c2", "bash", CMD),
         ])),
     )]]));
-    session.tool_runner = Arc::new(InjectingRunner { injects: 1 });
-    let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::Yes]);
+    session.tools = registry_with(InjectingTool { injects: 1 });
+    let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
@@ -306,8 +308,8 @@ fn quit_during_cleanup_exits_after_placeholders() {
         ])),
     )]]));
     // 执行中一次取消 + 清理期间升级第二次：收尾完成后退出。
-    session.tool_runner = Arc::new(InjectingRunner { injects: 2 });
-    let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::Yes]);
+    session.tools = registry_with(InjectingTool { injects: 2 });
+    let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
     assert!(session.turn(&mut ui, &cancel, "go").is_err());
@@ -325,7 +327,7 @@ fn sustained_delta_is_cancellable() {
         ready: ready_tx,
         released: Mutex::new(Some(release_rx)),
     });
-    let mut ui = ScriptedUi::new(vec![], vec![]);
+    let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
     let injector = injector_after_ready(cancel.clone(), ready_rx, release_tx, 1);
 
@@ -345,7 +347,7 @@ fn quit_during_stream_returns_quit() {
         ready: ready_tx,
         released: Mutex::new(Some(release_rx)),
     });
-    let mut ui = ScriptedUi::new(vec![], vec![]);
+    let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
     let injector = injector_after_ready(cancel.clone(), ready_rx, release_tx, 2);
 
@@ -359,7 +361,7 @@ fn disconnect_without_terminal_is_error() {
     let mut session = session();
     // 空脚本：事件线程立即结束，通道断开且无终态 → 防御性按 Error 收尾。
     session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![]]));
-    let mut ui = ScriptedUi::new(vec![], vec![]);
+    let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
     match session.turn(&mut ui, &cancel, "go").unwrap() {
@@ -379,7 +381,7 @@ fn render_failure_during_stream_aborts_before_commit() {
         text_final("done"),
     ]]));
     // 首个 Delta 渲染即失败：流收尾后不提交 Assistant，不执行工具。
-    let mut ui = FailingUi::new(0, vec![]);
+    let mut ui = FailingUi::new(0);
     let cancel = Cancel::new();
 
     match session.turn(&mut ui, &cancel, "go").unwrap() {
@@ -399,9 +401,9 @@ fn render_failure_mid_batch_placeholders_remaining_then_fatal() {
         ])),
     )]]));
     // 第一次 print（ToolCall 行）成功，第二个调用的结果渲染开始失败。
-    let mut ui = FailingUi::new(1, vec![ConfirmOutcome::Yes]);
-    session.tool_runner = Arc::new(PresetRunner {
-        output: "hi\n[Command finished with exit code 0]".into(),
+    let mut ui = FailingUi::new(1);
+    session.tools = registry_with(PresetTool {
+        output: "hi".into(),
     });
     let cancel = Cancel::new();
 
@@ -428,7 +430,7 @@ fn invalid_tool_call_ids_are_rejected_before_submit() {
         session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![StreamEvent::Final(
             Box::new(assistant_with_calls(calls)),
         )]]));
-        let mut ui = ScriptedUi::new(vec![], vec![]);
+        let mut ui = ScriptedUi::new(vec![]);
         let cancel = Cancel::new();
 
         match session.turn(&mut ui, &cancel, "go").unwrap() {
@@ -438,4 +440,70 @@ fn invalid_tool_call_ids_are_rejected_before_submit() {
         // 非法 Assistant 不提交：历史只有用户输入。
         assert_eq!(session.history().len(), 1);
     }
+}
+
+#[test]
+fn non_object_and_invalid_tool_args_are_counted_failures() {
+    let mut session = session();
+    session.launcher = Arc::new(ScriptedLauncher::new(vec![
+        vec![StreamEvent::Final(Box::new(assistant_with_calls(vec![
+            call("c1", "bash", "[]"),
+            call("c2", "bash", r#"{"command":"echo hi","extra":1}"#),
+            call("c3", "bash", r#"{}"#),
+        ])))],
+        vec![text_final("done")],
+    ]));
+    let mut ui = ScriptedUi::new(vec![]);
+    let cancel = Cancel::new();
+
+    let end = session.turn(&mut ui, &cancel, "go").unwrap();
+    assert!(matches!(end, TurnEnd::Done), "end was {end:?}");
+    assert!(tool_result_content(session.history(), 2).contains("arguments 必须是 JSON object"));
+    assert!(tool_result_content(session.history(), 3).contains("unknown field"));
+    assert!(tool_result_content(session.history(), 4).contains("missing field"));
+}
+
+#[test]
+fn builtin_write_read_edit_dispatch_through_registry() {
+    let mut session = session();
+    let path = std::env::temp_dir().join(format!(
+        "rho-agent-tools-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let path = path.display().to_string();
+    let write_args = json!({"path": path, "content": "hello\nworld\n"}).to_string();
+    let read_args = json!({"path": path}).to_string();
+    let edit_args = json!({
+        "path": path,
+        "edits": [{"old_text": "world", "new_text": "rho"}]
+    })
+    .to_string();
+
+    session.launcher = Arc::new(ScriptedLauncher::new(vec![
+        vec![StreamEvent::Final(Box::new(assistant_with_calls(vec![
+            call("c1", "write", &write_args),
+            call("c2", "read", &read_args),
+            call("c3", "edit", &edit_args),
+        ])))],
+        vec![text_final("done")],
+    ]));
+    let mut ui = ScriptedUi::new(vec![]);
+    let cancel = Cancel::new();
+
+    let end = session.turn(&mut ui, &cancel, "go").unwrap();
+    assert!(matches!(end, TurnEnd::Done), "end was {end:?}");
+    assert!(tool_result_content(session.history(), 2).contains("[action] created"));
+    assert!(tool_result_content(session.history(), 3).contains("[status] success"));
+    assert!(tool_result_content(session.history(), 4).contains("[replacements] 1"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\nrho\n");
+    assert!(ui.rendered.iter().any(|e| matches!(
+        e,
+        rho::render::RenderEvent::ToolResult { name, display: None, .. } if name == "read"
+    )));
+    let _ = std::fs::remove_file(&path);
 }

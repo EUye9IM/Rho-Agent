@@ -4,7 +4,7 @@ use super::common::{default_headers, merge_thinking, model_name};
 use super::{ChunkOutcome, FinishReason, ProviderAdapter, StreamEvent, TurnAcc};
 use crate::config::{Model, Provider};
 use crate::message::{AssistantMsg, Msg};
-use crate::tool_spec;
+use crate::tools::ToolSpec;
 use serde_json::{json, Map, Value};
 
 pub struct OpenAiChatAdapter {
@@ -30,6 +30,7 @@ impl ProviderAdapter for OpenAiChatAdapter {
         model: &Model,
         model_id: &str,
         thinking: Option<&Value>,
+        tools: &[ToolSpec],
     ) -> Value {
         let messages: Vec<Value> = hist
             .iter()
@@ -80,21 +81,26 @@ impl ProviderAdapter for OpenAiChatAdapter {
             })
             .collect();
 
-        let spec = tool_spec::bash();
+        let tools: Vec<Value> = tools
+            .iter()
+            .map(|spec| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": spec.name,
+                        "description": spec.description,
+                        "parameters": spec.parameters,
+                    }
+                })
+            })
+            .collect();
         let mut body = json!({
             "model": model_name(model, model_id),
             "messages": messages,
             "stream": true,
             // 模型声明的输出上限直接编进请求，避免上游超长回复。
             "max_tokens": model.max_output,
-            "tools": [{
-                "type": "function",
-                "function": {
-                    "name": spec.name,
-                    "description": spec.description,
-                    "parameters": spec.parameters,
-                }
-            }]
+            "tools": tools,
         });
 
         if let Some(fragment) = thinking {
@@ -245,7 +251,8 @@ mod tests {
             },
         ];
         let thinking = json!({ "thinking": { "type": "enabled" } });
-        let body = a.build_body(&hist, &model, "p/m", Some(&thinking));
+        let tools = crate::tools::ToolRegistry::builtin().specs();
+        let body = a.build_body(&hist, &model, "p/m", Some(&thinking), &tools);
         assert_eq!(body["model"], "m");
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_tokens"], 1);

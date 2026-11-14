@@ -107,9 +107,9 @@ fn start_mock(respond: impl FnOnce(&mut TcpStream) + Send + 'static) -> MockServ
     MockServer { base_url, stop }
 }
 
-/// tool_calls 响应（触发 bash 确认）：一条 bash 调用后 finish。
-fn tool_call_response(command: &str) -> impl FnOnce(&mut TcpStream) + Send {
-    let args = serde_json::json!({ "command": command }).to_string();
+/// tool_calls 响应（触发 bash 执行）：一条 bash 调用后 finish。
+fn tool_call_response(command: &str, timeout: u64) -> impl FnOnce(&mut TcpStream) + Send {
+    let args = serde_json::json!({ "command": command, "timeout": timeout }).to_string();
     let chunk1 = serde_json::json!({
         "choices": [{
             "delta": {
@@ -180,10 +180,6 @@ headers = {{ Authorization = "Bearer sk-pty-test" }}
 context_window = 10000
 max_output = 1000
 
-[tools.bash]
-allow = []
-timeout_seconds = 2
-max_output_bytes = 4096
 "#
         ),
     )
@@ -286,6 +282,12 @@ impl PtyRho {
             .map(|l| l.trim_end())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// 原始输出中是否包含某段（ANSI 颜色断言用）。
+    fn raw_contains(&self, needle: &str) -> bool {
+        let raw = self.raw.lock().unwrap();
+        String::from_utf8_lossy(&raw).contains(needle)
     }
 
     /// 诊断：最近输出的原始字节（可读转义形式）。
@@ -505,21 +507,27 @@ fn real_double_sigint_during_stream_quits() {
     assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
 }
 
-/// 确认界面的 Ctrl-C：可中断读取被 SIGINT 唤醒，取消整轮回提示符。
+/// 真实终端下的 ANSI 着色：提示符、输入、工具调用与成功结果。
 #[test]
-fn real_sigint_at_confirm_cancels_turn() {
-    let server = start_mock(tool_call_response("sleep 5"));
+fn prompt_input_tool_call_and_success_result_are_colored() {
+    let server = start_mock(tool_call_response("echo hi", 5));
     let config = write_config(&server.base_url);
     let mut rho = PtyRho::spawn(&config);
 
     rho.expect_screen("rho>", SCREEN_TIMEOUT);
+    assert!(rho.raw_contains("\x1b[1;36mrho> \x1b[0m"));
+    std::thread::sleep(SETTLE);
     rho.send_line("go");
-    rho.expect_screen("执行？[y/N]", SCREEN_TIMEOUT);
-    // 确认界面在 cooked 模式：Ctrl-C 产生 SIGINT，read 返回 EINTR → Cancelled；
-    // 当前及剩余调用补取消占位（占位文本与流式取消的文案不同）。
-    rho.send(b"\x03");
-    rho.expect_screen("用户取消执行", SCREEN_TIMEOUT);
-    rho.expect_screen("rho>", SCREEN_TIMEOUT);
+    rho.expect_screen("[status] completed", SCREEN_TIMEOUT);
+    assert!(
+        rho.raw_contains("\x1b[36mgo\x1b[0m"),
+        "raw tail:\n{}",
+        rho.raw_tail(3000)
+    );
+    assert!(rho.raw_contains("\x1b[35m→ bash: echo hi\x1b[0m"));
+    assert!(rho.raw_contains("\x1b[32m  │ [status] completed"));
+    // 第二次请求会因 mock 单连接关闭而失败；回到提示符后正常退出。
+    rho.expect_screen("rho>", Duration::from_secs(8));
     std::thread::sleep(SETTLE);
     rho.send_line("/exit");
     assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
@@ -528,16 +536,14 @@ fn real_sigint_at_confirm_cancels_turn() {
 /// bash 超时在真实终端的表现：超时标注 + 进程组终止后回提示符。
 #[test]
 fn bash_timeout_shows_annotation_and_returns_to_prompt() {
-    let server = start_mock(tool_call_response("sleep 30"));
+    let server = start_mock(tool_call_response("sleep 30", 2));
     let config = write_config(&server.base_url);
     let mut rho = PtyRho::spawn(&config);
 
     rho.expect_screen("rho>", SCREEN_TIMEOUT);
     rho.send_line("go");
-    rho.expect_screen("执行？[y/N]", SCREEN_TIMEOUT);
-    rho.send_line("y");
-    // timeout_seconds = 2：SIGTERM→2s→SIGKILL，总等待 ≤ ~5s。
-    rho.expect_screen("已部分执行（超时）", Duration::from_secs(8));
+    // timeout=2：SIGTERM→2s→SIGKILL，总等待 ≤ ~5s。
+    rho.expect_screen("[status] timed_out", Duration::from_secs(8));
     // 超时结果喂回后继续请求（mock 单连接已关：第二次请求失败）——回提示符即收尾。
     rho.expect_screen("rho>", Duration::from_secs(8));
     std::thread::sleep(SETTLE);

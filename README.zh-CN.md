@@ -4,11 +4,11 @@
 
 [English](README.md) | **简体中文**
 
-`rho` 是一个跑在终端里的轻量本地 agent。单 crate、单二进制（分发建议使用 musl 静态构建），使用阻塞 I/O + 线程，面向资源受限的 Linux 设备。你在 REPL 里对话，它从兼容 OpenAI Chat Completions 的供应商（默认 DeepSeek）流式返回结果，也可通过配置使用 OpenAI Responses 协议，并能通过 `bash` 工具执行命令——执行前要过 allowlist 判定和人工确认。
+`rho` 是一个跑在终端里的轻量本地 agent。单 crate、单二进制（分发建议使用 musl 静态构建），使用阻塞 I/O + 线程，面向资源受限的 Linux 设备。你在 REPL 里对话，它从兼容 OpenAI Chat Completions 的供应商（默认 DeepSeek）流式返回结果，也可通过配置使用 OpenAI Responses 协议，并能通过内置工具执行命令、读写文件。
 
 ## 愿景
 
-rho 要做一个运行在资源受限 Linux 设备上的本地 agent：单二进制、供应商由配置声明、只带一个 `bash` 工具；REPL 交互简单可预测，取消后对话历史仍然完整。
+rho 要做一个运行在资源受限 Linux 设备上的本地 agent：单二进制、供应商由配置声明、内置 shell 与文件工具；REPL 交互简单可预测，取消后对话历史仍然完整。
 
 实现架构见 [docs/architecture.md](docs/architecture.md)。
 
@@ -16,9 +16,9 @@ rho 要做一个运行在资源受限 Linux 设备上的本地 agent：单二进
 
 - **轻** —— 单 crate 单二进制，使用阻塞 I/O + 线程，release 开启 `strip` + LTO + `panic = "abort"`。
 - **配置驱动** —— 供应商、模型、思考档位都由数据声明；支持 `openai_chat` 与 `openai_responses`，切换协议只改配置。
-- **流式 + 思考可见** —— 正文逐块输出；`reasoning_content` 以暗淡色实时展示，默认只留在本地，仅当供应商配置 `compat.echo_reasoning = true` 时随历史回传。
-- **只有一个工具：`bash`** —— 前台执行 `bash -c <命令>`，每次调用启动新的 shell，单次超时后按进程组逐级终止。
-- **可预测的 Ctrl-C** —— 第一次取消当前流式/工具/确认，立即回到提示符（取消标志在逐块之间轮询生效；连接停滞无数据时，后台读取在下一块数据到达或空闲超时后结束），第二次退出；空闲提示符下两次空行 Ctrl-C（2 秒内）同样退出，第一次会在输入行尾显示灰色提示。对话历史在任何时刻都保持协议合法（工具调用必有对应结果）。
+- **流式 + 思考可见** —— 正文逐块输出；提示符和输入着色；工具调用单独着色，成功结果绿色、失败红色、打断黄色；`reasoning_content` 以暗淡色实时展示，默认只留在本地，仅当供应商配置 `compat.echo_reasoning = true` 时随历史回传。
+- **内置工具** —— `bash` 前台执行 `bash -c <命令>`，每次调用启动新的 shell，支持单次超时并按进程组逐级终止；`read` 返回带行号的文本；`write` 新建文件和父目录；`edit` 按顺序做精确替换，并保留文件的 CRLF/LF 风格。
+- **可预测的 Ctrl-C** —— 第一次取消当前流式/工具，立即回到提示符（取消标志在逐块之间轮询生效；连接停滞无数据时，后台读取在下一块数据到达或空闲超时后结束），第二次退出；空闲提示符下两次空行 Ctrl-C（2 秒内）同样退出，第一次会在输入行尾显示灰色提示。对话历史在任何时刻都保持协议合法（工具调用必有对应结果）。
 - **Tab 补全** —— 补全斜杠命令名以及 `/model`、`/provider`、`/thinking` 的参数，候选来自当前会话状态；切换供应商或模型后自动刷新。
 - **严格配置校验** —— 未知字段、悬空引用、缺失必填字段一律硬报错并给出配置路径（TOML 语法错误另带行号），退出码 2。
 
@@ -30,10 +30,16 @@ rho 要做一个运行在资源受限 Linux 设备上的本地 agent：单二进
 
 ## 安装
 
-安装最新 musl 产物到 `~/.local/bin`（支持 `x86_64` 与 `aarch64`）：
+安装最新稳定版 musl 产物到 `~/.local/bin`（支持 `x86_64` 与 `aarch64`）：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/EUye9IM/Rho-Agent/master/install.sh | sh
+```
+
+安装 nightly（`dev` 分支的滚动构建）：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/EUye9IM/Rho-Agent/master/install.sh | sh -s -- --nightly
 ```
 
 安装脚本会先校验 release 的 SHA-256，再安装二进制。若 `~/.local/bin` 不在 `PATH` 中，请自行加入。下载使用 `curl`，遵循标准代理环境变量。
@@ -72,12 +78,11 @@ rho> 看看 /var/log 下的磁盘占用
 ...
 ```
 
-指定供应商 / 模型 / 思考档位，或跳过确认：
+指定供应商 / 模型 / 思考档位：
 
 ```sh
 rho --config ./rho.toml --model deepseek/deepseek-v4-pro --thinking low
 rho --init           # 生成默认配置文件到 ~/.config/rho/config.toml
-rho --yes            # 自动放行所有 bash 调用
 ```
 
 ### 命令行参数
@@ -88,7 +93,6 @@ rho --yes            # 自动放行所有 bash 调用
 | `--provider <id>` | 初始供应商（覆盖配置默认）。 |
 | `--model <id>` | 初始模型（须为 `provider/model` 形式，覆盖配置默认）。 |
 | `--thinking <level>` | 初始思考档位（须属于所选模型）。 |
-| `--yes` | 跳过所有 `bash` 确认。 |
 | `--init` | 把内置配置写到 `--config` 路径或默认路径；目标已存在时报错不覆盖。 |
 | `--version`、`-V` | 打印 rho 版本并退出。 |
 
@@ -115,7 +119,8 @@ rho --yes            # 自动放行所有 bash 调用
 default_provider = "deepseek"
 default_model    = "deepseek/deepseek-v4-pro"   # 与 default_provider 冲突时以模型为准
 system_prompt    = "你是 rho，一个轻量本地运维助手。"  # 省略则请求不含 system 消息
-max_tool_steps   = 25
+max_tool_steps   = 100
+dns              = ["https://223.5.5.5/dns-query"]  # 可选：优先使用的 DoH 解析器
 
 [providers.deepseek]
 protocol = "openai_chat"                        # openai_chat 或 openai_responses
@@ -138,11 +143,6 @@ off  = { thinking = { type = "disabled" } }
 low  = { thinking = { type = "enabled" }, reasoning_effort = "low" }
 high = { thinking = { type = "enabled" }, reasoning_effort = "high" }
 max  = { thinking = { type = "enabled" }, reasoning_effort = "max" }
-
-[tools.bash]
-allow            = ["ls", "cat /var/log", "systemctl status"]  # 留空表示全部需确认
-timeout_seconds  = 120
-max_output_bytes = 16384
 ```
 
 要点：
@@ -151,22 +151,21 @@ max_output_bytes = 16384
 - `protocol` 支持 `openai_chat`（Chat Completions，`/chat/completions`）与 `openai_responses`（Responses，`/responses`）；后者把历史映射为 `input` items，并用 `max_output_tokens` 限制输出。
 - 认证 header 中的 `${VAR}` 在选择供应商时逐个展开：变量缺失只让该供应商不可用，不影响其他供应商——除非该供应商是被显式指定的。
 - 思考档位的值是 JSON 对象片段，请求时顶层合并进 body；档位名由配置自定义。
+- `dns` 是可选的 DoH 端点列表，配置后按声明顺序优先解析，端点全部失败才回退系统解析器；端点主机必须是 IP 字面量（形如 `https://223.5.5.5/dns-query`，IPv6 写成 `https://[2400:3200::1]/dns-query`）。成功结果按应答 TTL 缓存。Android/Termux 没有 `/etc/resolv.conf`，musl 静态构建的域名解析依赖这一项。
 - 校验严格：未知字段、悬空引用、缺失必填字段直接拒绝启动（退出码 2，并给出配置路径；TOML 语法错误另带行号）。
 
-## `bash` 工具与安全模型
+## 工具与安全模型
 
-`rho` 前台执行 `bash -c <命令>`。每次调用启动新的 shell，cwd 和环境变量改动只留在当次调用内；命令启动的后台进程会继续运行。需要先 `cd` 再执行时，写在同一行命令里。
+`rho` 内置四个工具。工具名、描述和 JSON Schema 会发给模型；模型用 JSON 参数调用，每个调用都会在对话历史中配一条工具结果。
 
-命令**同时**满足以下两点才免确认执行：
+- **`bash`** 前台执行 `bash -c <命令>`。每次调用启动新的 shell，cwd 和环境变量改动只留在当次调用内。`timeout` 可选（秒，默认 120，最大 300）；`cwd` 指定初始目录（绝对路径或相对 rho 启动目录）。stdout 与 stderr 共用同一个 pipe，只返回末尾 50,000 个 Unicode 字符，丢掉的字符数写在 `[omitted_chars]`。超时或 Ctrl-C 会终止整个进程组（SIGTERM，2 秒后 SIGKILL）。命令启动的后台进程会继续运行。
+- **`read`** 返回带真实 1-based 行号的文本。每次最多读取 2,000 行、50,000 个正文字符；`offset` 是 0-based，`limit` 最大 2,000。整个文件必须是有效 UTF-8 且不含 NUL。单行超过 50,000 字符会报错，建议改用 `bash` 的 `sed`、`cut` 或 `fold`。
+- **`write`** 新建文件，并自动创建缺失的父目录。路径已存在（普通文件、目录或符号链接）时拒绝；内容不能含 NUL；按原样写入，不追加换行，也不转换行尾。
+- **`edit`** 按 `edits` 数组顺序做精确字符串替换。默认 `old_text` 必须恰好出现一次；`replace_all: true` 时替换全部匹配。文件上限 10 MiB，必须是有效 UTF-8 且不含 NUL。匹配前把 CRLF 归一化为 LF，写回时按检测到的主要行尾风格恢复。每个 edit 成功后立即写盘；后续 edit 失败时，之前的修改保留。匹配失败时，如果存在足够相似的行，会返回行号和片段。
 
-1. 与某个 `allow` 条目完全相同，或以该条目开头且其后紧跟一个空格；
-2. 命令中不含 shell 元字符 `;` `&` `|` `<` `>` `$`、反引号或换行。
+模型发出的每个合法工具调用都会执行。真正的安全边界是运行 `rho` 的用户权限：`bash` 继承完整环境变量，文件工具也能读写该用户可访问的任何路径。请以你愿意让其执行命令的用户身份运行 `rho`，并只在信任的主机上使用。
 
-其余情况一律弹确认，显示当前工作目录与完整命令，默认 **N**；拒绝结果会作为工具结果喂回模型。`--yes` 跳过全部确认。
-
-> **安全边界。** allowlist 做字符串匹配，是免确认的便捷门槛；真正的安全边界是运行 `rho` 的用户权限。子进程完全继承父进程环境变量，模型用一条 `env` 就能读出 `DEEPSEEK_API_KEY`。请以你愿意让其执行命令的用户身份运行 `rho`，并只在信任的主机上使用。
-
-其他限制：每轮对话最多 `max_tool_steps` 次模型发起的工具调用（默认 25，拒绝/失败/参数错误的调用同样计数）；stdout 与 stderr 各自上限 `max_output_bytes`，保留头尾两段并标注省略字节数；超时后对整个进程组 SIGTERM，2 秒后 SIGKILL。每次请求把模型的 `max_output` 作为上游输出 token 上限发送。SSE 单行上限 1 MiB，单轮响应体累计上限 32 MiB，超出即按错误结束本轮。HTTP 错误直接展示；历史按原样发送，会话超出模型窗口时上游会失败，此时用 `/clear` 重开。
+其他限制：每轮对话最多 `max_tool_steps` 次模型发起的工具调用（默认 100，非法调用同样计数）。每次请求把模型的 `max_output` 作为上游输出 token 上限发送。SSE 单行上限 1 MiB，单轮响应体累计上限 32 MiB，超出即按错误结束本轮。HTTP 错误直接展示；历史按原样发送，会话超出模型窗口时上游会失败，此时用 `/clear` 重开。
 
 ## 测试
 

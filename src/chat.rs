@@ -5,16 +5,17 @@ pub use crate::message::{AssistantMsg, Msg, ToolCall};
 use crate::provider::{self, ProviderAdapter, StreamEvent};
 use crate::render::RenderEvent;
 use crate::term::{Cancel, SignalState};
-use crate::tools::{self, BashEnd, BashOutput};
-use crate::ui::{ConfirmOutcome, Ui};
+use crate::tools::{ToolContext, ToolRegistry, ToolResult, ToolStatus};
+use crate::ui::Ui;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::Duration;
 
-const DEFAULT_MAX_TOOL_STEPS: u32 = 25;
+const DEFAULT_MAX_TOOL_STEPS: u32 = 100;
 
 /// 取消/退出时未执行调用的占位文本。
 const CANCELLED_PLACEHOLDER: &str = "用户取消执行";
@@ -64,43 +65,19 @@ impl StreamLauncher for WorkerLauncher {
     }
 }
 
-/// 单个 bash 调用的执行边界：生产实现跑真实进程组；
-/// 测试实现返回预设结果（无进程）。
-pub trait ToolRunner: Send + Sync {
-    fn run(
-        &self,
-        command: &str,
-        cfg: &crate::config::BashToolConfig,
-        cancel: &Cancel,
-    ) -> BashOutput;
-}
-
-struct BashRunner;
-
-impl ToolRunner for BashRunner {
-    fn run(
-        &self,
-        command: &str,
-        cfg: &crate::config::BashToolConfig,
-        cancel: &Cancel,
-    ) -> BashOutput {
-        tools::run_bash(command, cfg, cancel)
-    }
-}
-
-/// 会话状态：历史 + 当前选择 + 适配器 + 工具步数。
+/// 会话状态：历史 + 当前选择 + 适配器 + 工具注册表 + 工具步数。
 /// adapter 为 Arc 共享：会话长期持有，每轮 clone 一份按值传给 worker
 /// （thread::spawn + detach 取消语义需 'static，不能借引用）。
 /// thinking 唯一真值源是 selection.thinking（switch_* 同步更新）。
-/// launcher / tool_runner 是测试注入边界：默认生产实现，集成测试可替换
-/// 为预编排事件与预设结果（见 tests/agent_loop.rs）。
+/// launcher 是流式请求的测试注入边界；tools 可在测试中替换为自定义注册表。
 pub struct Session {
     pub cfg: Config,
     pub selection: Selection,
     pub adapter: Arc<dyn ProviderAdapter>,
     pub launcher: Arc<dyn StreamLauncher>,
-    pub tool_runner: Arc<dyn ToolRunner>,
-    pub yes: bool,
+    pub tools: ToolRegistry,
+    /// rho 启动目录，用于解析工具的相对路径。
+    cwd: PathBuf,
     /// 只由 agent loop 写入；对外只读，保证 tool_calls 与 Tool 结果的配对不变式。
     history: Vec<Msg>,
 }
@@ -157,20 +134,15 @@ enum ToolPhase {
 impl Session {
     /// thinking 已在 main 层校验并写入 selection.thinking（resolve_thinking，非法 exit 2）。
     /// history 以 cfg.system_prompt 播种（Msg::System；省略则不含 system 消息）。
-    pub fn new(
-        cfg: Config,
-        selection: Selection,
-        adapter: Arc<dyn ProviderAdapter>,
-        yes: bool,
-    ) -> Self {
+    pub fn new(cfg: Config, selection: Selection, adapter: Arc<dyn ProviderAdapter>) -> Self {
         let history = system_history(cfg.system_prompt.as_deref());
         Self {
             cfg,
             selection,
             adapter,
             launcher: Arc::new(WorkerLauncher),
-            tool_runner: Arc::new(BashRunner),
-            yes,
+            tools: ToolRegistry::builtin(),
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             history,
         }
     }
@@ -191,11 +163,13 @@ impl Session {
             .thinking
             .as_ref()
             .and_then(|level| self.selection.model.thinking.get(level));
+        let tools = self.tools.specs();
         self.adapter.build_body(
             &self.history,
             &self.selection.model,
             &self.selection.model_id,
             thinking,
+            &tools,
         )
     }
 
@@ -364,12 +338,17 @@ impl Session {
         while i < tool_calls.len() {
             // 限额逐个前置检查：当前及剩余调用补超限占位。
             if *steps >= max {
-                self.placeholders(ui, &tool_calls[i..], LIMIT_PLACEHOLDER);
+                self.placeholders(ui, &tool_calls[i..], LIMIT_PLACEHOLDER, ToolStatus::Failure);
                 return ToolPhase::Limit(max);
             }
 
             if let Some(sig) = cancel.pending() {
-                self.placeholders(ui, &tool_calls[i..], CANCELLED_PLACEHOLDER);
+                self.placeholders(
+                    ui,
+                    &tool_calls[i..],
+                    CANCELLED_PLACEHOLDER,
+                    ToolStatus::Interrupted,
+                );
                 return if sig == SignalState::Quit {
                     ToolPhase::Quit
                 } else {
@@ -380,23 +359,28 @@ impl Session {
             // 终端写失败：剩余调用补占位后上抛（exit 1；占位写入可能同样失败，
             // 但历史配对仍由本函数保证）。
             if let Some(e) = ui.take_fatal() {
-                self.placeholders(ui, &tool_calls[i..], FATAL_PLACEHOLDER);
+                self.placeholders(ui, &tool_calls[i..], FATAL_PLACEHOLDER, ToolStatus::Failure);
                 return ToolPhase::Fatal(e);
             }
 
-            let outcome = dispatch_tool_call(
-                ui,
-                cancel,
-                &*self.tool_runner,
-                &self.cfg.tools.bash,
-                self.yes,
-                &tool_calls[i],
-            );
+            let result = {
+                let ctx = ToolContext {
+                    cwd: &self.cwd,
+                    cancel,
+                };
+                dispatch_tool_call(ui, &self.tools, &ctx, &tool_calls[i])
+            };
+            let interrupted = result.status == ToolStatus::Interrupted;
             // 单一出口：渲染结果、写入历史、计数（含取消/退出路径的当前调用）。
-            self.commit_call_result(ui, &tool_calls[i].id, &outcome.content, steps);
+            self.commit_call_result(ui, &tool_calls[i].name, &tool_calls[i].id, result, steps);
 
-            if outcome.stop {
-                self.placeholders(ui, &tool_calls[i + 1..], CANCELLED_PLACEHOLDER);
+            if interrupted {
+                self.placeholders(
+                    ui,
+                    &tool_calls[i + 1..],
+                    CANCELLED_PLACEHOLDER,
+                    ToolStatus::Interrupted,
+                );
                 // 执行/清理期间第二次 Ctrl-C：信号计数已置 quit。
                 return if cancel.is_quit() {
                     ToolPhase::Quit
@@ -407,7 +391,12 @@ impl Session {
 
             // 执行/清理期间第二次 Ctrl-C：信号计数已置 quit。
             if cancel.is_quit() {
-                self.placeholders(ui, &tool_calls[i + 1..], CANCELLED_PLACEHOLDER);
+                self.placeholders(
+                    ui,
+                    &tool_calls[i + 1..],
+                    CANCELLED_PLACEHOLDER,
+                    ToolStatus::Interrupted,
+                );
                 return ToolPhase::Quit;
             }
             i += 1;
@@ -423,21 +412,42 @@ impl Session {
     fn commit_call_result(
         &mut self,
         ui: &mut dyn Ui,
+        name: &str,
         call_id: &str,
-        content: &str,
+        result: ToolResult,
         steps: &mut u32,
     ) {
-        emit(ui, RenderEvent::ToolResult(content.to_string()));
+        emit(
+            ui,
+            RenderEvent::ToolResult {
+                name: name.to_string(),
+                display: result.display,
+                status: result.status,
+            },
+        );
         self.history.push(Msg::Tool {
             tool_call_id: call_id.to_string(),
-            content: content.to_string(),
+            content: result.output,
         });
         *steps += 1;
     }
 
-    fn placeholders(&mut self, ui: &mut dyn Ui, calls: &[ToolCall], content: &str) {
+    fn placeholders(
+        &mut self,
+        ui: &mut dyn Ui,
+        calls: &[ToolCall],
+        content: &str,
+        status: ToolStatus,
+    ) {
         for call in calls {
-            emit(ui, RenderEvent::ToolResult(content.to_string()));
+            emit(
+                ui,
+                RenderEvent::ToolResult {
+                    name: call.name.clone(),
+                    display: Some(content.to_string()),
+                    status,
+                },
+            );
             self.history.push(Msg::Tool {
                 tool_call_id: call.id.clone(),
                 content: content.to_string(),
@@ -512,87 +522,63 @@ impl StreamHandle {
     }
 }
 
-/// 单个调用的执行结果（在 run_tool_calls 的逐个循环中被调用）。
-/// content 是喂回模型的 Tool 消息文本（真实结果 / 错误文本 / 拒绝 / 占位）；
-/// stop = 取消/退出：当前调用结果仍经统一出口写入，剩余调用由调用方补占位。
-struct CallOutcome {
-    content: String,
-    stop: bool,
-}
-
-/// 参数/判定类错误（不停止批次）：作为该调用的 Tool 结果文本。
-fn tool_outcome(content: String) -> CallOutcome {
-    CallOutcome {
-        content,
-        stop: false,
-    }
-}
-
-/// 确认流：allowlist 自动放行；否则向用户确认（--yes 跳过全部确认）。
-/// 判定留在 agent loop，工具执行层只负责 allowed / run_bash。
-fn gate(ui: &mut dyn Ui, yes: bool, cwd: &str, command: &str, allow: &[String]) -> ConfirmOutcome {
-    if tools::allowed(command, allow) || yes {
-        ConfirmOutcome::Yes
-    } else {
-        ui.confirm(cwd, command)
-    }
-}
-
+/// 解析并执行单个调用。参数 JSON / object 校验和未知工具由公共层负责；
+/// 字段缺失、类型错误、多余字段、语义校验都在工具自己的 invoke 中完成。
 fn dispatch_tool_call(
     ui: &mut dyn Ui,
-    cancel: &Cancel,
-    tool_runner: &dyn ToolRunner,
-    bash_cfg: &crate::config::BashToolConfig,
-    yes: bool,
+    registry: &ToolRegistry,
+    ctx: &ToolContext<'_>,
     call: &ToolCall,
-) -> CallOutcome {
-    if call.name != "bash" {
-        return tool_outcome(format!("未知工具：{}", call.name));
-    }
-
-    let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
-        Ok(v) => v,
+) -> ToolResult {
+    let tool = registry.get(&call.name);
+    let parsed: Result<Value, _> = serde_json::from_str(&call.arguments);
+    let args = match parsed {
+        Ok(Value::Object(map)) => Value::Object(map),
+        Ok(other) => {
+            emit_tool_call(ui, &call.name, &other.to_string());
+            return ToolResult::failure(format!(
+                "工具参数解析失败：arguments 必须是 JSON object，收到 {}",
+                json_kind(&other)
+            ));
+        }
         Err(e) => {
-            return tool_outcome(format!(
+            emit_tool_call(ui, &call.name, &call.arguments);
+            return ToolResult::failure(format!(
                 "工具参数解析失败：{e}；原始参数：{}",
                 call.arguments
             ));
         }
     };
-    let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
-        return tool_outcome("工具参数解析失败：缺少字符串字段 command".to_string());
+
+    let summary = tool
+        .map(|tool| tool.summary(&args))
+        .unwrap_or_else(|| args.to_string());
+    emit_tool_call(ui, &call.name, &summary);
+
+    let Some(tool) = tool else {
+        return ToolResult::failure(format!("未知工具：{}", call.name));
     };
-    if command.trim().is_empty() {
-        return tool_outcome("工具参数解析失败：command 为空".to_string());
-    }
+    tool.invoke(args, ctx)
+}
 
-    emit(ui, RenderEvent::ToolCall(command.to_string()));
-
-    let cwd = crate::session_cwd();
-    match gate(ui, yes, &cwd, command, &bash_cfg.allow) {
-        ConfirmOutcome::No => tool_outcome("用户拒绝执行".to_string()),
-        ConfirmOutcome::Cancelled => CallOutcome {
-            content: CANCELLED_PLACEHOLDER.to_string(),
-            stop: true,
+fn emit_tool_call(ui: &mut dyn Ui, name: &str, summary: &str) {
+    emit(
+        ui,
+        RenderEvent::ToolCall {
+            name: name.to_string(),
+            summary: crate::tools::truncate_chars(summary, 200),
         },
-        ConfirmOutcome::Yes => {
-            // 确认与执行之间若已收到信号，直接按取消收尾，不再 spawn。
-            if cancel.pending().is_some() {
-                return CallOutcome {
-                    content: CANCELLED_PLACEHOLDER.to_string(),
-                    stop: true,
-                };
-            }
-            let out = tool_runner.run(command, bash_cfg, cancel);
-            match out.end {
-                BashEnd::SpawnFailed(_) | BashEnd::ReapFailed(_) => tool_outcome(out.content),
-                BashEnd::Cancelled | BashEnd::QuitRequested => CallOutcome {
-                    content: out.content,
-                    stop: true,
-                },
-                BashEnd::TimedOut | BashEnd::Exited(_) => tool_outcome(out.content),
-            }
-        }
+    );
+}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 

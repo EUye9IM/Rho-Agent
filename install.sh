@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install the latest rho release.
+# Install the latest stable or nightly rho release.
 set -eu
 
 die() {
@@ -8,9 +8,38 @@ die() {
 }
 
 REPO=EUye9IM/Rho-Agent
-BASE_URL="https://github.com/$REPO/releases/latest/download"
+CHANNEL=stable
+
+usage() {
+    cat <<'EOF'
+用法: install.sh [--nightly]
+
+  --nightly  安装 nightly（dev 分支的滚动构建）
+  -h, --help 显示帮助
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --nightly) CHANNEL=nightly ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *) die "未知选项：$1（支持 --nightly）" ;;
+    esac
+    shift
+done
+
 [ -n "${HOME:-}" ] || die "HOME 未设置"
 INSTALL_DIR="$HOME/.local/bin"
+
+# nightly 是 prerelease，`latest` 不会指向它，固定用 nightly tag。
+if [ "$CHANNEL" = nightly ]; then
+    BASE_URL="https://github.com/$REPO/releases/download/nightly"
+else
+    BASE_URL="https://github.com/$REPO/releases/latest/download"
+fi
 
 [ "$(uname -s)" = Linux ] || die "只支持 Linux"
 
@@ -29,7 +58,11 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/rho-install.XXXXXX") \
     || die "无法创建临时目录"
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 
-printf '下载 %s ...\n' "$ASSET"
+if [ "$CHANNEL" = nightly ]; then
+    printf '下载 nightly %s ...\n' "$ASSET"
+else
+    printf '下载 %s ...\n' "$ASSET"
+fi
 curl -fL --retry 2 --connect-timeout 10 \
     -o "$TMP/$ASSET" "$BASE_URL/$ASSET"
 curl -fL --retry 2 --connect-timeout 10 \
@@ -46,7 +79,11 @@ tar -xzf "$TMP/$ASSET" -C "$TMP" || die "解压失败"
 mkdir -p "$INSTALL_DIR" || die "无法创建 $INSTALL_DIR"
 install -m 0755 "$TMP/rho" "$INSTALL_DIR/rho"
 
-printf '已安装 rho 到 %s/rho\n' "$INSTALL_DIR"
+if [ "$CHANNEL" = nightly ]; then
+    printf '已安装 rho nightly 到 %s/rho\n' "$INSTALL_DIR"
+else
+    printf '已安装 rho 到 %s/rho\n' "$INSTALL_DIR"
+fi
 case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
     *) printf '提示：把 %s 加入 PATH 后即可直接运行 rho\n' "$INSTALL_DIR" ;;

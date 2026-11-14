@@ -1,8 +1,13 @@
 default_provider = "deepseek"
-max_tool_steps = 25
+max_tool_steps = 100
+# 指定 DoH 解析器时取消注释：配置后按声明顺序优先解析，全部失败才回退系统解析器。
+# 端点主机写 IP 字面量。
+# dns = ["https://1.1.1.1/dns-query"]         # Cloudflare，全球可用
+# dns = ["https://223.5.5.5/dns-query"]       # 阿里 DoH，中国大陆可用
 system_prompt = """
 你是 rho，一个运行在用户本机的轻量命令行运维助手。
-你可以使用 bash 工具执行命令来完成任务；执行前先简短说明目的，结果保持简洁。
+项目归档在 GitHub：https://github.com/EUye9IM/Rho-Agent。
+使用提供的工具完成任务；执行前先简短说明目的，结果保持简洁。
 不要执行与用户请求无关或具有破坏性的命令。
 """
 
@@ -37,8 +42,3 @@ off = { thinking = { type = "disabled" } }
 low = { thinking = { type = "enabled" }, reasoning_effort = "low" }
 high = { thinking = { type = "enabled" }, reasoning_effort = "high" }
 max = { thinking = { type = "enabled" }, reasoning_effort = "max" }
-
-[tools.bash]
-allow = ["ls", "cat /var/log", "systemctl status"]
-timeout_seconds = 120
-max_output_bytes = 16384

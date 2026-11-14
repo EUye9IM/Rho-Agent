@@ -1,8 +1,10 @@
-//! 渲染：思考暗淡色、正文原样、工具行、带左边栏的工具结果。颜色固定。
+//! 渲染：思考暗淡色、正文原样、提示符/输入着色、工具行与结果状态色。颜色固定。
 //!
 //! `Renderer` 是有状态格式化器：跨事件维护当前样式块，把「进入块」与「离开块」
 //! 各自只输出一次 ANSI（思考块一次 `\x1b[2m` … 一次 `\x1b[0m`），不随每个 delta
 //! 重复包裹。它只返回要写的文本，不直接写终端；去向由 `ui` 决定。
+
+use crate::tools::ToolStatus;
 
 /// 渲染事件（agent loop → ui.print 的载荷；具体形态实现期定）。
 #[derive(Debug)]
@@ -13,44 +15,70 @@ pub enum RenderEvent {
     TextDelta(String),
     /// 确保行首的折行（回合结束时由 `repl` 补，避免正文块贴住提示符）
     LineBreak,
-    /// 工具调用行：`→ bash: <命令>`
-    ToolCall(String),
-    /// 工具结果（带左边栏显示，截断处标注省略字节数）
-    ToolResult(String),
+    /// 工具调用行：`→ <工具名>: <摘要>`
+    ToolCall { name: String, summary: String },
+    /// 工具结果：display 为 None 时不展示结果体；status 决定样式。
+    ToolResult {
+        name: String,
+        display: Option<String>,
+        status: ToolStatus,
+    },
     /// 错误展示（轮内错误，回 REPL）
     Error(String),
 }
 
-/// ANSI 暗淡色开关（固定转义，无颜色开关；终态由 Ui/term 决定是否解释）。
+/// ANSI 样式（固定转义，无颜色开关；终态由 Ui/term 决定是否解释）。
+const RESET: &str = "\x1b[0m";
 const DIM_OPEN: &str = "\x1b[2m";
-const DIM_CLOSE: &str = "\x1b[0m";
+const PROMPT_OPEN: &str = "\x1b[1;36m";
+const INPUT_OPEN: &str = "\x1b[36m";
+const TOOL_CALL_OPEN: &str = "\x1b[35m";
+const SUCCESS_OPEN: &str = "\x1b[32m";
+const FAILURE_OPEN: &str = "\x1b[31m";
+const INTERRUPTED_OPEN: &str = "\x1b[33m";
 
 /// ANSI 暗淡色包裹单个片段（`ui/helper.rs` 的灰提示使用）。
 pub fn dim(s: &str) -> String {
-    format!("{DIM_OPEN}{s}{DIM_CLOSE}")
+    format!("{DIM_OPEN}{s}{RESET}")
 }
 
-/// 工具调用单行：`→ bash: <命令>`。
-pub fn tool_call_line(cmd: &str) -> String {
-    format!("→ bash: {cmd}")
+/// 提示符：粗体青色。
+pub fn prompt(s: &str) -> String {
+    format!("{PROMPT_OPEN}{s}{RESET}")
 }
 
-/// 工具结果带左边栏显示，空白行不补尾随空格。
-pub fn tool_result_block(content: &str) -> String {
-    if content.is_empty() {
-        return "  │ （无输出）".to_string();
+/// 用户输入：青色。
+pub fn input(s: &str) -> String {
+    format!("{INPUT_OPEN}{s}{RESET}")
+}
+
+/// 工具调用单行：`→ <工具名>: <摘要>`，品红色。
+pub fn tool_call_line(name: &str, summary: &str) -> String {
+    format!("{TOOL_CALL_OPEN}→ {name}: {summary}{RESET}")
+}
+
+/// 工具结果带左边栏显示，空白行不补尾随空格；成功绿色、失败红色、打断黄色。
+pub fn tool_result_block(content: &str, status: ToolStatus) -> String {
+    let body = if content.is_empty() {
+        "  │ （无输出）".to_string()
+    } else {
+        content
+            .lines()
+            .map(|line| {
+                if line.is_empty() {
+                    "  │".to_string()
+                } else {
+                    format!("  │ {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    match status {
+        ToolStatus::Success => format!("{SUCCESS_OPEN}{body}{RESET}"),
+        ToolStatus::Failure => format!("{FAILURE_OPEN}{body}{RESET}"),
+        ToolStatus::Interrupted => format!("{INTERRUPTED_OPEN}{body}{RESET}"),
     }
-    content
-        .lines()
-        .map(|line| {
-            if line.is_empty() {
-                "  │".to_string()
-            } else {
-                format!("  │ {line}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// 一次事件产生的输出，按流向分开：`stdout` 走渲染流，`stderr` 走错误流。
@@ -99,7 +127,7 @@ impl Renderer {
             }
             RenderEvent::TextDelta(s) => {
                 if self.block == Block::Reasoning {
-                    out.stdout.push_str(DIM_CLOSE);
+                    out.stdout.push_str(RESET);
                     out.stdout.push('\n');
                 }
                 self.block = Block::Text;
@@ -108,16 +136,22 @@ impl Renderer {
             RenderEvent::LineBreak => {
                 out.stdout.push('\n');
             }
-            RenderEvent::ToolCall(cmd) => {
+            RenderEvent::ToolCall { name, summary } => {
                 self.close(&mut out.stdout);
                 out.stdout.push('\n');
-                out.stdout.push_str(&tool_call_line(cmd));
+                out.stdout.push_str(&tool_call_line(name, summary));
                 out.stdout.push('\n');
             }
-            RenderEvent::ToolResult(content) => {
+            RenderEvent::ToolResult {
+                name: _,
+                display,
+                status,
+            } => {
                 self.close(&mut out.stdout);
-                out.stdout.push_str(&tool_result_block(content));
-                out.stdout.push('\n');
+                if let Some(content) = display {
+                    out.stdout.push_str(&tool_result_block(content, *status));
+                    out.stdout.push('\n');
+                }
             }
             RenderEvent::Error(msg) => {
                 self.close(&mut out.stdout);
@@ -135,7 +169,7 @@ impl Renderer {
     pub fn reset(&mut self) -> &'static str {
         if self.block == Block::Reasoning {
             self.block = Block::Idle;
-            DIM_CLOSE
+            RESET
         } else {
             ""
         }
@@ -144,7 +178,7 @@ impl Renderer {
     /// 收尾当前块：思考块补关闭序列，其余无输出。块回到 Idle。
     fn close(&mut self, stdout: &mut String) {
         if self.block == Block::Reasoning {
-            stdout.push_str(DIM_CLOSE);
+            stdout.push_str(RESET);
         }
         self.block = Block::Idle;
     }
@@ -161,22 +195,53 @@ mod tests {
 
     #[test]
     fn tool_call_line_format() {
-        assert_eq!(tool_call_line("ls"), "→ bash: ls");
+        assert_eq!(tool_call_line("bash", "ls"), "\x1b[35m→ bash: ls\x1b[0m");
     }
 
     #[test]
-    fn result_block_uses_left_rail() {
-        assert_eq!(tool_result_block("a\nb"), "  │ a\n  │ b");
+    fn prompt_and_input_have_distinct_styles() {
+        assert_eq!(prompt("rho> "), "\x1b[1;36mrho> \x1b[0m");
+        assert_eq!(input("ls"), "\x1b[36mls\x1b[0m");
+    }
+
+    #[test]
+    fn result_block_uses_left_rail_and_green_success() {
+        assert_eq!(
+            tool_result_block("a\nb", ToolStatus::Success),
+            "\x1b[32m  │ a\n  │ b\x1b[0m"
+        );
     }
 
     #[test]
     fn result_block_handles_empty_output() {
-        assert_eq!(tool_result_block(""), "  │ （无输出）");
+        assert_eq!(
+            tool_result_block("", ToolStatus::Success),
+            "\x1b[32m  │ （无输出）\x1b[0m"
+        );
     }
 
     #[test]
     fn result_block_keeps_blank_lines() {
-        assert_eq!(tool_result_block("a\n\nb"), "  │ a\n  │\n  │ b");
+        assert_eq!(
+            tool_result_block("a\n\nb", ToolStatus::Success),
+            "\x1b[32m  │ a\n  │\n  │ b\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn failure_result_is_red() {
+        assert_eq!(
+            tool_result_block("x", ToolStatus::Failure),
+            "\x1b[31m  │ x\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn interrupted_result_is_yellow() {
+        assert_eq!(
+            tool_result_block("x", ToolStatus::Interrupted),
+            "\x1b[33m  │ x\x1b[0m"
+        );
     }
 
     fn stdout(r: &Rendered) -> &str {
@@ -217,15 +282,22 @@ mod tests {
     fn tool_call_closes_reasoning_first() {
         let mut r = Renderer::new();
         r.event(&RenderEvent::ReasoningDelta("想".into()));
-        let out = r.event(&RenderEvent::ToolCall("ls".into()));
-        assert_eq!(stdout(&out), "\x1b[0m\n→ bash: ls\n");
+        let out = r.event(&RenderEvent::ToolCall {
+            name: "bash".into(),
+            summary: "ls".into(),
+        });
+        assert_eq!(stdout(&out), "\x1b[0m\n\x1b[35m→ bash: ls\x1b[0m\n");
     }
 
     #[test]
     fn tool_result_uses_left_rail_and_newline() {
         let mut r = Renderer::new();
-        let out = r.event(&RenderEvent::ToolResult("a\nb".into()));
-        assert_eq!(stdout(&out), "  │ a\n  │ b\n");
+        let out = r.event(&RenderEvent::ToolResult {
+            name: "bash".into(),
+            display: Some("a\nb".into()),
+            status: ToolStatus::Success,
+        });
+        assert_eq!(stdout(&out), "\x1b[32m  │ a\n  │ b\x1b[0m\n");
     }
 
     #[test]

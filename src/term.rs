@@ -137,7 +137,8 @@ pub fn init() -> Result<Arc<Cancel>, String> {
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = on_sigint as *const () as libc::sighandler_t;
-        // 不设 SA_RESTART：确认界面的 read 需要被 SIGINT 打断返回 EINTR。
+        // 不设 SA_RESTART：被信号打断的读取按 EINTR 处理（各读取循环显式重试），
+        // 取消由标志轮询驱动。
         action.sa_flags = 0;
         libc::sigemptyset(&mut action.sa_mask);
         if libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) == -1 {
