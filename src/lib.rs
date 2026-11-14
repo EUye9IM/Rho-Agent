@@ -18,16 +18,3 @@ pub mod term;
 pub mod tool_spec;
 pub mod tools;
 pub mod ui;
-
-use std::sync::OnceLock;
-
-/// 会话 cwd 恒为进程启动目录（全程不可变）。
-pub(crate) fn session_cwd() -> String {
-    static CWD: OnceLock<String> = OnceLock::new();
-    CWD.get_or_init(|| {
-        std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| ".".to_string())
-    })
-    .clone()
-}

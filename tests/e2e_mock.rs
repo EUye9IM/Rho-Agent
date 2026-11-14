@@ -7,7 +7,7 @@ use rho::render::RenderEvent;
 use rho::repl;
 use rho::term::Cancel;
 use rho::tools;
-use rho::ui::{ConfirmOutcome, ReadOutcome, ScriptedUi};
+use rho::ui::{ReadOutcome, ScriptedUi};
 
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -306,7 +306,6 @@ context_window = 10000
 max_output = 1000
 
 [tools.bash]
-allow = []
 timeout_seconds = 5
 max_output_bytes = 1024
 "#
@@ -341,7 +340,7 @@ fn session_for_protocol(
     .unwrap();
     let selection = config::resolve_selection(&cfg, Some("mock"), None).unwrap();
     let adapter = provider::adapter_for(&selection.provider).unwrap();
-    Session::new(cfg, selection, adapter, false)
+    Session::new(cfg, selection, adapter)
 }
 
 #[test]
@@ -349,7 +348,7 @@ fn full_tool_loop_with_mock_sse() {
     let server = start_server(vec![tool_call_response(), text_response("done")]);
     let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::No]);
+    let mut ui = ScriptedUi::new(vec![]);
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done));
@@ -371,7 +370,7 @@ fn full_tool_loop_with_mock_sse() {
             content,
         } => {
             assert_eq!(tool_call_id, "call_1");
-            assert_eq!(content, "用户拒绝执行");
+            assert!(content.contains("hi"));
         }
         other => panic!("unexpected {other:?}"),
     }
@@ -386,7 +385,7 @@ fn full_tool_loop_with_mock_sse() {
         .any(|e| matches!(e, RenderEvent::ToolCall(c) if c == "echo hi")));
     assert!(rendered
         .iter()
-        .any(|e| matches!(e, RenderEvent::ToolResult(c) if c == "用户拒绝执行")));
+        .any(|e| matches!(e, RenderEvent::ToolResult(c) if c.contains("hi"))));
     assert!(rendered
         .iter()
         .any(|e| matches!(e, RenderEvent::TextDelta(t) if t == "done")));
@@ -412,7 +411,7 @@ fn responses_protocol_full_tool_loop() {
     ]);
     let mut session = session_for_protocol(server.base_url(), "", "", "openai_responses");
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::No]);
+    let mut ui = ScriptedUi::new(vec![]);
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done));
@@ -433,7 +432,7 @@ fn responses_protocol_full_tool_loop() {
             content,
         } => {
             assert_eq!(tool_call_id, "call_1");
-            assert_eq!(content, "用户拒绝执行");
+            assert!(content.contains("hi"));
         }
         other => panic!("unexpected {other:?}"),
     }
@@ -474,7 +473,7 @@ fn slow_response_headers_are_not_an_error() {
 
     let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(vec![], vec![]);
+    let mut ui = ScriptedUi::new(vec![]);
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done), "end was {end:?}");
@@ -501,7 +500,7 @@ fn slow_stream_between_chunks_is_not_an_error() {
 
     let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(vec![], vec![]);
+    let mut ui = ScriptedUi::new(vec![]);
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done), "end was {end:?}");
@@ -536,7 +535,6 @@ low = { thinking = { type = "enabled" } }
 #[test]
 fn bash_captures_stdout_stderr_and_exit_code() {
     let cfg = BashToolConfig {
-        allow: vec![],
         timeout_seconds: 5,
         max_output_bytes: 1024,
     };
@@ -551,7 +549,6 @@ fn bash_captures_stdout_stderr_and_exit_code() {
 #[test]
 fn bash_timeout_terminates_group() {
     let cfg = BashToolConfig {
-        allow: vec![],
         timeout_seconds: 1,
         max_output_bytes: 1024,
     };
@@ -566,7 +563,6 @@ fn bash_timeout_terminates_group() {
 #[test]
 fn bash_returns_bounded_when_background_child_holds_pipe() {
     let cfg = BashToolConfig {
-        allow: vec![],
         timeout_seconds: 5,
         max_output_bytes: 1024,
     };
@@ -590,7 +586,6 @@ fn bash_returns_bounded_when_background_child_holds_pipe() {
 #[test]
 fn bash_timeout_kills_background_children_too() {
     let cfg = BashToolConfig {
-        allow: vec![],
         timeout_seconds: 1,
         max_output_bytes: 1024,
     };
@@ -609,7 +604,6 @@ fn bash_timeout_kills_background_children_too() {
 #[test]
 fn bash_cancel_terminates_group() {
     let cfg = BashToolConfig {
-        allow: vec![],
         timeout_seconds: 30,
         max_output_bytes: 1024,
     };
@@ -662,7 +656,7 @@ fn ctrl_c_during_stream_cancels_and_discards_partial() {
         std::thread::sleep(Duration::from_millis(150));
         injector.inject();
     });
-    let mut ui = ScriptedUi::new(vec![], vec![]);
+    let mut ui = ScriptedUi::new(vec![]);
     let started = std::time::Instant::now();
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Cancelled));
@@ -721,7 +715,7 @@ fn multiple_tool_calls_are_paired_in_order() {
     let server = start_server(vec![two_tool_calls_response(), text_response("ok")]);
     let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::No, ConfirmOutcome::No]);
+    let mut ui = ScriptedUi::new(vec![]);
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done));
@@ -739,8 +733,8 @@ fn multiple_tool_calls_are_paired_in_order() {
         ) => {
             assert_eq!(a, "call_a");
             assert_eq!(b, "call_b");
-            assert_eq!(ca, "用户拒绝执行");
-            assert_eq!(cb, "用户拒绝执行");
+            assert!(ca.contains('a'));
+            assert!(cb.contains('b'));
         }
         other => panic!("unexpected {other:?}"),
     }
@@ -755,7 +749,7 @@ fn max_tool_steps_placeholders_remaining_calls() {
     let server = start_server(vec![two_tool_calls_response()]);
     let mut session = session_for(server.base_url(), "max_tool_steps = 1", "");
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::No]);
+    let mut ui = ScriptedUi::new(vec![]);
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Error(_)));
@@ -773,7 +767,7 @@ fn max_tool_steps_placeholders_remaining_calls() {
         ) => {
             assert_eq!(a, "call_a");
             assert_eq!(b, "call_b");
-            assert_eq!(ca, "用户拒绝执行");
+            assert!(ca.contains('a'));
             assert!(cb.contains("上限"));
         }
         other => panic!("unexpected {other:?}"),
@@ -814,7 +808,7 @@ fn echo_reasoning_is_serialized_on_next_request() {
         "[providers.mock.compat]\necho_reasoning = true",
     );
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::No]);
+    let mut ui = ScriptedUi::new(vec![]);
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done));
@@ -832,7 +826,7 @@ fn top_level_error_chunk_is_surfaced() {
     let server = start_server(vec![response]);
     let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(vec![], vec![]);
+    let mut ui = ScriptedUi::new(vec![]);
 
     match session.turn(&mut ui, &cancel, "go").unwrap() {
         TurnEnd::Error(e) => assert!(e.contains("boom"), "error was {e}"),
@@ -853,7 +847,7 @@ fn truncated_finish_reason_is_error() {
     let server = start_server(vec![response]);
     let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(vec![], vec![]);
+    let mut ui = ScriptedUi::new(vec![]);
 
     match session.turn(&mut ui, &cancel, "go").unwrap() {
         TurnEnd::Error(e) => assert!(e.contains("length"), "error was {e}"),
@@ -871,7 +865,7 @@ fn done_without_trailing_newline_is_accepted() {
     let server = start_server(vec![response]);
     let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(vec![], vec![]);
+    let mut ui = ScriptedUi::new(vec![]);
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done));
@@ -902,7 +896,7 @@ fn unknown_tool_result_is_rendered() {
     let server = start_server(vec![unknown_tool_response(), text_response("ok")]);
     let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(vec![], vec![]);
+    let mut ui = ScriptedUi::new(vec![]);
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done));
@@ -915,7 +909,6 @@ fn unknown_tool_result_is_rendered() {
 #[test]
 fn bash_large_output_is_truncated_once_with_accurate_count() {
     let cfg = BashToolConfig {
-        allow: vec![],
         timeout_seconds: 10,
         max_output_bytes: 200,
     };
@@ -941,13 +934,10 @@ fn repl_adds_line_break_after_done_response() {
     let server = start_server(vec![text_response("one line")]);
     let session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(
-        vec![
-            ReadOutcome::Line("go".into()),
-            ReadOutcome::Line("/exit".into()),
-        ],
-        vec![],
-    );
+    let mut ui = ScriptedUi::new(vec![
+        ReadOutcome::Line("go".into()),
+        ReadOutcome::Line("/exit".into()),
+    ]);
 
     repl::run(&mut ui, session, &cancel).unwrap();
 
@@ -982,7 +972,7 @@ fn reasoning_delta_precedes_text_delta() {
     let server = start_server(vec![response]);
     let mut session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(vec![], vec![]);
+    let mut ui = ScriptedUi::new(vec![]);
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
     assert!(matches!(end, TurnEnd::Done));

@@ -1,25 +1,23 @@
-//! 测试实现：预排输入 + 预排确认 + 收集渲染事件。
+//! 测试实现：预排输入 + 收集渲染事件。
 //! 驱动 repl → agent loop → tools 全链路，无网络无 TTY。
 
 use crate::completion::CompletionProvider;
 use crate::render::RenderEvent;
-use crate::ui::{ConfirmOutcome, ReadOutcome, Ui};
+use crate::ui::{ReadOutcome, Ui};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 pub struct ScriptedUi {
     pub inputs: VecDeque<ReadOutcome>,
-    pub confirms: VecDeque<ConfirmOutcome>,
     pub rendered: Vec<RenderEvent>,
     /// 灰提示武装序列（`set_ctrl_c_hint` 的调用值，按顺序）。
     pub hints: Vec<bool>,
 }
 
 impl ScriptedUi {
-    pub fn new(inputs: Vec<ReadOutcome>, confirms: Vec<ConfirmOutcome>) -> Self {
+    pub fn new(inputs: Vec<ReadOutcome>) -> Self {
         Self {
             inputs: inputs.into(),
-            confirms: confirms.into(),
             rendered: Vec::new(),
             hints: Vec::new(),
         }
@@ -29,10 +27,6 @@ impl ScriptedUi {
 impl Ui for ScriptedUi {
     fn read_line(&mut self, _completer: Arc<dyn CompletionProvider>) -> ReadOutcome {
         self.inputs.pop_front().unwrap_or(ReadOutcome::Eof)
-    }
-
-    fn confirm(&mut self, _cwd: &str, _cmd: &str) -> ConfirmOutcome {
-        self.confirms.pop_front().unwrap_or(ConfirmOutcome::No)
     }
 
     fn print(&mut self, ev: &RenderEvent) {

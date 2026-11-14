@@ -4,7 +4,7 @@
 
 [English](README.md) | **简体中文**
 
-`rho` 是一个跑在终端里的轻量本地 agent。单 crate、单二进制（分发建议使用 musl 静态构建），使用阻塞 I/O + 线程，面向资源受限的 Linux 设备。你在 REPL 里对话，它从兼容 OpenAI Chat Completions 的供应商（默认 DeepSeek）流式返回结果，也可通过配置使用 OpenAI Responses 协议，并能通过 `bash` 工具执行命令——执行前要过 allowlist 判定和人工确认。
+`rho` 是一个跑在终端里的轻量本地 agent。单 crate、单二进制（分发建议使用 musl 静态构建），使用阻塞 I/O + 线程，面向资源受限的 Linux 设备。你在 REPL 里对话，它从兼容 OpenAI Chat Completions 的供应商（默认 DeepSeek）流式返回结果，也可通过配置使用 OpenAI Responses 协议，并能通过 `bash` 工具执行命令。
 
 ## 愿景
 
@@ -18,7 +18,7 @@ rho 要做一个运行在资源受限 Linux 设备上的本地 agent：单二进
 - **配置驱动** —— 供应商、模型、思考档位都由数据声明；支持 `openai_chat` 与 `openai_responses`，切换协议只改配置。
 - **流式 + 思考可见** —— 正文逐块输出；`reasoning_content` 以暗淡色实时展示，默认只留在本地，仅当供应商配置 `compat.echo_reasoning = true` 时随历史回传。
 - **只有一个工具：`bash`** —— 前台执行 `bash -c <命令>`，每次调用启动新的 shell，单次超时后按进程组逐级终止。
-- **可预测的 Ctrl-C** —— 第一次取消当前流式/工具/确认，立即回到提示符（取消标志在逐块之间轮询生效；连接停滞无数据时，后台读取在下一块数据到达或空闲超时后结束），第二次退出；空闲提示符下两次空行 Ctrl-C（2 秒内）同样退出，第一次会在输入行尾显示灰色提示。对话历史在任何时刻都保持协议合法（工具调用必有对应结果）。
+- **可预测的 Ctrl-C** —— 第一次取消当前流式/工具，立即回到提示符（取消标志在逐块之间轮询生效；连接停滞无数据时，后台读取在下一块数据到达或空闲超时后结束），第二次退出；空闲提示符下两次空行 Ctrl-C（2 秒内）同样退出，第一次会在输入行尾显示灰色提示。对话历史在任何时刻都保持协议合法（工具调用必有对应结果）。
 - **Tab 补全** —— 补全斜杠命令名以及 `/model`、`/provider`、`/thinking` 的参数，候选来自当前会话状态；切换供应商或模型后自动刷新。
 - **严格配置校验** —— 未知字段、悬空引用、缺失必填字段一律硬报错并给出配置路径（TOML 语法错误另带行号），退出码 2。
 
@@ -72,12 +72,11 @@ rho> 看看 /var/log 下的磁盘占用
 ...
 ```
 
-指定供应商 / 模型 / 思考档位，或跳过确认：
+指定供应商 / 模型 / 思考档位：
 
 ```sh
 rho --config ./rho.toml --model deepseek/deepseek-v4-pro --thinking low
 rho --init           # 生成默认配置文件到 ~/.config/rho/config.toml
-rho --yes            # 自动放行所有 bash 调用
 ```
 
 ### 命令行参数
@@ -88,7 +87,6 @@ rho --yes            # 自动放行所有 bash 调用
 | `--provider <id>` | 初始供应商（覆盖配置默认）。 |
 | `--model <id>` | 初始模型（须为 `provider/model` 形式，覆盖配置默认）。 |
 | `--thinking <level>` | 初始思考档位（须属于所选模型）。 |
-| `--yes` | 跳过所有 `bash` 确认。 |
 | `--init` | 把内置配置写到 `--config` 路径或默认路径；目标已存在时报错不覆盖。 |
 | `--version`、`-V` | 打印 rho 版本并退出。 |
 
@@ -141,7 +139,6 @@ high = { thinking = { type = "enabled" }, reasoning_effort = "high" }
 max  = { thinking = { type = "enabled" }, reasoning_effort = "max" }
 
 [tools.bash]
-allow            = ["ls", "cat /var/log", "systemctl status"]  # 留空表示全部需确认
 timeout_seconds  = 120
 max_output_bytes = 16384
 ```
@@ -159,16 +156,11 @@ max_output_bytes = 16384
 
 `rho` 前台执行 `bash -c <命令>`。每次调用启动新的 shell，cwd 和环境变量改动只留在当次调用内；命令启动的后台进程会继续运行。需要先 `cd` 再执行时，写在同一行命令里。
 
-命令**同时**满足以下两点才免确认执行：
+模型发出的每条命令都会立即执行。
 
-1. 与某个 `allow` 条目完全相同，或以该条目开头且其后紧跟一个空格；
-2. 命令中不含 shell 元字符 `;` `&` `|` `<` `>` `$`、反引号或换行。
+> **安全边界。** `rho` 会执行模型发出的任何命令，真正的安全边界是运行 `rho` 的用户权限。子进程完全继承父进程环境变量，模型用一条 `env` 就能读出 `DEEPSEEK_API_KEY`。请以你愿意让其执行命令的用户身份运行 `rho`，并只在信任的主机上使用。
 
-其余情况一律弹确认，显示当前工作目录与完整命令，默认 **N**；拒绝结果会作为工具结果喂回模型。`--yes` 跳过全部确认。
-
-> **安全边界。** allowlist 做字符串匹配，是免确认的便捷门槛；真正的安全边界是运行 `rho` 的用户权限。子进程完全继承父进程环境变量，模型用一条 `env` 就能读出 `DEEPSEEK_API_KEY`。请以你愿意让其执行命令的用户身份运行 `rho`，并只在信任的主机上使用。
-
-其他限制：每轮对话最多 `max_tool_steps` 次模型发起的工具调用（默认 25，拒绝/失败/参数错误的调用同样计数）；stdout 与 stderr 各自上限 `max_output_bytes`，保留头尾两段并标注省略字节数；超时后对整个进程组 SIGTERM，2 秒后 SIGKILL。每次请求把模型的 `max_output` 作为上游输出 token 上限发送。SSE 单行上限 1 MiB，单轮响应体累计上限 32 MiB，超出即按错误结束本轮。HTTP 错误直接展示；历史按原样发送，会话超出模型窗口时上游会失败，此时用 `/clear` 重开。
+其他限制：每轮对话最多 `max_tool_steps` 次模型发起的工具调用（默认 25，失败/参数错误的调用同样计数）；stdout 与 stderr 各自上限 `max_output_bytes`，保留头尾两段并标注省略字节数；超时后对整个进程组 SIGTERM，2 秒后 SIGKILL。每次请求把模型的 `max_output` 作为上游输出 token 上限发送。SSE 单行上限 1 MiB，单轮响应体累计上限 32 MiB，超出即按错误结束本轮。HTTP 错误直接展示；历史按原样发送，会话超出模型窗口时上游会失败，此时用 `/clear` 重开。
 
 ## 测试
 

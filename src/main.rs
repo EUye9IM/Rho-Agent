@@ -15,7 +15,6 @@ pub struct Args {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub thinking: Option<String>,
-    pub yes: bool,
     pub init: bool,
     pub version: bool,
 }
@@ -29,7 +28,7 @@ fn main() -> ExitCode {
     let args = match parse_args(std::env::args().skip(1).collect()) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("用法错误：{e}\n用法：rho [--config <path>] [--provider <id>] [--model <id>] [--thinking <level>] [--yes] [--init] [--version]");
+            eprintln!("用法错误：{e}\n用法：rho [--config <path>] [--provider <id>] [--model <id>] [--thinking <level>] [--init] [--version]");
             return ExitCode::from(EXIT_USAGE);
         }
     };
@@ -122,7 +121,7 @@ fn run(args: Args) -> u8 {
         }
     };
 
-    let session = Session::new(cfg, selection, adapter, args.yes);
+    let session = Session::new(cfg, selection, adapter);
     match repl::run(&mut term_ui, session, &cancel) {
         Ok(()) | Err(ReplExit::Quit) => EXIT_OK,
         Err(ReplExit::Fatal(e)) => {
@@ -146,14 +145,13 @@ fn resolve_thinking(selection: &mut config::Selection, cli: Option<&str>) -> Res
     }
 }
 
-/// 手写参数解析：支持 `--flag value` 与 `--flag=value`；未知参数/重复 flag/带值的 --yes 报错。
+/// 手写参数解析：支持 `--flag value` 与 `--flag=value`；未知参数/重复 flag/带值的 flag 报错。
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     let mut args = Args {
         config: None,
         provider: None,
         model: None,
         thinking: None,
-        yes: false,
         init: false,
         version: false,
     };
@@ -194,15 +192,6 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                 }
                 args.thinking = Some(take_value()?);
             }
-            "--yes" => {
-                if inline.is_some() {
-                    return Err("--yes 不接受值".into());
-                }
-                if args.yes {
-                    return Err("--yes 重复".into());
-                }
-                args.yes = true;
-            }
             "--init" => {
                 if inline.is_some() {
                     return Err("--init 不接受值".into());
@@ -233,10 +222,8 @@ mod tests {
 
     #[test]
     fn parse_basic() {
-        let a =
-            parse_args(["--provider".into(), "deepseek".into(), "--yes".into()].to_vec()).unwrap();
+        let a = parse_args(["--provider".into(), "deepseek".into()].to_vec()).unwrap();
         assert_eq!(a.provider.as_deref(), Some("deepseek"));
-        assert!(a.yes);
     }
 
     #[test]
@@ -270,7 +257,6 @@ mod tests {
             provider: None,
             model: None,
             thinking: None,
-            yes: false,
             init: true,
             version: false,
         };
@@ -285,11 +271,11 @@ mod tests {
     #[test]
     fn parse_rejects_unknown() {
         assert!(parse_args(["--clap".into()].to_vec()).is_err());
+        assert!(parse_args(["--yes".into()].to_vec()).is_err());
     }
 
     #[test]
     fn parse_rejects_duplicate() {
-        assert!(parse_args(["--yes".into(), "--yes".into()].to_vec()).is_err());
         assert!(parse_args(
             [
                 "--provider".into(),
@@ -300,10 +286,5 @@ mod tests {
             .to_vec()
         )
         .is_err());
-    }
-
-    #[test]
-    fn parse_rejects_yes_with_value() {
-        assert!(parse_args(["--yes=false".into()].to_vec()).is_err());
     }
 }

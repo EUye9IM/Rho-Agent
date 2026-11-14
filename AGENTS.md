@@ -15,7 +15,7 @@
 - 单 crate、单二进制
 - 阻塞 I/O + 线程，**不使用 async runtime**
 - 默认 DeepSeek；`protocol` 支持 `openai_chat` 与 `openai_responses`，供应商/模型/thinking 由 TOML 配置驱动
-- 只有一个 `bash` 工具，带 allowlist、确认 gate、超时和进程组清理
+- 只有一个 `bash` 工具，命令直接执行，带超时和进程组清理
 - 分发目标是 Linux musl 静态二进制（x86_64 为主）
 
 ## 分支与发布
@@ -97,7 +97,7 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 - bash 工具定义只在 `tool_spec.rs` 维护；各 adapter 只负责映射成自己的 wire format，不要复制 schema。
 - `ProviderAdapter::parse_chunk` 返回 `ChunkOutcome`；流结束标记与 `finish_reason` 的提交资格判定留在 provider worker。
 - 工具循环必须保证历史协议合法：所有 `tool_calls` 都要有对应 `Tool` 消息占位。
-- 取消语义、进程组清理、确认 gate 的行为以 `docs/architecture.md` 和现有代码为准，不要简化成“杀直接子进程”或“只 drop 连接”。确认 gate 由 `chat` 编排，`tools` 只负责 allowlist 判定与执行。
+- 取消语义、进程组清理的行为以 `docs/architecture.md` 和现有代码为准，不要简化成“杀直接子进程”或“只 drop 连接”。bash 调用由 `chat` 编排，`tools` 只负责执行。
 
 ## 配置语义
 
@@ -131,13 +131,11 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 
 - `rustyline` 每次 `readline` 前会清当前行（`\r\x1b[K`）。如果上一段输出没有换行，最后一行会被擦掉。
 - 正常回合结束后由 `repl.rs` 在 `TurnEnd::Done` 后补 `RenderEvent::LineBreak`；不要删掉，除非你同时换成等价的“确保行首”机制。
-- `TermUi::confirm` 用 `libc::read(0)`，以便 Ctrl-C 的 SIGINT 能打断；不要改回 `std::io::stdin().read_line()`。
 - 流式输出中 `TextDelta` 原样写出；不要在每个 delta 上强制加换行。
 
 ## 工具与安全
 
-- `bash` allowlist 是字符串匹配，不是 shell 解析或安全沙箱；不要把它描述成沙箱。
-- 确认 gate 默认拒绝；`--yes` 跳过全部确认（对任意命令直接放行），allowlist 只是免确认的便捷门槛。若打算改成“`--yes` 仍需过 allowlist”，必须先确认，因为这会改变行为。
+- `bash` 命令直接执行；安全边界是运行 `rho` 的用户权限，不要把它描述成沙箱。
 - 工具输出 stdout/stderr 各自有上限，只截断一次并保留省略字节数。
 - 超时和取消都走进程组 SIGTERM → 2s → SIGKILL；不要只杀直接子进程。
 - 不要新增第二个工具，除非用户明确要求。

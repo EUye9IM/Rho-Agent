@@ -8,7 +8,7 @@ use rho::config::{self, BashToolConfig, Provider};
 use rho::provider::{self, ProviderAdapter, StreamEvent};
 use rho::term::Cancel;
 use rho::tools::{BashEnd, BashOutput};
-use rho::ui::{ConfirmOutcome, ReadOutcome, ScriptedUi, Ui};
+use rho::ui::{ReadOutcome, ScriptedUi, Ui};
 
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,7 +31,7 @@ fn session() -> Session {
     let cfg = config::load_str(CONFIG_TOML, "<测试配置>").unwrap();
     let selection = config::resolve_selection(&cfg, None, None).unwrap();
     let adapter = provider::adapter_for(&selection.provider).unwrap();
-    Session::new(cfg, selection, adapter, false)
+    Session::new(cfg, selection, adapter)
 }
 
 fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
@@ -189,15 +189,13 @@ const CMD: &str = r#"{"command":"echo hi"}"#;
 /// 前 N 次 print 正常，之后每次 print 都置位 fatal（模拟渲染 I/O 失败，如 EPIPE）。
 struct FailingUi {
     prints_left: usize,
-    confirms: std::collections::VecDeque<ConfirmOutcome>,
     fatal: Option<String>,
 }
 
 impl FailingUi {
-    fn new(prints_left: usize, confirms: Vec<ConfirmOutcome>) -> Self {
+    fn new(prints_left: usize) -> Self {
         Self {
             prints_left,
-            confirms: confirms.into(),
             fatal: None,
         }
     }
@@ -206,10 +204,6 @@ impl FailingUi {
 impl Ui for FailingUi {
     fn read_line(&mut self, _completer: Arc<dyn CompletionProvider>) -> ReadOutcome {
         ReadOutcome::Eof
-    }
-
-    fn confirm(&mut self, _cwd: &str, _cmd: &str) -> ConfirmOutcome {
-        self.confirms.pop_front().unwrap_or(ConfirmOutcome::No)
     }
 
     fn print(&mut self, _ev: &rho::render::RenderEvent) {
@@ -236,8 +230,11 @@ fn first_call_failures_do_not_block_rest() {
         ])))],
         vec![text_final("done")],
     ]));
-    // 未知工具/参数错误不进 gate；只有 c3 弹确认（拒绝，不执行）。
-    let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::No]);
+    // 未知工具/参数错误不影响后续调用；c3 正常执行。
+    session.tool_runner = Arc::new(PresetRunner {
+        output: "hi\n[Command finished with exit code 0]".into(),
+    });
+    let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
@@ -246,7 +243,7 @@ fn first_call_failures_do_not_block_rest() {
     assert_eq!(session.history().len(), 6);
     assert!(tool_result_content(session.history(), 2).contains("未知工具：nope"));
     assert!(tool_result_content(session.history(), 3).contains("参数解析失败"));
-    assert_eq!(tool_result_content(session.history(), 4), "用户拒绝执行");
+    assert!(tool_result_content(session.history(), 4).contains("hi"));
     match &session.history()[5] {
         Msg::Assistant(a) => {
             assert_eq!(a.text.as_deref(), Some("done"));
@@ -254,25 +251,6 @@ fn first_call_failures_do_not_block_rest() {
         }
         other => panic!("unexpected {other:?}"),
     }
-}
-
-#[test]
-fn confirm_cancel_places_placeholders_for_remaining() {
-    let mut session = session();
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![StreamEvent::Final(
-        Box::new(assistant_with_calls(vec![
-            call("c1", "bash", CMD),
-            call("c2", "bash", CMD),
-        ])),
-    )]]));
-    let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::Cancelled]);
-    let cancel = Cancel::new();
-
-    let end = session.turn(&mut ui, &cancel, "go").unwrap();
-    assert!(matches!(end, TurnEnd::Cancelled), "end was {end:?}");
-    assert_eq!(session.history().len(), 4);
-    assert_eq!(tool_result_content(session.history(), 2), "用户取消执行");
-    assert_eq!(tool_result_content(session.history(), 3), "用户取消执行");
 }
 
 #[test]
@@ -285,7 +263,7 @@ fn execution_cancel_keeps_partial_result() {
         ])),
     )]]));
     session.tool_runner = Arc::new(InjectingRunner { injects: 1 });
-    let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::Yes]);
+    let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
     let end = session.turn(&mut ui, &cancel, "go").unwrap();
@@ -307,7 +285,7 @@ fn quit_during_cleanup_exits_after_placeholders() {
     )]]));
     // 执行中一次取消 + 清理期间升级第二次：收尾完成后退出。
     session.tool_runner = Arc::new(InjectingRunner { injects: 2 });
-    let mut ui = ScriptedUi::new(vec![], vec![ConfirmOutcome::Yes]);
+    let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
     assert!(session.turn(&mut ui, &cancel, "go").is_err());
@@ -325,7 +303,7 @@ fn sustained_delta_is_cancellable() {
         ready: ready_tx,
         released: Mutex::new(Some(release_rx)),
     });
-    let mut ui = ScriptedUi::new(vec![], vec![]);
+    let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
     let injector = injector_after_ready(cancel.clone(), ready_rx, release_tx, 1);
 
@@ -345,7 +323,7 @@ fn quit_during_stream_returns_quit() {
         ready: ready_tx,
         released: Mutex::new(Some(release_rx)),
     });
-    let mut ui = ScriptedUi::new(vec![], vec![]);
+    let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
     let injector = injector_after_ready(cancel.clone(), ready_rx, release_tx, 2);
 
@@ -359,7 +337,7 @@ fn disconnect_without_terminal_is_error() {
     let mut session = session();
     // 空脚本：事件线程立即结束，通道断开且无终态 → 防御性按 Error 收尾。
     session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![]]));
-    let mut ui = ScriptedUi::new(vec![], vec![]);
+    let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
     match session.turn(&mut ui, &cancel, "go").unwrap() {
@@ -379,7 +357,7 @@ fn render_failure_during_stream_aborts_before_commit() {
         text_final("done"),
     ]]));
     // 首个 Delta 渲染即失败：流收尾后不提交 Assistant，不执行工具。
-    let mut ui = FailingUi::new(0, vec![]);
+    let mut ui = FailingUi::new(0);
     let cancel = Cancel::new();
 
     match session.turn(&mut ui, &cancel, "go").unwrap() {
@@ -399,7 +377,7 @@ fn render_failure_mid_batch_placeholders_remaining_then_fatal() {
         ])),
     )]]));
     // 第一次 print（ToolCall 行）成功，第二个调用的结果渲染开始失败。
-    let mut ui = FailingUi::new(1, vec![ConfirmOutcome::Yes]);
+    let mut ui = FailingUi::new(1);
     session.tool_runner = Arc::new(PresetRunner {
         output: "hi\n[Command finished with exit code 0]".into(),
     });
@@ -428,7 +406,7 @@ fn invalid_tool_call_ids_are_rejected_before_submit() {
         session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![StreamEvent::Final(
             Box::new(assistant_with_calls(calls)),
         )]]));
-        let mut ui = ScriptedUi::new(vec![], vec![]);
+        let mut ui = ScriptedUi::new(vec![]);
         let cancel = Cancel::new();
 
         match session.turn(&mut ui, &cancel, "go").unwrap() {

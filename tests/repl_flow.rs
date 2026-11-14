@@ -8,7 +8,7 @@ use rho::provider;
 use rho::render::RenderEvent;
 use rho::repl::{self, ReplExit};
 use rho::term::Cancel;
-use rho::ui::{ConfirmOutcome, ReadOutcome, ScriptedUi, Ui};
+use rho::ui::{ReadOutcome, ScriptedUi, Ui};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -20,7 +20,7 @@ fn session_from(toml: &str) -> Session {
     let cfg = config::load_str(toml, "<测试配置>").unwrap();
     let selection = config::resolve_selection(&cfg, None, None).unwrap();
     let adapter = provider::adapter_for(&selection.provider).unwrap();
-    Session::new(cfg, selection, adapter, false)
+    Session::new(cfg, selection, adapter)
 }
 
 /// 保留一个真实文件加载路径的护栏：报错文案带文件路径。
@@ -85,20 +85,17 @@ max_output = 100
 
 #[test]
 fn slash_commands_then_exit() {
-    let mut ui = ScriptedUi::new(
-        vec![
-            ReadOutcome::Line("/help".into()),
-            ReadOutcome::Line("/model".into()),
-            ReadOutcome::Line("/model mock/m".into()),
-            ReadOutcome::Line("/provider".into()),
-            ReadOutcome::Line("/thinking".into()),
-            ReadOutcome::Line("/clear".into()),
-            ReadOutcome::Line("/unknown".into()),
-            ReadOutcome::Line("   ".into()),
-            ReadOutcome::Line("/exit".into()),
-        ],
-        vec![],
-    );
+    let mut ui = ScriptedUi::new(vec![
+        ReadOutcome::Line("/help".into()),
+        ReadOutcome::Line("/model".into()),
+        ReadOutcome::Line("/model mock/m".into()),
+        ReadOutcome::Line("/provider".into()),
+        ReadOutcome::Line("/thinking".into()),
+        ReadOutcome::Line("/clear".into()),
+        ReadOutcome::Line("/unknown".into()),
+        ReadOutcome::Line("   ".into()),
+        ReadOutcome::Line("/exit".into()),
+    ]);
     let cancel = Cancel::new();
     repl::run(&mut ui, session(), &cancel).unwrap();
     assert!(ui
@@ -113,14 +110,11 @@ fn slash_commands_then_exit() {
 
 #[test]
 fn help_and_model_list_follow_current_provider() {
-    let mut ui = ScriptedUi::new(
-        vec![
-            ReadOutcome::Line("/help".into()),
-            ReadOutcome::Line("/model".into()),
-            ReadOutcome::Line("/exit".into()),
-        ],
-        vec![],
-    );
+    let mut ui = ScriptedUi::new(vec![
+        ReadOutcome::Line("/help".into()),
+        ReadOutcome::Line("/model".into()),
+        ReadOutcome::Line("/exit".into()),
+    ]);
     let cancel = Cancel::new();
     repl::run(&mut ui, session_from(TWO_PROVIDERS), &cancel).unwrap();
     let text: String = ui
@@ -141,13 +135,10 @@ fn help_and_model_list_follow_current_provider() {
 
 #[test]
 fn help_hides_thinking_for_model_without_table() {
-    let mut ui = ScriptedUi::new(
-        vec![
-            ReadOutcome::Line("/help".into()),
-            ReadOutcome::Line("/exit".into()),
-        ],
-        vec![],
-    );
+    let mut ui = ScriptedUi::new(vec![
+        ReadOutcome::Line("/help".into()),
+        ReadOutcome::Line("/exit".into()),
+    ]);
     let cancel = Cancel::new();
     repl::run(&mut ui, session(), &cancel).unwrap();
     let text: String = ui
@@ -254,13 +245,10 @@ max_output = 100
 
 #[test]
 fn unavailable_provider_is_marked_in_listing() {
-    let mut ui = ScriptedUi::new(
-        vec![
-            ReadOutcome::Line("/provider".into()),
-            ReadOutcome::Line("/exit".into()),
-        ],
-        vec![],
-    );
+    let mut ui = ScriptedUi::new(vec![
+        ReadOutcome::Line("/provider".into()),
+        ReadOutcome::Line("/exit".into()),
+    ]);
     let cancel = Cancel::new();
     repl::run(
         &mut ui,
@@ -303,10 +291,6 @@ impl Ui for FatalUi {
         ReadOutcome::Eof
     }
 
-    fn confirm(&mut self, _cwd: &str, _cmd: &str) -> ConfirmOutcome {
-        ConfirmOutcome::No
-    }
-
     fn print(&mut self, _ev: &RenderEvent) {}
 
     fn take_fatal(&mut self) -> Option<String> {
@@ -326,20 +310,17 @@ fn ui_io_error_maps_to_exit_1() {
 #[test]
 fn eof_exits_normally() {
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(vec![ReadOutcome::Eof], vec![]);
+    let mut ui = ScriptedUi::new(vec![ReadOutcome::Eof]);
     assert!(repl::run(&mut ui, session(), &cancel).is_ok());
 }
 
 #[test]
 fn single_empty_interrupt_only_arms() {
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(
-        vec![
-            ReadOutcome::Interrupted { line_empty: true },
-            ReadOutcome::Line("/help".into()),
-        ],
-        vec![],
-    );
+    let mut ui = ScriptedUi::new(vec![
+        ReadOutcome::Interrupted { line_empty: true },
+        ReadOutcome::Line("/help".into()),
+    ]);
     assert!(repl::run(&mut ui, session(), &cancel).is_ok());
     // 没退出：/help 确实执行了。
     assert!(!ui.rendered.is_empty());
@@ -350,14 +331,11 @@ fn single_empty_interrupt_only_arms() {
 #[test]
 fn double_empty_interrupt_exits() {
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(
-        vec![
-            ReadOutcome::Interrupted { line_empty: true },
-            ReadOutcome::Interrupted { line_empty: true },
-            ReadOutcome::Line("/help".into()),
-        ],
-        vec![],
-    );
+    let mut ui = ScriptedUi::new(vec![
+        ReadOutcome::Interrupted { line_empty: true },
+        ReadOutcome::Interrupted { line_empty: true },
+        ReadOutcome::Line("/help".into()),
+    ]);
     assert!(repl::run(&mut ui, session(), &cancel).is_ok());
     // 第二次空行 Ctrl-C 已退出：后面的 /help 不该被执行。
     assert!(ui.rendered.is_empty());
@@ -367,16 +345,13 @@ fn double_empty_interrupt_exits() {
 #[test]
 fn editing_interrupt_disarms_before_exit() {
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(
-        vec![
-            ReadOutcome::Interrupted { line_empty: true },
-            // 编辑中（行非空）Ctrl-C：清行并撤销武装，回提示符。
-            ReadOutcome::Interrupted { line_empty: false },
-            ReadOutcome::Interrupted { line_empty: true },
-            ReadOutcome::Line("/help".into()),
-        ],
-        vec![],
-    );
+    let mut ui = ScriptedUi::new(vec![
+        ReadOutcome::Interrupted { line_empty: true },
+        // 编辑中（行非空）Ctrl-C：清行并撤销武装，回提示符。
+        ReadOutcome::Interrupted { line_empty: false },
+        ReadOutcome::Interrupted { line_empty: true },
+        ReadOutcome::Line("/help".into()),
+    ]);
     assert!(repl::run(&mut ui, session(), &cancel).is_ok());
     // 第三次 Ctrl-C 只是重新武装，不该退出。
     assert!(!ui.rendered.is_empty());
@@ -387,16 +362,13 @@ fn editing_interrupt_disarms_before_exit() {
 #[test]
 fn submitted_line_clears_arm() {
     let cancel = Cancel::new();
-    let mut ui = ScriptedUi::new(
-        vec![
-            ReadOutcome::Interrupted { line_empty: true },
-            // 空行回车清掉武装。
-            ReadOutcome::Line(String::new()),
-            ReadOutcome::Interrupted { line_empty: true },
-            ReadOutcome::Line("/help".into()),
-        ],
-        vec![],
-    );
+    let mut ui = ScriptedUi::new(vec![
+        ReadOutcome::Interrupted { line_empty: true },
+        // 空行回车清掉武装。
+        ReadOutcome::Line(String::new()),
+        ReadOutcome::Interrupted { line_empty: true },
+        ReadOutcome::Line("/help".into()),
+    ]);
     assert!(repl::run(&mut ui, session(), &cancel).is_ok());
     assert!(!ui.rendered.is_empty());
     // 空行回车也清掉武装，所以第三个 Ctrl-C 只能重新武装。

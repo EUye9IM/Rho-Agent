@@ -43,6 +43,5 @@ high = { thinking = { type = "enabled" }, reasoning_effort = "high" }
 max = { thinking = { type = "enabled" }, reasoning_effort = "max" }
 
 [tools.bash]
-allow = ["ls", "cat /var/log", "systemctl status"]
 timeout_seconds = 120
 max_output_bytes = 16384

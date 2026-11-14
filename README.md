@@ -4,7 +4,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-`rho` is a small local agent that lives in your terminal. It is a single binary (musl static builds are the intended distribution form), uses blocking I/O and threads, and is built for resource-constrained Linux boxes. You talk to it in a REPL; it streams answers from an OpenAI Chat Completions–compatible provider (DeepSeek by default), with OpenAI Responses support available by configuration, and can run shell commands through a `bash` tool gated by an allowlist plus an explicit confirmation.
+`rho` is a small local agent that lives in your terminal. It is a single binary (musl static builds are the intended distribution form), uses blocking I/O and threads, and is built for resource-constrained Linux boxes. You talk to it in a REPL; it streams answers from an OpenAI Chat Completions–compatible provider (DeepSeek by default), with OpenAI Responses support available by configuration, and can run shell commands through a `bash` tool.
 
 ## Vision
 
@@ -18,7 +18,7 @@ Implementation: [docs/architecture.md](docs/architecture.md).
 - **Config-driven providers** — providers, models and thinking levels are declared as data. `openai_chat` and `openai_responses` are both supported; switching protocol is configuration only.
 - **Streaming with visible reasoning** — text streams as it arrives; `reasoning_content` is rendered dimmed and stays local unless the provider sets `compat.echo_reasoning = true`.
 - **One tool: `bash`** — executed in the foreground as `bash -c <command>`, with a fresh shell per call and a per-call timeout that escalates to a process-group kill.
-- **Predictable Ctrl-C** — first Ctrl-C cancels the current stream/tool/confirmation and returns you to the prompt (cancellation takes effect between chunks; if the connection stalls, the background reader ends once the next data arrives or the idle timeout hits), second one exits; at the idle prompt two empty-line Ctrl-C within two seconds exit (the first shows a gray hint). The conversation history is always left in a protocol-valid state.
+- **Predictable Ctrl-C** — first Ctrl-C cancels the current stream/tool and returns you to the prompt (cancellation takes effect between chunks; if the connection stalls, the background reader ends once the next data arrives or the idle timeout hits), second one exits; at the idle prompt two empty-line Ctrl-C within two seconds exit (the first shows a gray hint). The conversation history is always left in a protocol-valid state.
 - **Tab completion** — slash command names and the arguments of `/model`, `/provider` and `/thinking` complete from the current session state; candidates refresh after a provider or model switch.
 - **Strict config validation** — unknown fields, dangling references and missing required fields fail loudly with the config path (TOML syntax errors also include a line number), exit code 2.
 
@@ -73,12 +73,11 @@ rho> check disk usage under /var/log
 ...
 ```
 
-Pick a non-default provider, model or thinking level, or skip confirmations:
+Pick a non-default provider, model or thinking level:
 
 ```sh
 rho --config ./rho.toml --model deepseek/deepseek-v4-pro --thinking low
 rho --init           # write the default config to ~/.config/rho/config.toml
-rho --yes            # auto-approve every `bash` call
 ```
 
 ### CLI
@@ -89,7 +88,6 @@ rho --yes            # auto-approve every `bash` call
 | `--provider <id>` | Initial provider (overrides config default). |
 | `--model <id>` | Initial model (must be `provider/model`, overrides config default). |
 | `--thinking <level>` | Initial thinking level (must exist for the chosen model). |
-| `--yes` | Skip all `bash` confirmations. |
 | `--init` | Write the built-in config to the `--config` path or the default path; refuses to overwrite an existing file. |
 | `--version`, `-V` | Print the rho version and exit. |
 
@@ -142,7 +140,6 @@ high = { thinking = { type = "enabled" }, reasoning_effort = "high" }
 max  = { thinking = { type = "enabled" }, reasoning_effort = "max" }
 
 [tools.bash]
-allow            = ["ls", "cat /var/log", "systemctl status"]  # empty = confirm everything
 timeout_seconds  = 120
 max_output_bytes = 16384
 ```
@@ -160,16 +157,11 @@ Rules worth knowing:
 
 `rho` runs `bash -c <command>` in the foreground. Each call starts a fresh shell, so `cwd` and environment changes stay inside that call. Background processes started by a command keep running; chain `cd` and the command in one line if you need both.
 
-A command runs without asking only when **both** hold:
+Every command the model emits runs immediately.
 
-1. It is exactly an `allow` entry, or starts with one immediately followed by a space; and
-2. it contains none of these shell metacharacters: `;` `&` `|` `<` `>` `$`, a backtick, or a newline.
+> **Safety boundary.** `rho` executes whatever the model emits; the host's user permissions are the only security boundary. Child processes inherit the full environment, so the model can read `DEEPSEEK_API_KEY` via `env`. Run `rho` as a user you are willing to have execute commands, and use it only on hosts you trust it to read.
 
-Everything else prompts with the working directory and the full command, defaulting to **N**; a rejection is fed back to the model as a tool result. `--yes` skips all prompts.
-
-> **Safety boundary.** The allowlist matches strings and acts as a convenience gate; the host's user permissions remain the real security boundary. Child processes inherit the full environment, so the model can read `DEEPSEEK_API_KEY` via `env`. Run `rho` as a user you are willing to have execute commands, and use it only on hosts you trust it to read.
-
-Other limits: at most `max_tool_steps` model-initiated tool calls per turn (default 25, counting rejected/failed calls too); stdout and stderr are each capped at `max_output_bytes` with the head and tail kept and the omitted byte count marked; a timeout kills the whole process group (SIGTERM, then SIGKILL after 2s). Each request sends the model's `max_output` as the upstream output token limit. SSE lines are capped at 1 MiB and a single response body at 32 MiB; exceeding either ends the turn with an error. HTTP errors are reported directly. History is sent as-is; when a conversation exceeds the model window, the upstream request fails and you need `/clear`.
+Other limits: at most `max_tool_steps` model-initiated tool calls per turn (default 25, counting failed calls too); stdout and stderr are each capped at `max_output_bytes` with the head and tail kept and the omitted byte count marked; a timeout kills the whole process group (SIGTERM, then SIGKILL after 2s). Each request sends the model's `max_output` as the upstream output token limit. SSE lines are capped at 1 MiB and a single response body at 32 MiB; exceeding either ends the turn with an error. HTTP errors are reported directly. History is sent as-is; when a conversation exceeds the model window, the upstream request fails and you need `/clear`.
 
 ## Testing
 

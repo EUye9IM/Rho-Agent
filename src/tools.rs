@@ -1,5 +1,4 @@
-//! bash 工具执行：进程组 spawn、超时升级、双 drain 管道、两段截断、
-//! allowlist + 元字符判定。
+//! bash 工具执行：进程组 spawn、超时升级、双 drain 管道、两段截断。
 
 use crate::config::BashToolConfig;
 use crate::term::{self, Cancel, SignalState};
@@ -37,23 +36,6 @@ pub enum BashEnd {
     /// quit 已请求：工具等待循环只终止进程组，把 quit 上报 agent loop，
     /// 不自行退出
     QuitRequested,
-}
-
-/// allowlist + 元字符判定：命令与规则完全相同，或前缀后紧接空格；
-/// 且不含 `; & | < > $`、反引号、换行。规则前后空白在比较时忽略。
-pub fn allowed(command: &str, allow: &[String]) -> bool {
-    const META: &[char] = &[';', '&', '|', '<', '>', '$', '`', '\n', '\r'];
-    if command.chars().any(|c| META.contains(&c)) {
-        return false;
-    }
-    allow.iter().any(|rule| {
-        let rule = rule.trim();
-        !rule.is_empty()
-            && (command == rule
-                || command
-                    .strip_prefix(rule)
-                    .is_some_and(|rest| rest.starts_with(' ')))
-    })
 }
 
 /// 执行 `bash -c <command>`（前台，工作目录恒为会话 cwd = 进程启动目录）。
@@ -441,33 +423,6 @@ mod tests {
         let mut buf = TruncBuf::new(limit);
         buf.push(bytes);
         buf.finish().render()
-    }
-
-    #[test]
-    fn allowlist_exact_match() {
-        assert!(allowed("ls", &["ls".into()]));
-    }
-
-    #[test]
-    fn allowlist_prefix_with_space() {
-        assert!(allowed("ls -la", &["ls".into()]));
-        // 前缀后无空格边界：lsof 不被 ls 放行
-        assert!(!allowed("lsof", &["ls".into()]));
-    }
-
-    #[test]
-    fn allowlist_rule_whitespace_is_ignored() {
-        assert!(allowed("ls", &["  ls  ".into()]));
-        assert!(allowed("ls -la", &[" ls ".into()]));
-        assert!(!allowed("lsof", &[" ls ".into()]));
-        assert!(!allowed("ls", &["   ".into()]));
-    }
-
-    #[test]
-    fn metachar_rejected() {
-        assert!(!allowed("ls; rm -rf /", &["ls".into()]));
-        assert!(!allowed("ls | cat", &["ls".into()]));
-        assert!(!allowed("ls\nrm", &["ls".into()]));
     }
 
     #[test]

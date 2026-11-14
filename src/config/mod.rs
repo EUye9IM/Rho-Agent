@@ -104,8 +104,6 @@ pub struct ToolsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BashToolConfig {
-    #[serde(default)]
-    pub allow: Vec<String>,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
     #[serde(default = "default_max_output")]
@@ -123,7 +121,6 @@ fn default_max_output() -> usize {
 impl Default for BashToolConfig {
     fn default() -> Self {
         Self {
-            allow: Vec::new(),
             timeout_seconds: default_timeout(),
             max_output_bytes: default_max_output(),
         }
@@ -464,6 +461,13 @@ mod tests {
         let err = load_str(&bad, "t").unwrap_err();
         assert!(err.contains("dns.1"), "error was {err}");
         assert!(err.contains("IP 字面量"), "error was {err}");
+    }
+
+    #[test]
+    fn allowlist_config_is_rejected() {
+        let src = format!("{BUILTIN_TOML}\nallow = []\n");
+        let err = load_str(&src, "t").unwrap_err();
+        assert!(err.contains("allow"), "error was {err}");
     }
 
     #[test]

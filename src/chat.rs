@@ -6,7 +6,7 @@ use crate::provider::{self, ProviderAdapter, StreamEvent};
 use crate::render::RenderEvent;
 use crate::term::{Cancel, SignalState};
 use crate::tools::{self, BashEnd, BashOutput};
-use crate::ui::{ConfirmOutcome, Ui};
+use crate::ui::Ui;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,7 +100,6 @@ pub struct Session {
     pub adapter: Arc<dyn ProviderAdapter>,
     pub launcher: Arc<dyn StreamLauncher>,
     pub tool_runner: Arc<dyn ToolRunner>,
-    pub yes: bool,
     /// 只由 agent loop 写入；对外只读，保证 tool_calls 与 Tool 结果的配对不变式。
     history: Vec<Msg>,
 }
@@ -157,12 +156,7 @@ enum ToolPhase {
 impl Session {
     /// thinking 已在 main 层校验并写入 selection.thinking（resolve_thinking，非法 exit 2）。
     /// history 以 cfg.system_prompt 播种（Msg::System；省略则不含 system 消息）。
-    pub fn new(
-        cfg: Config,
-        selection: Selection,
-        adapter: Arc<dyn ProviderAdapter>,
-        yes: bool,
-    ) -> Self {
+    pub fn new(cfg: Config, selection: Selection, adapter: Arc<dyn ProviderAdapter>) -> Self {
         let history = system_history(cfg.system_prompt.as_deref());
         Self {
             cfg,
@@ -170,7 +164,6 @@ impl Session {
             adapter,
             launcher: Arc::new(WorkerLauncher),
             tool_runner: Arc::new(BashRunner),
-            yes,
             history,
         }
     }
@@ -389,7 +382,6 @@ impl Session {
                 cancel,
                 &*self.tool_runner,
                 &self.cfg.tools.bash,
-                self.yes,
                 &tool_calls[i],
             );
             // 单一出口：渲染结果、写入历史、计数（含取消/退出路径的当前调用）。
@@ -528,22 +520,11 @@ fn tool_outcome(content: String) -> CallOutcome {
     }
 }
 
-/// 确认流：allowlist 自动放行；否则向用户确认（--yes 跳过全部确认）。
-/// 判定留在 agent loop，工具执行层只负责 allowed / run_bash。
-fn gate(ui: &mut dyn Ui, yes: bool, cwd: &str, command: &str, allow: &[String]) -> ConfirmOutcome {
-    if tools::allowed(command, allow) || yes {
-        ConfirmOutcome::Yes
-    } else {
-        ui.confirm(cwd, command)
-    }
-}
-
 fn dispatch_tool_call(
     ui: &mut dyn Ui,
     cancel: &Cancel,
     tool_runner: &dyn ToolRunner,
     bash_cfg: &crate::config::BashToolConfig,
-    yes: bool,
     call: &ToolCall,
 ) -> CallOutcome {
     if call.name != "bash" {
@@ -568,31 +549,21 @@ fn dispatch_tool_call(
 
     emit(ui, RenderEvent::ToolCall(command.to_string()));
 
-    let cwd = crate::session_cwd();
-    match gate(ui, yes, &cwd, command, &bash_cfg.allow) {
-        ConfirmOutcome::No => tool_outcome("用户拒绝执行".to_string()),
-        ConfirmOutcome::Cancelled => CallOutcome {
+    // 渲染与执行之间若已收到信号，直接按取消收尾，不再 spawn。
+    if cancel.pending().is_some() {
+        return CallOutcome {
             content: CANCELLED_PLACEHOLDER.to_string(),
             stop: true,
+        };
+    }
+    let out = tool_runner.run(command, bash_cfg, cancel);
+    match out.end {
+        BashEnd::SpawnFailed(_) | BashEnd::ReapFailed(_) => tool_outcome(out.content),
+        BashEnd::Cancelled | BashEnd::QuitRequested => CallOutcome {
+            content: out.content,
+            stop: true,
         },
-        ConfirmOutcome::Yes => {
-            // 确认与执行之间若已收到信号，直接按取消收尾，不再 spawn。
-            if cancel.pending().is_some() {
-                return CallOutcome {
-                    content: CANCELLED_PLACEHOLDER.to_string(),
-                    stop: true,
-                };
-            }
-            let out = tool_runner.run(command, bash_cfg, cancel);
-            match out.end {
-                BashEnd::SpawnFailed(_) | BashEnd::ReapFailed(_) => tool_outcome(out.content),
-                BashEnd::Cancelled | BashEnd::QuitRequested => CallOutcome {
-                    content: out.content,
-                    stop: true,
-                },
-                BashEnd::TimedOut | BashEnd::Exited(_) => tool_outcome(out.content),
-            }
-        }
+        BashEnd::TimedOut | BashEnd::Exited(_) => tool_outcome(out.content),
     }
 }
 
