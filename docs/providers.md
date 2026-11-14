@@ -25,13 +25,14 @@ rho 通过 `protocol` 声明协议族：`openai_chat`（Chat Completions，`/cha
 | 字段 | 取值 |
 |---|---|
 | `model` | `Model.api_model`，未设置时取模型 id 中第一个 `/` 之后的部分 |
-| `messages` | 历史原样映射：`system` / `user` / `assistant` / `tool`；assistant 的 `content` 在纯工具调用时为 `null`，`tool_calls` 用 `id` + `type: "function"` |
+| `messages` | 历史原样映射：`system` / `user` / `assistant` / `tool`；assistant 的 `content` 在纯工具调用时为 `null`，`tool_calls` 用 `id` + `type: "function"`；`Msg::Summary`（`/compact` 的检查点）映射为 `system` |
 | `stream` | 恒为 `true` |
 | `tools` | 内置四个工具的 `ToolSpec` 映射为 `function` 数组，每个请求都带 |
 | `max_completion_tokens` | `Model.max_output`；`compat.legacy_max_tokens = true` 时改用 `max_tokens` |
 | `stream_options.include_usage` | `compat.stream_usage = true`（默认）时发送 |
 | thinking 片段 | 当前档位对应的 JSON 对象浅合并到顶层（如 `thinking` / `reasoning_effort`） |
 | `reasoning_content`（assistant 消息内） | `compat.echo_reasoning = true` 且该轮有思考内容时写入 |
+| 压缩请求（`/compact`） | 与普通回合同形：历史前缀的副本 + 末尾一条 `compact.prompt`（`user`），`tools` 照旧，thinking 片段不发送 |
 
 ## 与 OpenAI 标准的差异
 

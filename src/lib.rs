@@ -9,6 +9,7 @@ pub mod chat;
 pub mod commands;
 pub mod completion;
 pub mod config;
+pub mod context;
 pub mod message;
 pub mod provider;
 pub mod render;

@@ -109,6 +109,30 @@ fn slash_commands_then_exit() {
 }
 
 #[test]
+fn compact_without_enough_history_reports_error() {
+    let mut ui = ScriptedUi::new(vec![
+        ReadOutcome::Line("/compact".into()),
+        ReadOutcome::Line("/compact extra".into()),
+        ReadOutcome::Line("/exit".into()),
+    ]);
+    let cancel = Cancel::new();
+    repl::run(&mut ui, session(), &cancel).unwrap();
+    assert!(ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, RenderEvent::Error(t) if t.contains("历史不足以压缩"))));
+    assert!(ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, RenderEvent::Error(t) if t.contains("用法：/compact"))));
+    // 命令不产生回合状态栏。
+    assert!(!ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, RenderEvent::Status(_))));
+}
+
+#[test]
 fn leading_space_sends_the_line_as_input() {
     // 命令的 `/` 必须紧贴行首：前导空白让本行按普通输入进一个回合。
     let mut ui = ScriptedUi::new(vec![
@@ -152,6 +176,7 @@ fn help_and_model_list_follow_current_provider() {
     assert!(text.contains("/thinking"));
     // 用量只在回合结束的状态栏展示，不是命令。
     assert!(!text.contains("/usage"));
+    assert!(text.contains("/compact"));
     // /model 只列当前 provider 的模型。
     assert!(text.contains("mock/m"));
     assert!(text.contains("mock/n"));

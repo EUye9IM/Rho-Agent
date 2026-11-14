@@ -42,6 +42,8 @@ src/
   message.rs     与协议解耦的消息模型 Msg / AssistantMsg / ToolCall（chat 与 provider 共用）
   commands.rs    斜杠命令元数据、解析、执行与补全候选；
                  执行只修改 Session 并返回 CommandEffect，输出由 repl 交给 Ui
+  context.rs     上下文压缩的纯函数：切点规划（保留最近 N 轮）、
+                 压缩请求的预算裁剪、token 粗估、内置摘要指令常量
   completion.rs  补全协议：CompletionProvider trait、Candidate / Completion；
                  不依赖终端、命令或 Session
   chat.rs        会话历史（Vec<Msg>，对外只读）、通用工具循环与批次编排；
@@ -93,6 +95,7 @@ src/
 // message.rs — 内部消息模型（与协议解耦，适配层负责映射）
 enum Msg {
     System(String),
+    Summary(String),                      // /compact 产出的检查点，位于 system 之后
     User(String),
     Assistant(AssistantMsg),   // 载荷见下；流终态与历史共用同一类型
     Tool { tool_call_id: String, content: String },
@@ -228,8 +231,9 @@ loop {
 - **提交资格（worker 侧）**：`finish_reason` 为 `stop`/`tool_calls`/空才发 `Final`；`length`/`content_filter` 等截断原因在 worker 内直接发 `Error`，被截断的 tool_calls 丢弃。主线程收到 `Final` 才提交，收到 `Error`（含通道断开）就按错误收尾。
 - **取消在两个粒度检查**：接收循环逐事件检查（含持续有事件时）；工具序列逐个调用前检查。任一处发现取消即按占位规则收尾。终端 I/O 失败（fatal）同样在流收尾与逐个调用前检查：流收尾后发现则不提交 Assistant 直接上抛；批次中途发现则剩余调用补“终端输出失败”占位后上抛；两者均映射 exit 1。
 - **限额逐个前置检查**：每个调用执行前先检查限额；所有模型发起的调用都计数（含参数解析失败/未知工具/工具内部错误），防止错误调用无限循环。
-- **历史即上下文**：历史（`Vec<Msg>`）原样序列化进请求；窗口超限时展示错误并提示 `/clear`。
-- **回合状态栏**：`Session::turn` 拆成薄包装与 `turn_inner`，包装层在本回合结束时发一条 `RenderEvent::Status`；fatal 与 `Err(Quit)` 路径不发。用量只是 `turn_inner` 的局部变量（每次成功的请求覆盖），不进会话状态；轮次由 `history` 中 `Msg::User` 的条数派生，`/clear` 后自然归零。斜杠命令不产生状态栏。
+- **历史即上下文**：历史（`Vec<Msg>`）原样序列化进请求；窗口超限时展示错误，用户可 `/compact` 或 `/clear`。
+- **压缩（`/compact`）**：`context::plan` 从 `Msg::User` 边界切开历史——前缀被摘要替换，最近 `compact.keep_turns` 轮原样保留，因此 `Assistant(tool_calls)` 与随后的 `Tool` 消息不会被拆开。请求是前缀的副本 + 末尾一条 `compact.prompt`（没有 `[compact].prompt` 时用 `context::DEFAULT_COMPACT_PROMPT`），`build_body` 与 `tools` 与普通回合一致、thinking 片段传 `None`；副本里的工具结果截到 500 字符、assistant 正文截到 2000 字符，仍超出 `context_window - max_output - 1024` 的估算预算就从最旧一轮整轮丢弃。收流复用 `drive_stream(render = false)`：不渲染正文，仍逐块轮询取消。摘要正文原样使用；成功时 `history.splice` 换成一条 `Msg::Summary`，失败/空回复/取消都不改动历史。压缩不是对话回合，不产生状态栏。
+- **回合状态栏**：`Session::turn` 拆成薄包装与 `turn_inner`，包装层在本回合结束时发一条 `RenderEvent::Status`；fatal 与 `Err(Quit)` 路径不发。用量只是 `turn_inner` 的局部变量（每次成功的请求覆盖），不进会话状态；轮次由 `history` 中 `Msg::User` 的条数派生，`/clear` 后自然归零。斜杠命令（含 `/compact`）不产生状态栏。
 - **usage 采集**：Chat Completions 在 `build_body` 里按 `compat.stream_usage` 发 `stream_options.include_usage`；usage 通常出现在 `choices` 为空的末尾 chunk，因此适配器在判空之前读取，缓存命中取 `prompt_tokens_details.cached_tokens` 或 DeepSeek 的 `prompt_cache_hit_tokens`。Responses 从 `response.completed` 的 `usage.input_tokens_details.cached_tokens` 取。worker 在 `Final` 之前发 `Usage`，主线程只在收到 `Final` 时采纳，保证失败或取消的请求不会污染状态栏。
 - **reasoning 随历史回传由 `compat.echo_reasoning` 决定**：打开时序列化进 assistant 消息，关闭时丢弃（适配层职责）；`CompatConfig` 默认与 OpenAI 标准一致（不回传、发 `max_completion_tokens`、带流式用量），内置 DeepSeek 配置显式打开 `echo_reasoning` 与 `legacy_max_tokens`。
 - **两条退出路径**：REPL 层将 `/exit` 命令、空行 Ctrl-C 双按、`Eof`（Ctrl-D）映射为退出——判定发生在输入阶段（回合之间），直接退出；活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测，先完成剩余调用占位补齐与工具进程清理再退出。

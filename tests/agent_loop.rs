@@ -101,6 +101,49 @@ impl StreamLauncher for ScriptedLauncher {
     }
 }
 
+/// 记录请求体并按脚本返回事件的启动器：压缩测试要检查发给模型的 body 形状。
+#[derive(Clone)]
+struct RecordingLauncher {
+    bodies: Arc<Mutex<Vec<Value>>>,
+    scripts: Arc<Mutex<Vec<Vec<StreamEvent>>>>,
+}
+
+impl RecordingLauncher {
+    fn new(scripts: Vec<Vec<StreamEvent>>) -> Self {
+        Self {
+            bodies: Arc::default(),
+            scripts: Arc::new(Mutex::new(scripts)),
+        }
+    }
+
+    fn bodies(&self) -> Vec<Value> {
+        self.bodies.lock().unwrap().clone()
+    }
+}
+
+impl StreamLauncher for RecordingLauncher {
+    fn launch(
+        &self,
+        _adapter: Arc<dyn ProviderAdapter>,
+        _provider: Provider,
+        body: Value,
+        _headers: Vec<(String, String)>,
+        _cancelled: Arc<AtomicBool>,
+    ) -> Receiver<StreamEvent> {
+        self.bodies.lock().unwrap().push(body);
+        let script = self.scripts.lock().unwrap().remove(0);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for ev in script {
+                if tx.send(ev).is_err() {
+                    return;
+                }
+            }
+        });
+        rx
+    }
+}
+
 /// 时序受控的启动器：等测试注入信号后再发一个 Delta，随后阻塞到取消标志置位。
 /// 用于流式期间取消/退出的确定性触发（不发终态，tx 在主线程放弃接收前不 drop）。
 struct ParkingLauncher {
@@ -648,4 +691,181 @@ fn status_turn_counts_user_inputs_and_resets_on_clear() {
     let mut third = ScriptedUi::new(vec![]);
     session.turn(&mut third, &cancel, "go").unwrap();
     assert_eq!(last_status(&third).turn, 1);
+}
+
+/// 自定义顶层配置的会话（压缩参数覆盖用）。
+fn session_with(top_extra: &str) -> Session {
+    let toml = format!(
+        r#"
+{top_extra}
+
+[providers.mock]
+protocol = "openai_chat"
+base_url = "http://127.0.0.1:1"
+
+[models."mock/m"]
+context_window = 1000
+max_output = 100
+"#
+    );
+    let cfg = config::load_str(&toml, "<测试配置>").unwrap();
+    let selection = config::resolve_selection(&cfg, None, None).unwrap();
+    let adapter = provider::adapter_for(&selection.provider).unwrap();
+    Session::new(cfg, selection, adapter)
+}
+
+/// 跑满 n 轮对话，为压缩准备历史。
+fn fill_turns(session: &mut Session, ui: &mut ScriptedUi, cancel: &Cancel, n: usize) {
+    for i in 1..=n {
+        session.turn(ui, cancel, &format!("u{i}")).unwrap();
+    }
+}
+
+#[test]
+fn compact_replaces_older_turns_with_a_summary() {
+    let launcher = RecordingLauncher::new(vec![
+        vec![text_final("a1")],
+        vec![text_final("a2")],
+        vec![text_final("a3")],
+        vec![text_final("CHECKPOINT")],
+    ]);
+    let mut session = session();
+    session.launcher = Arc::new(launcher.clone());
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(vec![]);
+    fill_turns(&mut session, &mut ui, &cancel, 3);
+    ui.rendered.clear();
+
+    session.compact(&mut ui, &cancel).unwrap();
+
+    // 请求体：被压掉的那一轮原文 + 末尾一条指令，tools 与普通回合同形。
+    let bodies = launcher.bodies();
+    let body = &bodies[3];
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["content"], "u1");
+    assert_eq!(messages[1]["content"], "a1");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"], rho::context::DEFAULT_COMPACT_PROMPT);
+    assert_eq!(body["tools"].as_array().unwrap().len(), 4);
+    // thinking 片段不发送。
+    assert!(body.get("reasoning_effort").is_none());
+    assert!(body.get("thinking").is_none());
+
+    // 历史：摘要 + 保留的两轮。
+    let history = session.history();
+    assert!(matches!(&history[0], Msg::Summary(s) if s == "CHECKPOINT"));
+    assert!(matches!(&history[1], Msg::User(u) if u == "u2"));
+    assert_eq!(history.len(), 5);
+
+    // 一行结果，且不产生状态栏（压缩不是对话回合）。
+    assert!(ui.rendered.iter().any(
+        |e| matches!(e, rho::render::RenderEvent::TextDelta(t) if t.contains("已压缩 2 条消息"))
+    ));
+    assert!(!ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, rho::render::RenderEvent::Status(_))));
+}
+
+#[test]
+fn compact_uses_configured_prompt_and_keep_turns() {
+    let launcher = RecordingLauncher::new(vec![
+        vec![text_final("a1")],
+        vec![text_final("a2")],
+        vec![text_final("CHECKPOINT")],
+    ]);
+    let mut session = session_with("[compact]\nprompt = \"SUM\"\nkeep_turns = 1");
+    session.launcher = Arc::new(launcher.clone());
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(vec![]);
+    fill_turns(&mut session, &mut ui, &cancel, 2);
+
+    session.compact(&mut ui, &cancel).unwrap();
+
+    let bodies = launcher.bodies();
+    let messages = bodies[2]["messages"].as_array().unwrap();
+    assert_eq!(messages.last().unwrap()["content"], "SUM");
+    // keep_turns = 1：只留最后一轮。
+    let history = session.history();
+    assert!(matches!(&history[0], Msg::Summary(s) if s == "CHECKPOINT"));
+    assert!(matches!(&history[1], Msg::User(u) if u == "u2"));
+    assert_eq!(history.len(), 3);
+}
+
+#[test]
+fn compact_without_enough_turns_reports_and_sends_nothing() {
+    let launcher = RecordingLauncher::new(vec![vec![text_final("a1")]]);
+    let mut session = session();
+    session.launcher = Arc::new(launcher.clone());
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(vec![]);
+    fill_turns(&mut session, &mut ui, &cancel, 1);
+    ui.rendered.clear();
+
+    session.compact(&mut ui, &cancel).unwrap();
+
+    assert_eq!(launcher.bodies().len(), 1);
+    assert!(ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, rho::render::RenderEvent::Error(t) if t.contains("历史不足以压缩"))));
+}
+
+#[test]
+fn compact_failure_leaves_history_unchanged() {
+    let launcher = RecordingLauncher::new(vec![
+        vec![text_final("a1")],
+        vec![text_final("a2")],
+        vec![text_final("a3")],
+        vec![StreamEvent::Error("上游 400".into())],
+    ]);
+    let mut session = session();
+    session.launcher = Arc::new(launcher.clone());
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(vec![]);
+    fill_turns(&mut session, &mut ui, &cancel, 3);
+    let before = session.history().len();
+    ui.rendered.clear();
+
+    session.compact(&mut ui, &cancel).unwrap();
+
+    assert_eq!(session.history().len(), before);
+    assert!(session
+        .history()
+        .iter()
+        .all(|m| !matches!(m, Msg::Summary(_))));
+    assert!(ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, rho::render::RenderEvent::Error(t) if t.contains("上游 400"))));
+}
+
+#[test]
+fn compact_with_empty_reply_keeps_history() {
+    let launcher = RecordingLauncher::new(vec![
+        vec![text_final("a1")],
+        vec![text_final("a2")],
+        vec![text_final("a3")],
+        vec![StreamEvent::Final(Box::new(AssistantMsg {
+            text: None,
+            reasoning: Some("只有思维链".into()),
+            tool_calls: vec![],
+        }))],
+    ]);
+    let mut session = session();
+    session.launcher = Arc::new(launcher.clone());
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(vec![]);
+    fill_turns(&mut session, &mut ui, &cancel, 3);
+    let before = session.history().len();
+    ui.rendered.clear();
+
+    session.compact(&mut ui, &cancel).unwrap();
+
+    assert_eq!(session.history().len(), before);
+    assert!(ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, rho::render::RenderEvent::Error(t) if t.contains("返回空内容"))));
 }

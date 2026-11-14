@@ -12,6 +12,7 @@ enum Command {
     Model,
     Provider,
     Thinking,
+    Compact,
     Clear,
     Exit,
 }
@@ -43,6 +44,12 @@ const COMMANDS: &[CommandSpec] = &[
         description: "切换或列出思考档位",
     },
     CommandSpec {
+        command: Command::Compact,
+        name: "/compact",
+        usage: "/compact",
+        description: "把较早的对话压缩成摘要",
+    },
+    CommandSpec {
         command: Command::Clear,
         name: "/clear",
         usage: "/clear",
@@ -67,6 +74,8 @@ const COMMANDS: &[CommandSpec] = &[
 pub enum CommandEffect {
     /// 继续 REPL，并展示给定文本。
     Continue(String),
+    /// 压缩历史：需要发起流式请求，由 REPL 交给 `Session::compact`。
+    Compact,
     /// 正常退出。
     Exit,
 }
@@ -88,6 +97,12 @@ pub fn execute(session: &mut Session, line: &str) -> Result<CommandEffect, Strin
         Command::Model => model(session, &arg),
         Command::Provider => provider(session, &arg),
         Command::Thinking => thinking(session, &arg),
+        Command::Compact => {
+            if !arg.is_empty() {
+                return Err("用法：/compact".into());
+            }
+            Ok(CommandEffect::Compact)
+        }
         Command::Clear => {
             session.clear();
             Ok(CommandEffect::Continue("已清空对话历史".into()))

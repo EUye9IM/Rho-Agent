@@ -1019,3 +1019,52 @@ fn reasoning_delta_precedes_text_delta() {
         .unwrap();
     assert!(reasoning < text);
 }
+
+/// `/compact` 走真实 HTTP：请求体是历史前缀 + 指令，改完历史后下一回合带摘要。
+#[test]
+fn compact_rewrites_history_and_next_request_carries_summary() {
+    let server = start_server(vec![
+        text_response("a1"),
+        text_response("a2"),
+        text_response("a3"),
+        text_response("CHECKPOINT"),
+        text_response("done"),
+    ]);
+    let mut session = session_for(server.base_url(), "[compact]\nkeep_turns = 2", "");
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(vec![]);
+
+    for input in ["u1", "u2", "u3"] {
+        session.turn(&mut ui, &cancel, input).unwrap();
+    }
+    session.compact(&mut ui, &cancel).unwrap();
+    assert!(server.wait_served(4, Duration::from_secs(5)));
+
+    // 压缩请求：被压掉的一轮原文 + 末尾指令，tools 仍是四个内置工具。
+    let body: Value = serde_json::from_str(&server.body(3)).unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["content"], "u1");
+    assert_eq!(messages[1]["content"], "a1");
+    assert_eq!(messages[2]["content"], rho::context::DEFAULT_COMPACT_PROMPT);
+    assert_eq!(body["tools"].as_array().unwrap().len(), 4);
+
+    // 历史：一条摘要 + 保留的两轮。
+    assert!(matches!(&session.history()[0], Msg::Summary(s) if s == "CHECKPOINT"));
+    assert_eq!(session.history().len(), 5);
+    assert!(ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, RenderEvent::TextDelta(t) if t.contains("已压缩 2 条消息"))));
+
+    // 下一回合的请求体：摘要作为第一条 system 消息，早期内容不再发送。
+    session.turn(&mut ui, &cancel, "u4").unwrap();
+    assert!(server.wait_served(5, Duration::from_secs(5)));
+    let body: Value = serde_json::from_str(&server.body(4)).unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], "CHECKPOINT");
+    assert!(messages
+        .iter()
+        .all(|m| m["content"] != Value::String("u1".into())));
+}

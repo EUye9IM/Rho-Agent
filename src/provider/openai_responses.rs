@@ -39,7 +39,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
 
         for msg in hist {
             match msg {
-                Msg::System(text) => instructions.push(text),
+                Msg::System(text) | Msg::Summary(text) => instructions.push(text),
                 Msg::User(text) => input.push(json!({ "role": "user", "content": text })),
                 Msg::Assistant(a) => {
                     if let Some(text) = &a.text {

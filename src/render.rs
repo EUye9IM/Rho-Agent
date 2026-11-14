@@ -139,7 +139,7 @@ fn used_percent(used: u64, window: u64) -> f64 {
 
 /// 用量压缩：1000 以下原样，之后按 k/M 保留一位小数，整十位时省略小数。
 /// 四舍五入在整数域完成，避免浮点边界（999,950 这类会进到 M）。
-fn compact_tokens(n: u64) -> String {
+pub(crate) fn compact_tokens(n: u64) -> String {
     if n < 1_000 {
         return n.to_string();
     }

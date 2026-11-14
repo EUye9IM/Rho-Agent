@@ -4,6 +4,8 @@
 #[derive(Debug, Clone)]
 pub enum Msg {
     System(String),
+    /// 压缩产生的检查点：位于 system 之后、保留轮之前（适配层映射为 system 消息）。
+    Summary(String),
     User(String),
     /// Assistant 载荷：流终态与历史共用同一类型（见 [`AssistantMsg`]）。
     Assistant(AssistantMsg),

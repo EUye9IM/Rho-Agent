@@ -20,6 +20,7 @@ Implementation: [docs/architecture.md](docs/architecture.md).
 - **Built-in tools** — `bash` runs in the foreground as `bash -c <command>` with a fresh shell, a per-call timeout, and process-group cleanup. `read` returns line-numbered text; `write` creates new files and parent directories; `edit` applies exact, sequential replacements and preserves the file's CRLF/LF style.
 - **Predictable Ctrl-C** — first Ctrl-C cancels the current stream/tool and returns you to the prompt (cancellation takes effect between chunks; if the connection stalls, the background reader ends once the next data arrives or the idle timeout hits), second one exits; at the idle prompt two empty-line Ctrl-C within two seconds exit (the first shows a gray hint). The conversation history is always left in a protocol-valid state.
 - **Tab completion** — slash command names and the arguments of `/model`, `/provider` and `/thinking` complete from the current session state; candidates refresh after a provider or model switch.
+- **Manual context compaction** — `/compact` asks the model for a structured checkpoint of the older turns and replaces them with it, keeping the most recent turns verbatim; the instruction is configurable.
 - **Per-turn status line** — each turn ends with one dim line showing the turn number, model, thinking level, prompt-cache hit rate and context usage.
 - **Strict config validation** — unknown fields, dangling references and missing required fields fail loudly with the config path (TOML syntax errors also include a line number), exit code 2.
 
@@ -107,6 +108,7 @@ Config source priority: `--config <path>` > the default path `$XDG_CONFIG_HOME/r
 | `/model [id]` | Switch model, or list models of the current provider with the active one marked. |
 | `/provider [id]` | Switch provider, or list providers (unavailable ones are annotated with the missing variables). |
 | `/thinking [level]` | Switch thinking level, or list levels for the current model. Omitted from `/help` when the model declares none. |
+| `/compact` | Replace the older turns with a checkpoint summary; the most recent `compact.keep_turns` turns stay verbatim. |
 | `/clear` | Reset history to the configured `system_prompt` (or empty if none). |
 | `/help` | Show help. |
 | `/exit` | Quit (Ctrl-D also exits; at the prompt press Ctrl-C twice within two seconds — the first shows a gray hint). |
@@ -144,6 +146,10 @@ system_prompt    = "You are rho, a lightweight local ops assistant."  # omit to 
 max_tool_steps   = 100
 dns              = ["https://223.5.5.5/dns-query"]  # optional: preferred DoH resolver
 
+[compact]
+keep_turns = 2                                   # verbatim turns kept when /compact runs
+# prompt = "..."                                 # checkpoint instruction; the built-in one is used when omitted
+
 [providers.deepseek]
 protocol = "openai_chat"                        # openai_chat or openai_responses
 base_url = "https://api.deepseek.com"
@@ -178,6 +184,7 @@ Rules worth knowing:
 - `${VAR}` in auth headers is expanded per provider. A missing variable marks that provider unavailable; other providers keep working, unless that provider was explicitly requested.
 - `compat` holds wire-format differences from the OpenAI standard, per provider: `legacy_max_tokens` sends the old `max_tokens` field instead of `max_completion_tokens`, `echo_reasoning` sends `reasoning_content` back with history (OpenAI reasoning models return no chain-of-thought and have no such field), `stream_usage` requests `stream_options.include_usage` so the status line has usage data. Omitting the section means OpenAI-standard behavior; the built-in DeepSeek config enables the first two.
 - Thinking levels are JSON object fragments merged into the top level of the request body. Level names are yours to choose.
+- `/compact` replaces every turn older than `compact.keep_turns` with one checkpoint message, produced by a request shaped like a normal turn: a copy of that history slice plus `compact.prompt` as the final user message. Tool results and assistant text are trimmed in that copy so the request fits the window; the history itself changes only when a summary comes back. A failed, empty or cancelled compaction leaves the history untouched.
 - `dns` lists optional DoH endpoints used first, in order; the system resolver takes over only when every endpoint fails. The endpoint host must be an IP literal (`https://223.5.5.5/dns-query`; IPv6 uses `https://[2400:3200::1]/dns-query`). Answers are cached for their TTL. Android/Termux has no `/etc/resolv.conf`, so musl static builds rely on this entry to resolve names.
 - Validation is strict: unknown fields, dangling references and missing required fields abort startup with exit code 2 and the config path; TOML syntax errors also include a line number.
 

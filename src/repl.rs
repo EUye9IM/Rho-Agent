@@ -60,7 +60,7 @@ pub fn run(ui: &mut dyn Ui, mut session: Session, cancel: &Cancel) -> Result<(),
                 // 命令的 `/` 必须紧贴行首：行首留空白就让整行按普通输入发送，
                 // 这样 `/home/x` 这类路径可以直接交给模型。
                 if line.starts_with('/') {
-                    let result = handle_command(ui, &mut session, trimmed);
+                    let result = handle_command(ui, &mut session, cancel, trimmed)?;
                     check_fatal(ui)?;
                     if cancel.is_quit() {
                         return Err(ReplExit::Quit);
@@ -105,16 +105,26 @@ fn within_window(armed: Instant, now: Instant) -> bool {
 }
 
 /// 斜杠命令处理：解析与执行委托给 `commands`，这里只负责把结果转成 UI 输出。
-fn handle_command(ui: &mut dyn Ui, session: &mut Session, line: &str) -> CommandResult {
+/// 需要流式请求的命令（`/compact`）交给 `Session`，输出由 Session 自己渲染。
+fn handle_command(
+    ui: &mut dyn Ui,
+    session: &mut Session,
+    cancel: &Cancel,
+    line: &str,
+) -> Result<CommandResult, ReplExit> {
     match commands::execute(session, line) {
-        Ok(CommandEffect::Exit) => CommandResult::Exit,
+        Ok(CommandEffect::Exit) => Ok(CommandResult::Exit),
         Ok(CommandEffect::Continue(message)) => {
             text(ui, &message);
-            CommandResult::Continue
+            Ok(CommandResult::Continue)
+        }
+        Ok(CommandEffect::Compact) => {
+            session.compact(ui, cancel).map_err(|_| ReplExit::Quit)?;
+            Ok(CommandResult::Continue)
         }
         Err(e) => {
             emit_error(ui, e);
-            CommandResult::Continue
+            Ok(CommandResult::Continue)
         }
     }
 }

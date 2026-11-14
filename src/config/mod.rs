@@ -50,6 +50,21 @@ pub struct Config {
     /// DoH 端点：配置后按声明顺序优先解析，全部失败才回退系统解析器。
     #[serde(default)]
     pub dns: Vec<String>,
+    #[serde(default)]
+    pub compact: CompactConfig,
+}
+
+/// 上下文压缩（`/compact`）的参数。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactConfig {
+    /// 压缩指令：作为压缩请求的最后一条 user 消息。
+    /// 省略时用内置文案（`context::DEFAULT_COMPACT_PROMPT`）。
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// 压缩时原样保留的最近轮数；省略时用 2。
+    #[serde(default)]
+    pub keep_turns: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

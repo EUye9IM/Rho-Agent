@@ -20,6 +20,7 @@ rho 要做一个运行在资源受限 Linux 设备上的本地 agent：单二进
 - **内置工具** —— `bash` 前台执行 `bash -c <命令>`，每次调用启动新的 shell，支持单次超时并按进程组逐级终止；`read` 返回带行号的文本；`write` 新建文件和父目录；`edit` 按顺序做精确替换，并保留文件的 CRLF/LF 风格。
 - **可预测的 Ctrl-C** —— 第一次取消当前流式/工具，立即回到提示符（取消标志在逐块之间轮询生效；连接停滞无数据时，后台读取在下一块数据到达或空闲超时后结束），第二次退出；空闲提示符下两次空行 Ctrl-C（2 秒内）同样退出，第一次会在输入行尾显示灰色提示。对话历史在任何时刻都保持协议合法（工具调用必有对应结果）。
 - **Tab 补全** —— 补全斜杠命令名以及 `/model`、`/provider`、`/thinking` 的参数，候选来自当前会话状态；切换供应商或模型后自动刷新。
+- **手动压缩上下文** —— `/compact` 让模型对较早的轮次产出结构化检查点并替换掉它们，最近几轮保持原文；指令文案可配置。
 - **回合状态栏** —— 每个对话回合结束打一行暗淡状态栏：轮次、模型、思考档位、缓存命中率与上下文占用。
 - **严格配置校验** —— 未知字段、悬空引用、缺失必填字段一律硬报错并给出配置路径（TOML 语法错误另带行号），退出码 2。
 
@@ -106,6 +107,7 @@ rho --init           # 生成默认配置文件到 ~/.config/rho/config.toml
 | `/model [id]` | 切换模型；不带参数时列出当前供应商的模型并标注当前值。 |
 | `/provider [id]` | 切换供应商；不带参数时列出全部供应商（不可用者标注缺失变量）。 |
 | `/thinking [level]` | 切换思考档位；模型未声明档位时从 `/help` 中省略该命令。 |
+| `/compact` | 把较早的轮次换成一条检查点摘要，最近 `compact.keep_turns` 轮保持原文。 |
 | `/clear` | 重置为配置的 `system_prompt`（未配置则为空）。 |
 | `/help` | 显示帮助。 |
 | `/exit` | 退出（Ctrl-D 同样正常退出；提示符下 2 秒内连按两次空行 Ctrl-C 也退出，第一次会显示灰色提示）。 |
@@ -143,6 +145,10 @@ system_prompt    = "你是 rho，一个轻量本地运维助手。"  # 省略则
 max_tool_steps   = 100
 dns              = ["https://223.5.5.5/dns-query"]  # 可选：优先使用的 DoH 解析器
 
+[compact]
+keep_turns = 2                                   # /compact 时原样保留的最近轮数
+# prompt = "..."                                 # 检查点指令；省略则用内置文案
+
 [providers.deepseek]
 protocol = "openai_chat"                        # openai_chat 或 openai_responses
 base_url = "https://api.deepseek.com"
@@ -177,6 +183,7 @@ max  = { thinking = { type = "enabled" }, reasoning_effort = "max" }
 - 认证 header 中的 `${VAR}` 在选择供应商时逐个展开：变量缺失只让该供应商不可用，不影响其他供应商——除非该供应商是被显式指定的。
 - 思考档位的值是 JSON 对象片段，请求时顶层合并进 body；档位名由配置自定义。
 - `compat` 按供应商声明与 OpenAI 标准的差异：`legacy_max_tokens` 用旧字段 `max_tokens` 而不是 `max_completion_tokens`，`echo_reasoning` 把 `reasoning_content` 随历史回传（OpenAI 推理模型不返回思维链，也没这个字段），`stream_usage` 请求 `stream_options.include_usage` 让状态栏拿到用量。省略整段即 OpenAI 标准行为；内置 DeepSeek 配置打开了前两项。
+- `/compact` 把早于 `compact.keep_turns` 的轮次换成一条检查点消息，请求形状与普通回合同形：真实历史前缀的副本 + 末尾一条 `compact.prompt`。副本里的工具结果与正文会按上限裁剪以保证请求塞得进窗口，历史本身只在摘要成功返回时才改写；失败、空回复或取消都不改动历史。
 - `dns` 是可选的 DoH 端点列表，配置后按声明顺序优先解析，端点全部失败才回退系统解析器；端点主机必须是 IP 字面量（形如 `https://223.5.5.5/dns-query`，IPv6 写成 `https://[2400:3200::1]/dns-query`）。成功结果按应答 TTL 缓存。Android/Termux 没有 `/etc/resolv.conf`，musl 静态构建的域名解析依赖这一项。
 - 校验严格：未知字段、悬空引用、缺失必填字段直接拒绝启动（退出码 2，并给出配置路径；TOML 语法错误另带行号）。
 

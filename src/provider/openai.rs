@@ -37,7 +37,9 @@ impl ProviderAdapter for OpenAiChatAdapter {
         let messages: Vec<Value> = hist
             .iter()
             .map(|m| match m {
-                Msg::System(text) => json!({ "role": "system", "content": text }),
+                Msg::System(text) | Msg::Summary(text) => {
+                    json!({ "role": "system", "content": text })
+                }
                 Msg::User(text) => json!({ "role": "user", "content": text }),
                 Msg::Assistant(a) => {
                     let AssistantMsg {

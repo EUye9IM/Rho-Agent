@@ -96,6 +96,7 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 - `message::Msg` 是协议无关的内部消息模型；Chat Completions 字段映射留在 `provider/openai.rs`，Responses 映射留在 `provider/openai_responses.rs`。
 - 每个工具在 `src/tools/<tool>.rs` 自己维护 schema、`deny_unknown_fields` 参数结构、语义校验和执行；`src/tools/mod.rs` 只保留 Tool trait、通用结果类型和注册表。各 adapter 只负责把 `ToolSpec` 映射成自己的 wire format，不要复制 schema。
 - `ProviderAdapter::parse_chunk` 返回 `ChunkOutcome`；流结束标记与 `finish_reason` 的提交资格判定留在 provider worker。
+- 上下文压缩的纯函数在 `context.rs`（切点、预算裁剪、token 粗估、内置摘要指令）；`chat::Session::compact` 负责发请求与改写历史。切点只落在 `Msg::User` 之前，前缀换成一条 `Msg::Summary`，压缩请求复用 `build_body` + `StreamLauncher` 并以 `render = false` 收流；失败、空回复、取消都不改动历史。压缩是手动命令，触发点只有用户输入。
 - 工具循环必须保证历史协议合法：所有 `tool_calls` 都要有对应 `Tool` 消息占位。
 - 取消语义、进程组清理的行为以 `docs/architecture.md` 和现有代码为准，不要简化成“杀直接子进程”或“只 drop 连接”。`chat` 只做注册表查找、JSON object 校验、状态控制和历史配对；参数语义与执行归各工具。
 
@@ -106,6 +107,7 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 - 外部配置**完全替换**内置配置，不合并。
 - 严格校验：未知字段、悬空引用、缺失必填项都报错；语义错误一次收集全部，TOML 语法/反序列化错误按首个报告。
 - `${VAR}` 只用于 header 值展开；缺失变量报错；明文密钥要告警。
+- `[compact]` 是压缩参数：`prompt` 省略时用 `context::DEFAULT_COMPACT_PROMPT`（与内置 TOML 保持一致，有测试护栏），`keep_turns` 省略时为 2；两字段都参与严格校验。
 - 退出码：`0` 正常退出，`1` REPL 内部错误，`2` 参数/配置/供应商不可用等用法错误。
 - 不做隐式供应商分支；`protocol` 显式选择 `openai_chat` / `openai_responses`，同协议族新供应商只加配置，新增协议族才改 adapter。
 
@@ -116,6 +118,7 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 - 纯单元：`sse.rs`、`config`、`tools` 参数校验/截断/文件边界、`render`、`commands` 补全候选
 - 协议映射：`provider::openai`（Chat Completions）与 `provider::openai_responses`（Responses）
 - agent loop + 工具：`ScriptedUi` + `StreamLauncher` / `Session.tools` 注册表注入
+- 上下文压缩：`context` 纯函数（切点、预算裁剪、估算）单测；`Session::compact` 用 `RecordingLauncher` 断言请求体与历史改写
 - HTTP/SSE：`tests/e2e_mock.rs` 的本地 mock 服务
 - REPL：`tests/repl_flow.rs`
 

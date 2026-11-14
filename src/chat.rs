@@ -1,6 +1,7 @@
 //! 内部消息模型与 agent 工具循环：历史、流接收、工具批次执行。
 
 use crate::config::{self, Config, Provider, Selection};
+use crate::context;
 pub use crate::message::{AssistantMsg, Msg, TokenUsage, ToolCall};
 use crate::provider::{self, ProviderAdapter, StreamEvent};
 use crate::render::{RenderEvent, StatusLine};
@@ -25,6 +26,12 @@ const LIMIT_PLACEHOLDER: &str = "工具调用次数已达上限，未执行";
 const FATAL_PLACEHOLDER: &str = "终端输出失败，未执行";
 /// 流式接收被取消时展示的提示。
 const TURN_CANCELLED_MSG: &str = "已取消本轮响应";
+/// 压缩被取消时展示的提示。
+const COMPACT_CANCELLED_MSG: &str = "已取消压缩";
+/// 没有可压缩的轮次时展示的提示。
+const COMPACT_EMPTY_MSG: &str = "历史不足以压缩（可压缩的轮次不足）";
+/// 摘要请求没有返回正文时展示的提示。
+const COMPACT_EMPTY_RESULT_MSG: &str = "压缩返回空内容，历史未改动";
 
 fn system_history(prompt: Option<&str>) -> Vec<Msg> {
     prompt
@@ -180,6 +187,74 @@ impl Session {
         self.history = system_history(self.cfg.system_prompt.as_deref());
     }
 
+    /// `/compact`：把较早的若干轮换成一条 `Msg::Summary`。
+    ///
+    /// 请求形状与普通回合同形（真实历史前缀的副本 + 末尾一条 user 指令，
+    /// 同样的 tools 与输出上限），只是收流不渲染。摘要正文原样使用、不再裁；
+    /// 失败、空回复与取消都不改动历史。
+    pub fn compact(&mut self, ui: &mut dyn Ui, cancel: &Cancel) -> ChatResult<()> {
+        let keep = self
+            .cfg
+            .compact
+            .keep_turns
+            .unwrap_or(context::DEFAULT_KEEP_TURNS);
+        let Some(plan) = context::plan(
+            &self.history,
+            keep,
+            self.selection.model.context_window,
+            self.selection.model.max_output,
+        ) else {
+            emit(ui, RenderEvent::Error(COMPACT_EMPTY_MSG.into()));
+            return Ok(());
+        };
+        let (start, end, dropped) = (plan.start, plan.end, plan.dropped());
+        let prompt = self
+            .cfg
+            .compact
+            .prompt
+            .as_deref()
+            .unwrap_or(context::DEFAULT_COMPACT_PROMPT);
+
+        let mut head = plan.head;
+        head.push(Msg::User(prompt.to_string()));
+        // thinking 传 None：摘要不需要思维链，省预算也更快。
+        let body = self.adapter.build_body(
+            &head,
+            &self.selection.model,
+            &self.selection.model_id,
+            None,
+            &self.tools.specs(),
+        );
+
+        match self.drive_stream(ui, cancel, body, false, COMPACT_CANCELLED_MSG) {
+            StreamOutcome::Final { msg, usage: _ } => {
+                let Some(summary) = msg
+                    .text
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| !text.is_empty())
+                else {
+                    emit(ui, RenderEvent::Error(COMPACT_EMPTY_RESULT_MSG.into()));
+                    return Ok(());
+                };
+                let before = crate::render::compact_tokens(context::estimate_tokens(
+                    &self.history[start..end],
+                ));
+                let after = crate::render::compact_tokens(context::estimate_text(&summary));
+                self.history.splice(start..end, [Msg::Summary(summary)]);
+                emit(
+                    ui,
+                    RenderEvent::TextDelta(format!(
+                        "已压缩 {dropped} 条消息 → 摘要（约 {before} → {after} tokens）\n"
+                    )),
+                );
+                Ok(())
+            }
+            // 错误与取消已由 drive_stream 渲染。
+            StreamOutcome::Error(_) | StreamOutcome::Cancelled => Ok(()),
+            StreamOutcome::Quit => Err(Quit),
+        }
+    }
+
     fn build_body(&self) -> serde_json::Value {
         let thinking = self
             .selection
@@ -292,10 +367,22 @@ impl Session {
         }
     }
 
-    /// 发起一次流式请求并接收事件：渲染增量、逐块取消判定都在这里。
-    /// 契约：worker 必经 Final 或 Error 收尾；收到终态或取消后返回。
     fn receive_stream(&self, ui: &mut dyn Ui, cancel: &Cancel) -> StreamOutcome {
-        let body = self.build_body();
+        self.drive_stream(ui, cancel, self.build_body(), true, TURN_CANCELLED_MSG)
+    }
+
+    /// 发起一次流式请求并接收事件：渲染增量、逐块取消判定都在这里。
+    /// `render` 为 false 时只收终态与用量（压缩请求不把摘要正文写进屏幕）；
+    /// `cancelled_msg` 是用户取消时展示的提示。
+    /// 契约：worker 必经 Final 或 Error 收尾；收到终态或取消后返回。
+    fn drive_stream(
+        &self,
+        ui: &mut dyn Ui,
+        cancel: &Cancel,
+        body: Value,
+        render: bool,
+        cancelled_msg: &str,
+    ) -> StreamOutcome {
         let provider = self.selection.provider.clone();
         let headers = self.adapter.headers(&provider);
         let adapter = self.adapter.clone();
@@ -317,7 +404,7 @@ impl Session {
                     // 空闲轮询间隙只查信号；无信号继续等。
                     if let Some(sig) = cancel.pending() {
                         handle.abandon();
-                        return signal_outcome(ui, sig, cancel);
+                        return signal_outcome(ui, sig, cancel, cancelled_msg);
                     }
                     continue;
                 }
@@ -330,11 +417,14 @@ impl Session {
             // 持续有事件时也逐块可取消。
             if let Some(sig) = cancel.pending() {
                 handle.abandon();
-                return signal_outcome(ui, sig, cancel);
+                return signal_outcome(ui, sig, cancel, cancelled_msg);
             }
             match ev {
                 StreamEvent::Delta { text, reasoning } => {
                     // 块间过渡（思考→正文的折行与样式收尾）由渲染器负责。
+                    if !render {
+                        continue;
+                    }
                     if let Some(r) = reasoning {
                         emit(ui, RenderEvent::ReasoningDelta(r));
                     }
@@ -632,11 +722,16 @@ fn json_kind(value: &Value) -> &'static str {
 
 /// 信号触发的接收收尾：放弃接收（drop Receiver）后判定方向。
 /// 收尾间隙可能再收到一次 Ctrl-C（cancel 升级为 quit），以最终状态为准。
-fn signal_outcome(ui: &mut dyn Ui, sig: SignalState, cancel: &Cancel) -> StreamOutcome {
+fn signal_outcome(
+    ui: &mut dyn Ui,
+    sig: SignalState,
+    cancel: &Cancel,
+    cancelled_msg: &str,
+) -> StreamOutcome {
     if sig == SignalState::Quit || cancel.is_quit() {
         return StreamOutcome::Quit;
     }
-    emit(ui, RenderEvent::Error(TURN_CANCELLED_MSG.into()));
+    emit(ui, RenderEvent::Error(cancelled_msg.into()));
     StreamOutcome::Cancelled
 }
 
