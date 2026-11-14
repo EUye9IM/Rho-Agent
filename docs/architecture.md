@@ -66,8 +66,9 @@ src/
     read.rs      全文文本校验、行偏移、行号、50k 字符与 2000 行上限
     write.rs     仅新建、自动建父目录、拒绝 NUL、直接写入
     edit.rs      顺序 edits、精确匹配、replace_all、换行归一化、失败相似行提示
-  render.rs      有状态渲染器 Renderer + RenderEvent：思考块暗淡色、正文原样、工具行、
-                 带左边栏的工具结果；返回待写文本，不直接写终端
+  render.rs      有状态渲染器 Renderer + RenderEvent：思考块暗淡色、正文原样、
+                 提示符/输入/工具调用着色、带左边栏的工具结果
+                 （成功绿、失败红、打断黄）；返回待写文本，不直接写终端
                  （颜色固定使用 ANSI 转义，暗色终端下仍可用）
   repl.rs        REPL 循环、Ctrl-C 语义；斜杠命令委托给 commands，输出经 Ui
   term.rs        终端信号处理（SIGINT、进程组信号）
@@ -173,7 +174,7 @@ enum ReadOutcome {
 - **Ui trait 只负责输入和输出**：退出有两条路径——① REPL 层判定（`/exit`、`Eof`、空行 Ctrl-C 双按）发生在回合之间的输入阶段，此时没有进行中的调用，直接退出；② 活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测，按占位规则收尾、完成工具进程清理后以 `ChatResult` 的 `Err(Quit)` 上抛退出。`Quit` 只承载路径 ② 的回合内传播。
 
 - 生产实现 `TermUi`：rustyline 后端。stdin 是否为 TTY 的检查在 `TermUi::new` 里做，`main` 只接收检查结果。`TermUi` 持有 `Renderer` 驱动事件渲染，并在每次 `read_line` 开头（画提示符前）调用 `Renderer::reset` 收尾上一轮可能残留的思考块，避免暗淡色跨到提示符；Ctrl-C 双按退出不再经过 `read_line`，由 `Drop` 再做一次收尾。
-- 双按提示：`ui::helper::ReplHelper` 实现 `Hinter`/`Highlighter`，武装时在空行上返回暗淡色提示（`render::dim`），由下一次 `readline` 的重绘显示；`CTRL_C_WINDOW` 常量由 `ui` 模块提供，`repl` 用同一常量判定退出。到期由 `rho-hint` 线程撤掉提示：它只向 stdout 写一个“擦到屏幕末尾”的序列（`\x1b[J`），不移动光标，因此 rustyline 的位置模型（提示符末尾、输入行空）保持不变，也不会把提示符顶到下一行；用 `\x1b[J` 而不是 `\x1b[K` 是因为窄终端下提示会换到下一行，只擦当前行会留下尾巴。动手前提由 `should_erase_hint` 判定——处于 `readline` 期间、提示行当前为空（`Hinter` 每次重绘时更新）、stdout 是 TTY，否则只撤销武装不碰终端。判定与写入之间主线程可能已经开始重绘，因此这是尽力而为的擦除，两个方向（没擦干净 / 擦掉了刚画出的新提示）都可能发生；下一次按键重绘会自愈。
+- 双按提示：`ui::helper::ReplHelper` 实现 `Hinter`/`Highlighter`，用 `render` 的颜色函数把提示符画成粗体青、输入行画成青色；武装时在空行上返回暗淡色提示（`render::dim`），由下一次 `readline` 的重绘显示；`CTRL_C_WINDOW` 常量由 `ui` 模块提供，`repl` 用同一常量判定退出。到期由 `rho-hint` 线程撤掉提示：它只向 stdout 写一个“擦到屏幕末尾”的序列（`\x1b[J`），不移动光标，因此 rustyline 的位置模型（提示符末尾、输入行空）保持不变，也不会把提示符顶到下一行；用 `\x1b[J` 而不是 `\x1b[K` 是因为窄终端下提示会换到下一行，只擦当前行会留下尾巴。动手前提由 `should_erase_hint` 判定——处于 `readline` 期间、提示行当前为空（`Hinter` 每次重绘时更新）、stdout 是 TTY，否则只撤销武装不碰终端。判定与写入之间主线程可能已经开始重绘，因此这是尽力而为的擦除，两个方向（没擦干净 / 擦掉了刚画出的新提示）都可能发生；下一次按键重绘会自愈。
 - 被 Ctrl-C 中断的输入不提交，而 rustyline 每次 `readline` 结束都会补一个换行（`Editor::readline_with` 的 `term.writeln()`），于是会在回滚区留下提示符 + 已输入内容（以及布局里的灰提示）组成的块。`CtrlCHandler` 在中断时记下输入行的显示宽度（`unicode-width`），块宽再加上 `Hinter` 记下的“最后一次布局里是否含灰提示”；`TermUi` 结合 `TIOCGWINSZ` 的列数算出回收时要上移的行数：`1 + 宽度 / 列数`——宽度刚好是列数整数倍时 rustyline 会自己补一个换行（`calculate_position` 的 `col == cols` 分支 → `refresh` 的 “generate our own newline on line wrap”），所以行数比内容高度多一，不能用向上取整。下一次 `read_line` 开始时用“`\x1b[{N}A\r\x1b[J`（上移 N 行、擦到屏幕末尾）”把这块收回重用；双按退出时在 `Drop` 里同样收回。这样打字后按 Ctrl-C 是原地清空，不多占行。`\x1b[J` 依赖“提示符块永远是最后一段输出”这个不变式：块高于屏幕时视口里全是块自己的行，`\x1b[{N}A` 被终端钳制到顶行，擦掉的仍只是块内容。stdout 不是 TTY 时不动光标。宽字符或制表符正好落在换列边界时行数会少算一行（`unicode-width` 不算 tab 的制表位展开），宁可留残影也不多上移（多上移会擦掉历史输出）。
 - 到期擦除只动屏幕、不改 rustyline 缓存的 layout，所以“布局里含不含灰提示”的标志不能在到期时清零：下次中断的 `move_cursor_to_end` 仍会把光标移到含提示的 `layout.end`，回收行数要跟着布局走，否则会少上移一行。
 - 补全：`completion::CompletionProvider` 定义 `complete(line, pos) -> Completion`；`commands::completion_provider(&session)` 从当前 provider/model/thinking 生成快照，`repl` 在每次 `read_line` 前传入。模型或供应商切换发生在命令执行后，下一次读取自然拿到新候选，因此 UI 不持久保存 completion 状态。`ui::helper::ReplHelper` 只把 `Candidate` 映射为 rustyline 的 `Pair`，命令名与参数语义留在 `commands`。rustyline 使用 `CompletionType::List`：先补公共前缀，再列出候选。

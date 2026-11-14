@@ -284,6 +284,12 @@ impl PtyRho {
             .join("\n")
     }
 
+    /// 原始输出中是否包含某段（ANSI 颜色断言用）。
+    fn raw_contains(&self, needle: &str) -> bool {
+        let raw = self.raw.lock().unwrap();
+        String::from_utf8_lossy(&raw).contains(needle)
+    }
+
     /// 诊断：最近输出的原始字节（可读转义形式）。
     fn raw_tail(&self, n: usize) -> String {
         let raw = self.raw.lock().unwrap();
@@ -498,6 +504,32 @@ fn real_double_sigint_during_stream_quits() {
     rho.send(b"\x03");
     std::thread::sleep(Duration::from_millis(50));
     rho.send(b"\x03");
+    assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
+}
+
+/// 真实终端下的 ANSI 着色：提示符、输入、工具调用与成功结果。
+#[test]
+fn prompt_input_tool_call_and_success_result_are_colored() {
+    let server = start_mock(tool_call_response("echo hi", 5));
+    let config = write_config(&server.base_url);
+    let mut rho = PtyRho::spawn(&config);
+
+    rho.expect_screen("rho>", SCREEN_TIMEOUT);
+    assert!(rho.raw_contains("\x1b[1;36mrho> \x1b[0m"));
+    std::thread::sleep(SETTLE);
+    rho.send_line("go");
+    rho.expect_screen("[status] completed", SCREEN_TIMEOUT);
+    assert!(
+        rho.raw_contains("\x1b[36mgo\x1b[0m"),
+        "raw tail:\n{}",
+        rho.raw_tail(3000)
+    );
+    assert!(rho.raw_contains("\x1b[35m→ bash: echo hi\x1b[0m"));
+    assert!(rho.raw_contains("\x1b[32m  │ [status] completed"));
+    // 第二次请求会因 mock 单连接关闭而失败；回到提示符后正常退出。
+    rho.expect_screen("rho>", Duration::from_secs(8));
+    std::thread::sleep(SETTLE);
+    rho.send_line("/exit");
     assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
 }
 
