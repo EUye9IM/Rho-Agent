@@ -19,7 +19,9 @@ base_url = "https://api.deepseek.com"
 headers = { Authorization = "Bearer ${DEEPSEEK_API_KEY}" }
 
 [providers.deepseek.compat]
-echo_reasoning = false
+# 非标准行为：带 tools 的请求按 DeepSeek 文档把 reasoning_content 随历史回传；
+# OpenAI 没有该字段，换供应商时改回 false。
+echo_reasoning = true
 stream_usage = true
 
 [models."deepseek/deepseek-flash"]

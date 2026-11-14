@@ -226,7 +226,7 @@ loop {
 - **历史即上下文**：历史（`Vec<Msg>`）原样序列化进请求；窗口超限时展示错误并提示 `/clear`。
 - **回合状态栏**：`Session::turn` 拆成薄包装与 `turn_inner`，包装层在本回合结束时发一条 `RenderEvent::Status`；fatal 与 `Err(Quit)` 路径不发。用量只是 `turn_inner` 的局部变量（每次成功的请求覆盖），不进会话状态；轮次由 `history` 中 `Msg::User` 的条数派生，`/clear` 后自然归零。斜杠命令不产生状态栏。
 - **usage 采集**：Chat Completions 在 `build_body` 里按 `compat.stream_usage` 发 `stream_options.include_usage`；usage 通常出现在 `choices` 为空的末尾 chunk，因此适配器在判空之前读取，缓存命中取 `prompt_tokens_details.cached_tokens` 或 DeepSeek 的 `prompt_cache_hit_tokens`。Responses 从 `response.completed` 的 `usage.input_tokens_details.cached_tokens` 取。worker 在 `Final` 之前发 `Usage`，主线程只在收到 `Final` 时采纳，保证失败或取消的请求不会污染状态栏。
-- **reasoning 默认留在本地**：`echo_reasoning = true` 时随历史回传，其余情况序列化时丢弃（适配层职责）。
+- **reasoning 随历史回传由 `compat.echo_reasoning` 决定**：打开时序列化进 assistant 消息，关闭时丢弃（适配层职责）；`CompatConfig` 默认与 OpenAI 标准一致（不回传），内置 DeepSeek 配置显式打开。
 - **两条退出路径**：REPL 层将 `/exit` 命令、空行 Ctrl-C 双按、`Eof`（Ctrl-D）映射为退出——判定发生在输入阶段（回合之间），直接退出；活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测，先完成剩余调用占位补齐与工具进程清理再退出。
 
 ## 五、线程与取消（term.rs / repl.rs）

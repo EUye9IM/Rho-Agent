@@ -74,6 +74,9 @@ pub struct AuthConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompatConfig {
+    /// 非标准：把 `reasoning_content` 随历史回传。
+    /// OpenAI 的推理模型不返回思维链文本，也没有该字段，因此默认关闭；
+    /// 内置 DeepSeek 配置打开它（带 tools 的请求按 DeepSeek 文档回传思考内容）。
     #[serde(default)]
     pub echo_reasoning: bool,
     /// Chat Completions 请求 `stream_options.include_usage`；默认开启。
@@ -443,6 +446,18 @@ mod tests {
         let err = load_str(&bad, "t").unwrap_err();
         assert!(err.contains("dns.1"), "error was {err}");
         assert!(err.contains("IP 字面量"), "error was {err}");
+    }
+
+    #[test]
+    fn builtin_deepseek_enables_non_standard_compat() {
+        // 内置配置是 DeepSeek 专用：回传思考内容，且 OpenAI 标准默认值不被偷改。
+        let cfg = load_str(BUILTIN_TOML, "t").unwrap();
+        let deepseek = &cfg.providers["deepseek"];
+        assert!(deepseek.compat.echo_reasoning);
+        assert!(deepseek.compat.stream_usage);
+        // CompatConfig 默认值保持 OpenAI 标准：不回传思考内容，带流式用量。
+        assert!(!CompatConfig::default().echo_reasoning);
+        assert!(CompatConfig::default().stream_usage);
     }
 
     #[test]
