@@ -118,7 +118,7 @@ Switching only affects subsequent requests; earlier history stays as recorded. I
 Every turn ends with one dim line:
 
 ```
-── #3 · deepseek/deepseek-flash · high · 缓存 53% · 12.4k/1M (1.2%)
+── #3 · deepseek/deepseek-flash · high · 53% · 12.4k/1M (1.2%)
 ```
 
 | Field | Meaning |
@@ -126,7 +126,7 @@ Every turn ends with one dim line:
 | `#3` | The turn number: how many user inputs this session has handled. `/clear` resets the history, so the next turn is `#1` again. |
 | model id | The active model (`/model` switch applies to the next turn). |
 | thinking level | The active level; omitted when the model declares no levels. |
-| `缓存 53%` | Prompt-cache hit rate: cached input tokens over input tokens. Omitted when the provider reports no cache statistics (`compat.stream_usage = false`, or a gateway that does not send `usage`). |
+| `53%` | Prompt-cache hit rate: cached input tokens over input tokens. Omitted when the provider reports no cache statistics (`compat.stream_usage = false`, or a gateway that does not send `usage`). |
 | `12.4k/1M (1.2%)` | Tokens used by the last completed request of the turn over the model's `context_window`. `上下文 —` when the turn produced no completed request. |
 
 Failed and cancelled turns also end with a status line, using the last completed request of that turn (or `上下文 —` if the turn was cancelled before any request finished). Slash commands, `/exit`, Ctrl-D and the second Ctrl-C do not print one. Token counts use `k`/`M` units above a thousand.

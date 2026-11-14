@@ -97,7 +97,7 @@ pub struct StatusLine {
     pub context_window: u64,
 }
 
-/// 状态栏单行文本（不含 ANSI）：`── #3 · model · high · 缓存 53% · 12.4k/1M (1.2%)`。
+/// 状态栏单行文本（不含 ANSI）：`── #3 · model · high · 53% · 12.4k/1M (1.2%)`。
 /// 每段只在有数据时出现：无思考档位省思考段，命中率缺失或输入为 0 时省命中率段，
 /// 无 usage 时用量段显示 `—`。
 pub fn status_line(s: &StatusLine) -> String {
@@ -109,7 +109,7 @@ pub fn status_line(s: &StatusLine) -> String {
         Some(u) => {
             if u.input > 0 {
                 if let Some(cached) = u.cached_input {
-                    parts.push(format!("缓存 {}%", hit_rate(cached, u.input)));
+                    parts.push(format!("{}%", hit_rate(cached, u.input)));
                 }
             }
             parts.push(format!(
@@ -380,7 +380,7 @@ mod tests {
                 usage: Some(usage(120, 30, 12_400, Some(64))),
                 context_window: 1_000_000,
             }),
-            "── #3 · deepseek/deepseek-flash · high · 缓存 53% · 12.4k/1M (1.2%)"
+            "── #3 · deepseek/deepseek-flash · high · 53% · 12.4k/1M (1.2%)"
         );
     }
 
@@ -400,9 +400,12 @@ mod tests {
 
     #[test]
     fn status_line_shows_zero_hits_but_not_zero_input() {
-        assert!(status_line(&status(Some(usage(100, 0, 100, Some(0))))).contains("缓存 0%"));
-        let no_input = status_line(&status(Some(usage(0, 0, 0, Some(5)))));
-        assert!(!no_input.contains("缓存"), "{no_input}");
+        assert!(status_line(&status(Some(usage(100, 0, 100, Some(0))))).contains(" · 0% · "));
+        // 输入为 0 时没有命中率语义，整段省掉。
+        assert_eq!(
+            status_line(&status(Some(usage(0, 0, 0, Some(5))))),
+            "── #3 · mock/m · high · 0/1k (0.0%)"
+        );
     }
 
     #[test]

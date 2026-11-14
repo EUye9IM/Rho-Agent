@@ -117,7 +117,7 @@ rho --init           # 生成默认配置文件到 ~/.config/rho/config.toml
 每个对话回合结束打一行暗淡状态栏：
 
 ```
-── #3 · deepseek/deepseek-flash · high · 缓存 53% · 12.4k/1M (1.2%)
+── #3 · deepseek/deepseek-flash · high · 53% · 12.4k/1M (1.2%)
 ```
 
 | 字段 | 含义 |
@@ -125,7 +125,7 @@ rho --init           # 生成默认配置文件到 ~/.config/rho/config.toml
 | `#3` | 轮次：本次会话处理过多少条用户输入。`/clear` 重置历史，下一条输入重新算作 `#1`。 |
 | 模型 | 当前生效的模型（`/model` 切换后从下一个回合生效）。 |
 | 思考档位 | 当前档位；模型未声明档位表时省去该段。 |
-| `缓存 53%` | 提示缓存命中率：命中的输入 token 占输入 token 的比例。供应商不提供缓存统计时省去该段（`compat.stream_usage = false`，或网关不返回 `usage`）。 |
+| `53%` | 提示缓存命中率：命中的输入 token 占输入 token 的比例。供应商不提供缓存统计时省去该段（`compat.stream_usage = false`，或网关不返回 `usage`）。 |
 | `12.4k/1M (1.2%)` | 本回合最后一次完成的请求所用 token / 模型的 `context_window`。本回合没有任何完成的请求时显示 `上下文 —`。 |
 
 失败与取消的回合同样有状态栏，用量取该回合最后一次完成请求；本回合第一个请求就被取消时显示 `上下文 —`。斜杠命令、`/exit`、Ctrl-D、第二次 Ctrl-C 不打印状态栏。token 数超过一千时用 `k`/`M` 压缩。
