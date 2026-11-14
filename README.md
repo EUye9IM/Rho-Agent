@@ -30,10 +30,16 @@ Implementation: [docs/architecture.md](docs/architecture.md).
 
 ## Install
 
-Install the latest musl release to `~/.local/bin` (`x86_64` and `aarch64`):
+Install the latest stable musl release to `~/.local/bin` (`x86_64` and `aarch64`):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/EUye9IM/Rho-Agent/master/install.sh | sh
+```
+
+Install the nightly build (a rolling build from the `dev` branch):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/EUye9IM/Rho-Agent/master/install.sh | sh -s -- --nightly
 ```
 
 The installer verifies the release checksum before installing. Add `~/.local/bin` to `PATH` if it is not already there. Download traffic uses `curl`, so standard proxy environment variables apply.

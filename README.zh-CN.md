@@ -30,10 +30,16 @@ rho 要做一个运行在资源受限 Linux 设备上的本地 agent：单二进
 
 ## 安装
 
-安装最新 musl 产物到 `~/.local/bin`（支持 `x86_64` 与 `aarch64`）：
+安装最新稳定版 musl 产物到 `~/.local/bin`（支持 `x86_64` 与 `aarch64`）：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/EUye9IM/Rho-Agent/master/install.sh | sh
+```
+
+安装 nightly（`dev` 分支的滚动构建）：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/EUye9IM/Rho-Agent/master/install.sh | sh -s -- --nightly
 ```
 
 安装脚本会先校验 release 的 SHA-256，再安装二进制。若 `~/.local/bin` 不在 `PATH` 中，请自行加入。下载使用 `curl`，遵循标准代理环境变量。
