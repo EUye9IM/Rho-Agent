@@ -130,7 +130,7 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 ## 终端/REPL 注意点
 
 - `rustyline` 每次 `readline` 前会清当前行（`\r\x1b[K`）。如果上一段输出没有换行，最后一行会被擦掉。
-- 正常回合结束后由 `repl.rs` 在 `TurnEnd::Done` 后补 `RenderEvent::LineBreak`；不要删掉，除非你同时换成等价的“确保行首”机制。
+- 每个对话回合结束时 `chat` 发一条 `RenderEvent::Status`；它由 `Renderer` 负责“收尾当前块 + 补换行 + 输出暗淡行 + 换行”，是唯一的“确保行首”机制。新增会结束回合的路径时必须让它经过这一层，否则半截输出会被提示符擦掉。
 - 流式输出中 `TextDelta` 原样写出；不要在每个 delta 上强制加换行。
 
 ## 工具与安全

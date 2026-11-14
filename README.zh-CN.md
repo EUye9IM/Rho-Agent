@@ -20,6 +20,7 @@ rho 要做一个运行在资源受限 Linux 设备上的本地 agent：单二进
 - **内置工具** —— `bash` 前台执行 `bash -c <命令>`，每次调用启动新的 shell，支持单次超时并按进程组逐级终止；`read` 返回带行号的文本；`write` 新建文件和父目录；`edit` 按顺序做精确替换，并保留文件的 CRLF/LF 风格。
 - **可预测的 Ctrl-C** —— 第一次取消当前流式/工具，立即回到提示符（取消标志在逐块之间轮询生效；连接停滞无数据时，后台读取在下一块数据到达或空闲超时后结束），第二次退出；空闲提示符下两次空行 Ctrl-C（2 秒内）同样退出，第一次会在输入行尾显示灰色提示。对话历史在任何时刻都保持协议合法（工具调用必有对应结果）。
 - **Tab 补全** —— 补全斜杠命令名以及 `/model`、`/provider`、`/thinking` 的参数，候选来自当前会话状态；切换供应商或模型后自动刷新。
+- **回合状态栏** —— 每个对话回合结束打一行暗淡状态栏：轮次、模型、思考档位、缓存命中率与上下文占用。
 - **严格配置校验** —— 未知字段、悬空引用、缺失必填字段一律硬报错并给出配置路径（TOML 语法错误另带行号），退出码 2。
 
 ## 环境要求
@@ -111,6 +112,24 @@ rho --init           # 生成默认配置文件到 ~/.config/rho/config.toml
 
 切换只影响后续请求，已有历史保持不变。若 `/provider` 切换后当前模型不属于新供应商，模型重置为该供应商声明顺序第一个，thinking 重置为新模型的 `thinking_default`。
 
+### 状态栏
+
+每个对话回合结束打一行暗淡状态栏：
+
+```
+── #3 · deepseek/deepseek-flash · high · 缓存 53% · 12.4k/1M (1.2%)
+```
+
+| 字段 | 含义 |
+|---|---|
+| `#3` | 轮次：本次会话处理过多少条用户输入。`/clear` 重置历史，下一条输入重新算作 `#1`。 |
+| 模型 | 当前生效的模型（`/model` 切换后从下一个回合生效）。 |
+| 思考档位 | 当前档位；模型未声明档位表时省去该段。 |
+| `缓存 53%` | 提示缓存命中率：命中的输入 token 占输入 token 的比例。供应商不提供缓存统计时省去该段（`compat.stream_usage = false`，或网关不返回 `usage`）。 |
+| `12.4k/1M (1.2%)` | 本回合最后一次完成的请求所用 token / 模型的 `context_window`。本回合没有任何完成的请求时显示 `上下文 —`。 |
+
+失败与取消的回合同样有状态栏，用量取该回合最后一次完成请求；本回合第一个请求就被取消时显示 `上下文 —`。斜杠命令、`/exit`、Ctrl-D、第二次 Ctrl-C 不打印状态栏。token 数超过一千时用 `k`/`M` 压缩。
+
 ## 配置
 
 内置配置包含 DeepSeek（`deepseek/deepseek-flash`、`deepseek/deepseek-v4-pro`）。用户配置必须自包含：
@@ -131,6 +150,7 @@ headers = { Authorization = "Bearer ${DEEPSEEK_API_KEY}" }
 
 [providers.deepseek.compat]
 echo_reasoning = false
+stream_usage   = true                            # 发送 stream_options.include_usage（默认开启）
 
 [models."deepseek/deepseek-v4-pro"]
 context_window   = 1000000

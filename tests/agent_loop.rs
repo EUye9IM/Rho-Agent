@@ -2,7 +2,7 @@
 //! `ToolRegistry` 预设结果驱动真实 `Session::turn`，无网络无进程。
 //! 覆盖：取消/退出各粒度、占位补齐、错误路径与配对不变式。
 
-use rho::chat::{AssistantMsg, Msg, Session, StreamLauncher, ToolCall, TurnEnd};
+use rho::chat::{AssistantMsg, Msg, Session, StreamLauncher, TokenUsage, ToolCall, TurnEnd};
 use rho::completion::CompletionProvider;
 use rho::config::{self, Provider};
 use rho::provider::{self, ProviderAdapter, StreamEvent};
@@ -506,4 +506,146 @@ fn builtin_write_read_edit_dispatch_through_registry() {
         rho::render::RenderEvent::ToolResult { name, display: None, .. } if name == "read"
     )));
     let _ = std::fs::remove_file(&path);
+}
+
+fn usage(input: u64, output: u64, total: u64, cached: Option<u64>) -> TokenUsage {
+    TokenUsage {
+        input,
+        output,
+        total,
+        cached_input: cached,
+    }
+}
+
+/// 最后一个状态栏事件（没有则 panic）。
+fn last_status(ui: &ScriptedUi) -> rho::render::StatusLine {
+    match ui.rendered.last() {
+        Some(rho::render::RenderEvent::Status(status)) => status.clone(),
+        other => panic!("unexpected last event: {other:?}"),
+    }
+}
+
+#[test]
+fn status_reports_the_last_completed_request_in_the_turn() {
+    let mut session = session();
+    session.launcher = Arc::new(ScriptedLauncher::new(vec![
+        // 第一次请求：调用工具，带 usage。
+        vec![
+            StreamEvent::Usage(usage(120, 30, 150, Some(96))),
+            StreamEvent::Final(Box::new(assistant_with_calls(vec![call(
+                "c1", "bash", CMD,
+            )]))),
+        ],
+        // 第二次请求：最终答复，usage 覆盖前一次。
+        vec![
+            StreamEvent::Usage(usage(200, 50, 250, None)),
+            text_final("done"),
+        ],
+    ]));
+    session.tools = registry_with(PresetTool {
+        output: "hi".into(),
+    });
+    let mut ui = ScriptedUi::new(vec![]);
+    let cancel = Cancel::new();
+
+    let end = session.turn(&mut ui, &cancel, "go").unwrap();
+    assert!(matches!(end, TurnEnd::Done), "end was {end:?}");
+    // 一轮只有一个状态栏，且用量是最后一次成功请求的。
+    assert_eq!(
+        ui.rendered
+            .iter()
+            .filter(|e| matches!(e, rho::render::RenderEvent::Status(_)))
+            .count(),
+        1
+    );
+    let status = last_status(&ui);
+    assert_eq!(status.turn, 1);
+    assert_eq!(status.model, "mock/m");
+    assert_eq!(status.usage, Some(usage(200, 50, 250, None)));
+    assert_eq!(status.context_window, 1000);
+}
+
+#[test]
+fn cancelled_turn_still_prints_status_with_earlier_usage() {
+    let mut session = session();
+    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![
+        StreamEvent::Usage(usage(120, 30, 150, Some(96))),
+        StreamEvent::Final(Box::new(assistant_with_calls(vec![call(
+            "c1", "bash", CMD,
+        )]))),
+    ]]));
+    session.tools = registry_with(InjectingTool { injects: 1 });
+    let mut ui = ScriptedUi::new(vec![]);
+    let cancel = Cancel::new();
+
+    let end = session.turn(&mut ui, &cancel, "go").unwrap();
+    assert!(matches!(end, TurnEnd::Cancelled), "end was {end:?}");
+    // 工具被取消（结果标为打断），然后补状态栏。
+    assert!(ui.rendered.iter().any(|e| matches!(
+        e,
+        rho::render::RenderEvent::ToolResult { status, .. } if *status == ToolStatus::Interrupted
+    )));
+    assert_eq!(last_status(&ui).usage, Some(usage(120, 30, 150, Some(96))));
+}
+
+#[test]
+fn cancelled_first_request_reports_unknown_usage() {
+    let mut session = session();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    session.launcher = Arc::new(ParkingLauncher {
+        ready: ready_tx,
+        released: Mutex::new(Some(release_rx)),
+    });
+    let mut ui = ScriptedUi::new(vec![]);
+    let cancel = Cancel::new();
+    let injector = injector_after_ready(cancel.clone(), ready_rx, release_tx, 1);
+
+    let end = session.turn(&mut ui, &cancel, "go").unwrap();
+    injector.join().unwrap();
+    assert!(matches!(end, TurnEnd::Cancelled), "end was {end:?}");
+    assert_eq!(last_status(&ui).usage, None);
+}
+
+#[test]
+fn quit_paths_do_not_print_status() {
+    let mut session = session();
+    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![StreamEvent::Final(
+        Box::new(assistant_with_calls(vec![call("c1", "bash", CMD)])),
+    )]]));
+    // 执行中两次注入：升级为 quit，回合以 Err 上抛。
+    session.tools = registry_with(InjectingTool { injects: 2 });
+    let mut ui = ScriptedUi::new(vec![]);
+    let cancel = Cancel::new();
+
+    assert!(session.turn(&mut ui, &cancel, "go").is_err());
+    assert!(!ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, rho::render::RenderEvent::Status(_))));
+}
+
+#[test]
+fn status_turn_counts_user_inputs_and_resets_on_clear() {
+    let mut session = session();
+    session.launcher = Arc::new(ScriptedLauncher::new(vec![
+        vec![text_final("one")],
+        vec![text_final("two")],
+        vec![text_final("three")],
+    ]));
+    let cancel = Cancel::new();
+
+    let mut first = ScriptedUi::new(vec![]);
+    session.turn(&mut first, &cancel, "go").unwrap();
+    assert_eq!(last_status(&first).turn, 1);
+
+    let mut second = ScriptedUi::new(vec![]);
+    session.turn(&mut second, &cancel, "go").unwrap();
+    assert_eq!(last_status(&second).turn, 2);
+
+    // /clear 重置历史：轮次归零，下一次输入重新算作第 1 轮。
+    session.clear();
+    let mut third = ScriptedUi::new(vec![]);
+    session.turn(&mut third, &cancel, "go").unwrap();
+    assert_eq!(last_status(&third).turn, 1);
 }

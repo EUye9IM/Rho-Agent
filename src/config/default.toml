@@ -20,6 +20,7 @@ headers = { Authorization = "Bearer ${DEEPSEEK_API_KEY}" }
 
 [providers.deepseek.compat]
 echo_reasoning = false
+stream_usage = true
 
 [models."deepseek/deepseek-flash"]
 context_window = 1000000

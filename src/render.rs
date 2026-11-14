@@ -1,9 +1,11 @@
-//! 渲染：思考暗淡色、正文原样、提示符/输入着色、工具行与结果状态色。颜色固定。
+//! 渲染：思考暗淡色、正文原样、提示符/输入着色、工具行与结果状态色、回合状态栏。
+//! 颜色固定。
 //!
 //! `Renderer` 是有状态格式化器：跨事件维护当前样式块，把「进入块」与「离开块」
 //! 各自只输出一次 ANSI（思考块一次 `\x1b[2m` … 一次 `\x1b[0m`），不随每个 delta
 //! 重复包裹。它只返回要写的文本，不直接写终端；去向由 `ui` 决定。
 
+use crate::message::TokenUsage;
 use crate::tools::ToolStatus;
 
 /// 渲染事件（agent loop → ui.print 的载荷；具体形态实现期定）。
@@ -13,8 +15,9 @@ pub enum RenderEvent {
     ReasoningDelta(String),
     /// 正文增量（原样输出，不渲染 markdown）
     TextDelta(String),
-    /// 确保行首的折行（回合结束时由 `repl` 补，避免正文块贴住提示符）
-    LineBreak,
+    /// 回合结束状态栏：先确保行首（收起思考块、必要时补换行），再输出暗淡单行。
+    /// 回合的每条结束路径都发它，被取消的回合同样有（半截正文不再贴住提示符）。
+    Status(StatusLine),
     /// 工具调用行：`→ <工具名>: <摘要>`
     ToolCall { name: String, summary: String },
     /// 工具结果：display 为 None 时不展示结果体；status 决定样式。
@@ -81,6 +84,84 @@ pub fn tool_result_block(content: &str, status: ToolStatus) -> String {
     }
 }
 
+/// 回合结束状态栏的内容。数值由 agent loop 装配，格式化全在本模块。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusLine {
+    /// 会话内第几条用户输入（`/clear` 后归零）
+    pub turn: u32,
+    pub model: String,
+    /// 当前思考档位；模型未声明档位表时为 None
+    pub thinking: Option<String>,
+    /// 本回合最近一次成功请求的用量；None 表示本轮没有完成的请求或上游未返回
+    pub usage: Option<TokenUsage>,
+    pub context_window: u64,
+}
+
+/// 状态栏单行文本（不含 ANSI）：`── #3 · model · high · 缓存 53% · 12.4k/1M (1.2%)`。
+/// 每段只在有数据时出现：无思考档位省思考段，命中率缺失或输入为 0 时省命中率段，
+/// 无 usage 时用量段显示 `—`。
+pub fn status_line(s: &StatusLine) -> String {
+    let mut parts = vec![format!("#{}", s.turn), s.model.clone()];
+    if let Some(level) = &s.thinking {
+        parts.push(level.clone());
+    }
+    match s.usage {
+        Some(u) => {
+            if u.input > 0 {
+                if let Some(cached) = u.cached_input {
+                    parts.push(format!("缓存 {}%", hit_rate(cached, u.input)));
+                }
+            }
+            parts.push(format!(
+                "{}/{} ({:.1}%)",
+                compact_tokens(u.total),
+                compact_tokens(s.context_window),
+                used_percent(u.total, s.context_window)
+            ));
+        }
+        None => parts.push("上下文 —".to_string()),
+    }
+    format!("── {}", parts.join(" · "))
+}
+
+/// 缓存命中占输入的比例（整数百分比，向下取整）；输入为 0 时由调用方跳过。
+fn hit_rate(cached: u64, input: u64) -> u64 {
+    cached.saturating_mul(100) / input
+}
+
+/// 用量占上下文窗口的百分比；窗口为 0 时无占比语义（配置校验不接受 0）。
+fn used_percent(used: u64, window: u64) -> f64 {
+    if window == 0 {
+        return 0.0;
+    }
+    used as f64 * 100.0 / window as f64
+}
+
+/// 用量压缩：1000 以下原样，之后按 k/M 保留一位小数，整十位时省略小数。
+/// 四舍五入在整数域完成，避免浮点边界（999,950 这类会进到 M）。
+fn compact_tokens(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    // 0.1k 为单位；到 1000k 就换 M 表达。
+    let tenths_k = (u128::from(n) * 10 + 500) / 1_000;
+    if tenths_k >= 10_000 {
+        // 0.1M 为单位。
+        return compact_unit((u128::from(n) + 50_000) / 100_000, "M");
+    }
+    compact_unit(tenths_k, "k")
+}
+
+fn compact_unit(tenths: u128, suffix: &str) -> String {
+    let whole = tenths / 10;
+    let frac = tenths % 10;
+    if frac == 0 {
+        format!("{whole}{suffix}")
+    } else {
+        format!("{whole}.{frac}{suffix}")
+    }
+}
+
 /// 一次事件产生的输出，按流向分开：`stdout` 走渲染流，`stderr` 走错误流。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Rendered {
@@ -133,7 +214,15 @@ impl Renderer {
                 self.block = Block::Text;
                 out.stdout.push_str(s);
             }
-            RenderEvent::LineBreak => {
+            RenderEvent::Status(status) => {
+                // 思考块开着先关样式；正文块（含被取消的半截输出）先折行，
+                // 保证状态栏从行首开始、且它自己是最后一段带换行的输出。
+                let open = self.block != Block::Idle;
+                self.close(&mut out.stdout);
+                if open {
+                    out.stdout.push('\n');
+                }
+                out.stdout.push_str(&dim(&status_line(status)));
                 out.stdout.push('\n');
             }
             RenderEvent::ToolCall { name, summary } => {
@@ -259,9 +348,109 @@ mod tests {
             stdout(&r.event(&RenderEvent::ReasoningDelta("b".into()))),
             "b"
         );
-        // LineBreak 只折行，不关块；收尾交给 reset。
-        assert_eq!(stdout(&r.event(&RenderEvent::LineBreak)), "\n");
         assert_eq!(r.reset(), "\x1b[0m");
+    }
+
+    fn status(usage: Option<TokenUsage>) -> StatusLine {
+        StatusLine {
+            turn: 3,
+            model: "mock/m".into(),
+            thinking: Some("high".into()),
+            usage,
+            context_window: 1_000,
+        }
+    }
+
+    fn usage(input: u64, output: u64, total: u64, cached_input: Option<u64>) -> TokenUsage {
+        TokenUsage {
+            input,
+            output,
+            total,
+            cached_input,
+        }
+    }
+
+    #[test]
+    fn status_line_lists_every_available_field() {
+        assert_eq!(
+            status_line(&StatusLine {
+                turn: 3,
+                model: "deepseek/deepseek-flash".into(),
+                thinking: Some("high".into()),
+                usage: Some(usage(120, 30, 12_400, Some(64))),
+                context_window: 1_000_000,
+            }),
+            "── #3 · deepseek/deepseek-flash · high · 缓存 53% · 12.4k/1M (1.2%)"
+        );
+    }
+
+    #[test]
+    fn status_line_omits_thinking_and_cache_when_absent() {
+        assert_eq!(
+            status_line(&StatusLine {
+                turn: 1,
+                model: "mock/m".into(),
+                thinking: None,
+                usage: Some(usage(100, 0, 100, None)),
+                context_window: 1_000,
+            }),
+            "── #1 · mock/m · 100/1k (10.0%)"
+        );
+    }
+
+    #[test]
+    fn status_line_shows_zero_hits_but_not_zero_input() {
+        assert!(status_line(&status(Some(usage(100, 0, 100, Some(0))))).contains("缓存 0%"));
+        let no_input = status_line(&status(Some(usage(0, 0, 0, Some(5)))));
+        assert!(!no_input.contains("缓存"), "{no_input}");
+    }
+
+    #[test]
+    fn status_line_without_usage_marks_context_unknown() {
+        let text = status_line(&StatusLine {
+            turn: 2,
+            model: "mock/m".into(),
+            thinking: None,
+            usage: None,
+            context_window: 1_000,
+        });
+        assert_eq!(text, "── #2 · mock/m · 上下文 —");
+    }
+
+    #[test]
+    fn compact_tokens_switches_units() {
+        assert_eq!(compact_tokens(0), "0");
+        assert_eq!(compact_tokens(999), "999");
+        assert_eq!(compact_tokens(1_000), "1k");
+        assert_eq!(compact_tokens(1_050), "1.1k");
+        assert_eq!(compact_tokens(12_345), "12.3k");
+        assert_eq!(compact_tokens(999_949), "999.9k");
+        assert_eq!(compact_tokens(999_950), "1M");
+        assert_eq!(compact_tokens(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn status_closes_reasoning_and_starts_on_a_fresh_line() {
+        let mut r = Renderer::new();
+        r.event(&RenderEvent::ReasoningDelta("想".into()));
+        let out = r.event(&RenderEvent::Status(status(None)));
+        assert_eq!(
+            stdout(&out),
+            "\x1b[0m\n\x1b[2m── #3 · mock/m · high · 上下文 —\x1b[0m\n"
+        );
+        // 收尾后回到 Idle：再发状态栏不会多补换行。
+        assert!(stdout(&r.event(&RenderEvent::Status(status(None)))).starts_with("\x1b[2m"));
+    }
+
+    #[test]
+    fn status_breaks_line_after_unterminated_text() {
+        let mut r = Renderer::new();
+        r.event(&RenderEvent::TextDelta("半截".into()));
+        let out = r.event(&RenderEvent::Status(status(None)));
+        assert_eq!(
+            stdout(&out),
+            "\n\x1b[2m── #3 · mock/m · high · 上下文 —\x1b[0m\n"
+        );
     }
 
     #[test]
@@ -307,6 +496,14 @@ mod tests {
         let out = r.event(&RenderEvent::Error("boom".into()));
         assert_eq!(stdout(&out), "\x1b[0m");
         assert_eq!(out.stderr, "错误：boom\n");
+    }
+
+    #[test]
+    fn reset_after_status_is_noop() {
+        let mut r = Renderer::new();
+        r.event(&RenderEvent::ReasoningDelta("想".into()));
+        r.event(&RenderEvent::Status(status(None)));
+        assert_eq!(r.reset(), "");
     }
 
     #[test]

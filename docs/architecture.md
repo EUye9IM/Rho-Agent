@@ -55,7 +55,8 @@ src/
                  才回退系统解析器，结果按应答 TTL 缓存
                  （Android/Termux 等系统解析器不可用的环境靠它解析域名）
     openai.rs    openai_chat：/chat/completions、messages、max_tokens、reasoning_content
-                 （echo_reasoning 构造时注入）、`[DONE]` 结束标记
+                 （echo_reasoning 构造时注入）、`[DONE]` 结束标记、
+                 usage 解析（含 stream_options.include_usage 与缓存命中字段）
     openai_responses.rs
                  openai_responses：/responses、input items、max_output_tokens、
                  function_call / function_call_output、reasoning summary 与最终 response 事件
@@ -68,8 +69,8 @@ src/
     edit.rs      顺序 edits、精确匹配、replace_all、换行归一化、失败相似行提示
   render.rs      有状态渲染器 Renderer + RenderEvent：思考块暗淡色、正文原样、
                  提示符/输入/工具调用着色、带左边栏的工具结果
-                 （成功绿、失败红、打断黄）；返回待写文本，不直接写终端
-                 （颜色固定使用 ANSI 转义，暗色终端下仍可用）
+                 （成功绿、失败红、打断黄）、回合状态栏单行；返回待写文本，
+                 不直接写终端（颜色固定使用 ANSI 转义，暗色终端下仍可用）
   repl.rs        REPL 循环、Ctrl-C 语义；斜杠命令委托给 commands，输出经 Ui
   term.rs        终端信号处理（SIGINT、进程组信号）
   ui/
@@ -79,7 +80,7 @@ src/
     scripted.rs  测试实现 ScriptedUi（预排输入、收集渲染事件）
 ```
 
-依赖方向为 `repl → commands/chat/ui`；`commands → chat/completion`，`chat → provider → sse/message`，`chat → tools → term`，`ui → completion/render → tools`。`completion` 只定义补全协议，`ui` 只把候选适配到 rustyline；`commands` 持有命令与候选语义，`repl` 负责按调用注入当前快照。`Msg`/`AssistantMsg`/`ToolCall` 放在 `message.rs`，chat 与 provider 都只依赖这个共享模型，provider 不再反向依赖 chat。`config` 被各层读取，处于依赖关系底层。`render` 提供有状态渲染器（`Renderer`）与 `RenderEvent`：`chat` 只产生 `RenderEvent`，`ui` 持有 `Renderer` 把事件序列化为待写文本，按标准输出/标准错误分流写入终端。
+依赖方向为 `repl → commands/chat/ui`；`commands → chat/completion`，`chat → provider → sse/message`，`chat → tools → term`，`ui → completion/render → tools`。`completion` 只定义补全协议，`ui` 只把候选适配到 rustyline；`commands` 持有命令与候选语义，`repl` 负责按调用注入当前快照。`Msg`/`AssistantMsg`/`ToolCall` 放在 `message.rs`，chat 与 provider 都只依赖这个共享模型，provider 不再反向依赖 chat。`config` 被各层读取，处于依赖关系底层。`render` 提供有状态渲染器（`Renderer`）与 `RenderEvent`：`chat` 只产生 `RenderEvent`，`ui` 持有 `Renderer` 把事件序列化为待写文本，按标准输出/标准错误分流写入终端。回合结束的 `RenderEvent::Status` 同时承担“确保行首”的职责，因此不再单独发折行事件。
 
 ## 三、关键数据类型
 
@@ -120,6 +121,7 @@ trait Tool: Send + Sync {
 // provider/mod.rs
 enum StreamEvent {
     Delta { text: Option<String>, reasoning: Option<String> }, // 渲染用增量（正文/思考文本）
+    Usage(TokenUsage),                          // 单次请求的 token 用量（总在 Final 之前，缺失表示上游未提供）
     Final(Box<AssistantMsg>),                   // worker 组装完成的完整 Assistant 消息
     Error(String),                              // HTTP 错误 / 断流 / 非法 JSON / finish_reason=length|content_filter 等截断；异常 EOF 按错误处理
 }
@@ -143,7 +145,7 @@ trait ProviderAdapter: Send + Sync {
     fn parse_chunk(&self, chunk: &Value, acc: &mut TurnAcc) -> ChunkOutcome;
 }
 // 适配器按 Provider 构造（adapter_for(&Provider) -> Result<Arc<dyn ProviderAdapter>, String>）：
-// compat 开关（echo_reasoning）构造时注入；Session 长期持有 Arc，每轮 clone 一份按值传给 worker
+// compat 开关（echo_reasoning / stream_usage）构造时注入；Session 长期持有 Arc，每轮 clone 一份按值传给 worker
 // （thread::spawn + detach 取消语义需 'static，不能借引用）；/provider 切换时重建。
 // Protocol::parse 决定 openai_chat / openai_responses；未知协议返回可展示的 Err。
 ```
@@ -180,7 +182,7 @@ enum ReadOutcome {
 - 补全：`completion::CompletionProvider` 定义 `complete(line, pos) -> Completion`；`commands::completion_provider(&session)` 从当前 provider/model/thinking 生成快照，`repl` 在每次 `read_line` 前传入。模型或供应商切换发生在命令执行后，下一次读取自然拿到新候选，因此 UI 不持久保存 completion 状态。`ui::helper::ReplHelper` 只把 `Candidate` 映射为 rustyline 的 `Pair`，命令名与参数语义留在 `commands`。rustyline 使用 `CompletionType::List`：先补公共前缀，再列出候选。
 - 测试实现 `ScriptedUi`：预排输入队列 + 收集渲染事件，驱动 `repl → agent loop → tools` 全链路。
 
-- `TurnAcc`（worker 线程的每流累加器）：按 `index` 组装多段 `tool_calls`、累积 text/reasoning；流正常结束时组装为完整 Assistant 消息经 `Final` 交付主线程。取消时主线程 drop Receiver，累加器随 worker 结束一起丢弃。
+- `TurnAcc`（worker 线程的每流累加器）：按 `index` 组装多段 `tool_calls`、累积 text/reasoning 与上游 `usage`；流正常结束时组装为完整 Assistant 消息经 `Final` 交付主线程（`usage` 走前置的 `Usage` 事件）。取消时主线程 drop Receiver，累加器随 worker 结束一起丢弃。
 - OpenAI Responses：`openai_responses` 适配器把历史映射为 `input` items（user/assistant 文本、`function_call`、`function_call_output`），系统提示写入顶层 `instructions`；流式事件按 `response.output_text.delta` / reasoning summary / `function_call_arguments.delta` 累积，`response.completed` / `response.incomplete` 作为终态，`response.failed` / `error` 直接报错。
 - Anthropic Messages：尚未实现；`protocol` 指向未知协议时返回可展示的错误。
 
@@ -222,6 +224,8 @@ loop {
 - **取消在两个粒度检查**：接收循环逐事件检查（含持续有事件时）；工具序列逐个调用前检查。任一处发现取消即按占位规则收尾。终端 I/O 失败（fatal）同样在流收尾与逐个调用前检查：流收尾后发现则不提交 Assistant 直接上抛；批次中途发现则剩余调用补“终端输出失败”占位后上抛；两者均映射 exit 1。
 - **限额逐个前置检查**：每个调用执行前先检查限额；所有模型发起的调用都计数（含参数解析失败/未知工具/工具内部错误），防止错误调用无限循环。
 - **历史即上下文**：历史（`Vec<Msg>`）原样序列化进请求；窗口超限时展示错误并提示 `/clear`。
+- **回合状态栏**：`Session::turn` 拆成薄包装与 `turn_inner`，包装层在本回合结束时发一条 `RenderEvent::Status`；fatal 与 `Err(Quit)` 路径不发。用量只是 `turn_inner` 的局部变量（每次成功的请求覆盖），不进会话状态；轮次由 `history` 中 `Msg::User` 的条数派生，`/clear` 后自然归零。斜杠命令不产生状态栏。
+- **usage 采集**：Chat Completions 在 `build_body` 里按 `compat.stream_usage` 发 `stream_options.include_usage`；usage 通常出现在 `choices` 为空的末尾 chunk，因此适配器在判空之前读取，缓存命中取 `prompt_tokens_details.cached_tokens` 或 DeepSeek 的 `prompt_cache_hit_tokens`。Responses 从 `response.completed` 的 `usage.input_tokens_details.cached_tokens` 取。worker 在 `Final` 之前发 `Usage`，主线程只在收到 `Final` 时采纳，保证失败或取消的请求不会污染状态栏。
 - **reasoning 默认留在本地**：`echo_reasoning = true` 时随历史回传，其余情况序列化时丢弃（适配层职责）。
 - **两条退出路径**：REPL 层将 `/exit` 命令、空行 Ctrl-C 双按、`Eof`（Ctrl-D）映射为退出——判定发生在输入阶段（回合之间），直接退出；活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测，先完成剩余调用占位补齐与工具进程清理再退出。
 
@@ -258,11 +262,11 @@ exit 0：/exit、空闲态 Ctrl-C 双按、Ctrl-D（均正常退出）
 | 层 | 方式 |
 |---|---|
 | `sse.rs` / `config` / `tools` 参数校验与截断 / `expand` | 纯单元测试，录制夹具 |
-| `render` 格式 / `ui::prompt_rows`（回收时上移的行数）/ `ui::should_erase_hint` / `repl::within_window`（双按窗口） | 纯单元测试，无 TTY |
+| `render` 格式（含状态栏字段省略规则、用量压缩单位）/ `ui::prompt_rows`（回收时上移的行数）/ `ui::should_erase_hint` / `repl::within_window`（双按窗口） | 纯单元测试，无 TTY |
 | `commands` 补全候选与命令文案 / `ui::helper` 的 Pair 适配 | 纯单元测试，无 TTY；`tests/repl_flow.rs` 覆盖模型切换后的候选刷新 |
 | `provider::openai` / `provider::openai_responses` 解析 | 单元测试：构造 JSON chunk/事件 → `ChunkOutcome` / `TurnAcc` |
 | `provider::dns` 报文与回退 | 单元 + 本地 mock：假 DoH 服务（std TcpListener 手写 HTTP），覆盖 A/AAAA、压缩指针、NXDOMAIN、端点失败转移、TTL 缓存；报文编解码与 `config::parse_dns_endpoint` 为纯单元测试 |
-| agent loop + tools | 集成：`Session.launcher` 与 `Session.tools` 注入边界 + `ScriptedUi`，无网络驱动分支（取消/退出各粒度、占位补齐、非法参数/未知工具、配对不变式；时序用 channel 握手控制）；`BashTool::invoke` 与 `read` / `write` / `edit` 单元测试覆盖参数、截断、CRLF、相似行和文件边界 |
+| agent loop + tools | 集成：`Session.launcher` 与 `Session.tools` 注入边界 + `ScriptedUi`，无网络驱动分支（取消/退出各粒度、占位补齐、非法参数/未知工具、配对不变式、状态栏的轮次与用量来源；时序用 channel 握手控制）；`BashTool::invoke` 与 `read` / `write` / `edit` 单元测试覆盖参数、截断、CRLF、相似行和文件边界 |
 | provider + HTTP 层 | 集成：本地 mock SSE 服务（std TcpListener 手写），测协议映射与流读取 |
 | 端到端工具循环 | 集成：mock SSE 服务驱动多轮真实 HTTP 请求，验证占位 Tool 消息的配对/顺序/第二次请求序列化（含 echo_reasoning） |
 | 取消/退出 | 集成：`ScriptedUi` 注入 `Line("/exit")`、`Eof` 验证退出路径；注入 `Interrupted{line_empty}` 序列验证 2 秒双按窗口、编辑中撤销、提交行清除武装（并断言 `set_ctrl_c_hint` 序列）；直接注入信号记录（第 1 次）验证流式取消路径——quit 路径（第 2 次）的计数判定由 `term.rs` 单元测试覆盖，端到端行为由 PTY 测试覆盖 |

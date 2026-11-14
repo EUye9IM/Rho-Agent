@@ -3,19 +3,24 @@
 use super::common::{default_headers, merge_thinking, model_name};
 use super::{ChunkOutcome, FinishReason, ProviderAdapter, StreamEvent, TurnAcc};
 use crate::config::{Model, Provider};
-use crate::message::{AssistantMsg, Msg};
+use crate::message::{AssistantMsg, Msg, TokenUsage};
 use crate::tools::ToolSpec;
 use serde_json::{json, Map, Value};
 
 pub struct OpenAiChatAdapter {
-    /// compat 开关在构造时注入（echo_reasoning 等）
+    /// compat 开关在构造时注入（echo_reasoning / stream_usage）
     pub echo_reasoning: bool,
+    pub stream_usage: bool,
 }
 
 impl OpenAiChatAdapter {
-    /// compat 开关注入：echo_reasoning=true 时 reasoning_content 随历史回传。
-    pub fn new(echo_reasoning: bool) -> Self {
-        Self { echo_reasoning }
+    /// compat 开关注入：echo_reasoning=true 时 reasoning_content 随历史回传；
+    /// stream_usage=true 时请求 `stream_options.include_usage`。
+    pub fn new(echo_reasoning: bool, stream_usage: bool) -> Self {
+        Self {
+            echo_reasoning,
+            stream_usage,
+        }
     }
 }
 
@@ -103,6 +108,9 @@ impl ProviderAdapter for OpenAiChatAdapter {
             "tools": tools,
         });
 
+        if self.stream_usage {
+            body["stream_options"] = json!({ "include_usage": true });
+        }
         if let Some(fragment) = thinking {
             merge_thinking(&mut body, fragment);
         }
@@ -120,6 +128,10 @@ impl ProviderAdapter for OpenAiChatAdapter {
     /// 解析单个 chunk：累积进 acc；有 text/reasoning 增量时返回 Delta。
     /// tool_calls 的组装只进 acc（不产生事件）；请求从不设置 n，choices 实际只有一条。
     fn parse_chunk(&self, chunk: &Value, acc: &mut TurnAcc) -> ChunkOutcome {
+        // usage 可能出现在 choices 为空的末尾 chunk，必须在 choices 判空之前读取。
+        if let Some(usage) = chunk.get("usage").and_then(parse_usage) {
+            acc.usage = Some(usage);
+        }
         let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
             return ChunkOutcome::Continue;
         };
@@ -194,6 +206,28 @@ impl ProviderAdapter for OpenAiChatAdapter {
     }
 }
 
+/// Chat Completions usage：prompt/completion/total，兼容 DeepSeek 的缓存命中字段。
+fn parse_usage(value: &Value) -> Option<TokenUsage> {
+    let input = value.get("prompt_tokens").and_then(Value::as_u64);
+    let output = value.get("completion_tokens").and_then(Value::as_u64);
+    let total = value.get("total_tokens").and_then(Value::as_u64);
+    if input.is_none() && output.is_none() && total.is_none() {
+        return None;
+    }
+    let input = input.unwrap_or(0);
+    let output = output.unwrap_or(0);
+    let cached_input = value
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| value.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
+    Some(TokenUsage {
+        input,
+        output,
+        total: total.unwrap_or_else(|| input.saturating_add(output)),
+        cached_input,
+    })
+}
+
 fn finish_reason(reason: &str) -> FinishReason {
     match reason {
         "stop" => FinishReason::Stop,
@@ -220,7 +254,7 @@ mod tests {
 
     #[test]
     fn endpoint_trims_slash() {
-        let a = OpenAiChatAdapter::new(false);
+        let a = OpenAiChatAdapter::new(false, true);
         assert_eq!(
             a.endpoint(&provider()),
             "https://api.example.com/chat/completions"
@@ -229,7 +263,7 @@ mod tests {
 
     #[test]
     fn body_maps_messages_and_thinking() {
-        let a = OpenAiChatAdapter::new(true);
+        let a = OpenAiChatAdapter::new(true, true);
         let model = Model {
             api_model: None,
             context_window: 1,
@@ -263,11 +297,72 @@ mod tests {
             body["tools"][0]["function"]["parameters"]["required"][0],
             "command"
         );
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn parses_usage_from_empty_choices_chunk() {
+        let a = OpenAiChatAdapter::new(false, true);
+        let mut acc = TurnAcc::default();
+        let chunk = json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+                "total_tokens": 150,
+                "prompt_tokens_details": { "cached_tokens": 64 }
+            }
+        });
+        assert!(matches!(
+            a.parse_chunk(&chunk, &mut acc),
+            ChunkOutcome::Continue
+        ));
+        assert_eq!(
+            acc.usage,
+            Some(TokenUsage {
+                input: 120,
+                output: 30,
+                total: 150,
+                cached_input: Some(64),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_deepseek_cache_usage() {
+        assert_eq!(
+            parse_usage(&json!({
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 12,
+                "prompt_cache_hit_tokens": 7
+            })),
+            Some(TokenUsage {
+                input: 10,
+                output: 2,
+                total: 12,
+                cached_input: Some(7),
+            })
+        );
+    }
+
+    #[test]
+    fn stream_usage_can_be_disabled() {
+        let a = OpenAiChatAdapter::new(false, false);
+        let model = Model {
+            api_model: None,
+            context_window: 1,
+            max_output: 1,
+            thinking_default: None,
+            thinking: Default::default(),
+        };
+        let body = a.build_body(&[], &model, "p/m", None, &[]);
+        assert!(body.get("stream_options").is_none());
     }
 
     #[test]
     fn parses_text_and_tool_calls() {
-        let a = OpenAiChatAdapter::new(false);
+        let a = OpenAiChatAdapter::new(false, true);
         let mut acc = TurnAcc::default();
         let chunk = json!({
             "choices": [{

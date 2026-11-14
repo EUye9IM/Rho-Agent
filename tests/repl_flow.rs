@@ -127,10 +127,17 @@ fn help_and_model_list_follow_current_provider() {
         .collect();
     // mock/m 声明了思考档位，help 应包含 /thinking。
     assert!(text.contains("/thinking"));
+    // 用量只在回合结束的状态栏展示，不是命令。
+    assert!(!text.contains("/usage"));
     // /model 只列当前 provider 的模型。
     assert!(text.contains("mock/m"));
     assert!(text.contains("mock/n"));
     assert!(!text.contains("other/m2"));
+    // 斜杠命令不触发状态栏，只有对话回合才有。
+    assert!(!ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, RenderEvent::Status(_))));
 }
 
 #[test]

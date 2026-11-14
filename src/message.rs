@@ -29,3 +29,13 @@ pub struct ToolCall {
     pub name: String,
     pub arguments: String,
 }
+
+/// 上游返回的单次请求 token 用量（已从协议字段归一化）。
+/// `cached_input` 只在供应商提供缓存命中统计时存在。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub total: u64,
+    pub cached_input: Option<u64>,
+}

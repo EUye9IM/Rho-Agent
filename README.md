@@ -20,6 +20,7 @@ Implementation: [docs/architecture.md](docs/architecture.md).
 - **Built-in tools** — `bash` runs in the foreground as `bash -c <command>` with a fresh shell, a per-call timeout, and process-group cleanup. `read` returns line-numbered text; `write` creates new files and parent directories; `edit` applies exact, sequential replacements and preserves the file's CRLF/LF style.
 - **Predictable Ctrl-C** — first Ctrl-C cancels the current stream/tool and returns you to the prompt (cancellation takes effect between chunks; if the connection stalls, the background reader ends once the next data arrives or the idle timeout hits), second one exits; at the idle prompt two empty-line Ctrl-C within two seconds exit (the first shows a gray hint). The conversation history is always left in a protocol-valid state.
 - **Tab completion** — slash command names and the arguments of `/model`, `/provider` and `/thinking` complete from the current session state; candidates refresh after a provider or model switch.
+- **Per-turn status line** — each turn ends with one dim line showing the turn number, model, thinking level, prompt-cache hit rate and context usage.
 - **Strict config validation** — unknown fields, dangling references and missing required fields fail loudly with the config path (TOML syntax errors also include a line number), exit code 2.
 
 ## Requirements
@@ -112,6 +113,24 @@ Config source priority: `--config <path>` > the default path `$XDG_CONFIG_HOME/r
 
 Switching only affects subsequent requests; earlier history stays as recorded. If a `/provider` switch leaves the current model outside the new provider, the model resets to the first model declared by that provider and thinking resets to that model's `thinking_default`.
 
+### Status line
+
+Every turn ends with one dim line:
+
+```
+── #3 · deepseek/deepseek-flash · high · 缓存 53% · 12.4k/1M (1.2%)
+```
+
+| Field | Meaning |
+|---|---|
+| `#3` | The turn number: how many user inputs this session has handled. `/clear` resets the history, so the next turn is `#1` again. |
+| model id | The active model (`/model` switch applies to the next turn). |
+| thinking level | The active level; omitted when the model declares no levels. |
+| `缓存 53%` | Prompt-cache hit rate: cached input tokens over input tokens. Omitted when the provider reports no cache statistics (`compat.stream_usage = false`, or a gateway that does not send `usage`). |
+| `12.4k/1M (1.2%)` | Tokens used by the last completed request of the turn over the model's `context_window`. `上下文 —` when the turn produced no completed request. |
+
+Failed and cancelled turns also end with a status line, using the last completed request of that turn (or `上下文 —` if the turn was cancelled before any request finished). Slash commands, `/exit`, Ctrl-D and the second Ctrl-C do not print one. Token counts use `k`/`M` units above a thousand.
+
 ## Configuration
 
 The built-in config ships DeepSeek (`deepseek/deepseek-flash`, `deepseek/deepseek-v4-pro`). A user config must be self-contained:
@@ -132,6 +151,7 @@ headers = { Authorization = "Bearer ${DEEPSEEK_API_KEY}" }
 
 [providers.deepseek.compat]
 echo_reasoning = false
+stream_usage   = true                            # send stream_options.include_usage (default true)
 
 [models."deepseek/deepseek-v4-pro"]
 context_window   = 1000000

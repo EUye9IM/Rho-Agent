@@ -354,6 +354,7 @@ mod tests {
         let all = no_thinking.complete("/", 1);
         let commands = replacements(&all);
         assert!(commands.contains(&"/help "));
+        assert!(!commands.contains(&"/usage "));
         assert!(!commands.contains(&"/thinking "));
     }
 

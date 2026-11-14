@@ -79,15 +79,10 @@ pub fn run(ui: &mut dyn Ui, mut session: Session, cancel: &Cancel) -> Result<(),
                 if cancel.is_quit() {
                     return Err(ReplExit::Quit);
                 }
+                // 回合结束时 chat 已补上状态栏（含行首收尾），这里不需要再补换行。
                 match turn {
-                    // 正常回复最后一段通常不带换行；补一个 LineBreak，避免下一次
-                    // rustyline 刷新提示符时用 `\r\x1b[K` 擦掉最后一行。
-                    Ok(TurnEnd::Done) => {
-                        ui.print(&RenderEvent::LineBreak);
-                        check_fatal(ui)?;
-                    }
-                    Ok(TurnEnd::Error(_)) | Ok(TurnEnd::Cancelled) => {}
                     Ok(TurnEnd::Fatal(e)) => return Err(ReplExit::Fatal(e)),
+                    Ok(_) => {}
                     Err(_) => return Err(ReplExit::Quit),
                 }
             }

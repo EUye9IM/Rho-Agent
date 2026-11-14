@@ -1,9 +1,9 @@
 //! 内部消息模型与 agent 工具循环：历史、流接收、工具批次执行。
 
 use crate::config::{self, Config, Provider, Selection};
-pub use crate::message::{AssistantMsg, Msg, ToolCall};
+pub use crate::message::{AssistantMsg, Msg, TokenUsage, ToolCall};
 use crate::provider::{self, ProviderAdapter, StreamEvent};
-use crate::render::RenderEvent;
+use crate::render::{RenderEvent, StatusLine};
 use crate::term::{Cancel, SignalState};
 use crate::tools::{ToolContext, ToolRegistry, ToolResult, ToolStatus};
 use crate::ui::Ui;
@@ -105,8 +105,11 @@ pub enum TurnEnd {
 /// 一次流式请求的接收结果（`Session::receive_stream` 的返回值）。
 #[derive(Debug)]
 enum StreamOutcome {
-    /// 收到完整 Assistant 消息
-    Final(AssistantMsg),
+    /// 收到完整 Assistant 消息，以及该请求的 token 用量
+    Final {
+        msg: AssistantMsg,
+        usage: Option<TokenUsage>,
+    },
     /// 错误（已展示，保留已完成历史）
     Error(String),
     /// 用户取消
@@ -152,6 +155,26 @@ impl Session {
         &self.history
     }
 
+    /// 会话内第几条用户输入；`/clear` 重置历史后自然归零。
+    /// 失败/取消的回合同样计入（回合入口就写入 User 消息）。
+    fn turns(&self) -> u32 {
+        self.history
+            .iter()
+            .filter(|m| matches!(m, Msg::User(_)))
+            .count() as u32
+    }
+
+    /// 回合结束状态栏的内容：选择来自 selection，轮次来自历史，用量由调用方传入。
+    fn status_line(&self, usage: Option<TokenUsage>) -> StatusLine {
+        StatusLine {
+            turn: self.turns(),
+            model: self.selection.model_id.clone(),
+            thinking: self.selection.thinking.clone(),
+            usage,
+            context_window: self.selection.model.context_window,
+        }
+    }
+
     /// `/clear`：历史重置为仅含 system 消息（播种语义同 new）。
     pub fn clear(&mut self) {
         self.history = system_history(self.cfg.system_prompt.as_deref());
@@ -173,10 +196,28 @@ impl Session {
         )
     }
 
-    /// agent 工具循环。
-    /// 编排：发起请求并接收流（`receive_stream`）→ 无工具调用即收束；
-    /// 有则交 `run_tool_calls` 执行，全部执行完带上结果继续请求。
+    /// agent 工具循环：一次用户输入触发一个回合。
+    /// 回合结束（除 fatal 与退出路径）补一条状态栏事件；用量随回合结束一次性交付，
+    /// 不进会话状态。
     pub fn turn(&mut self, ui: &mut dyn Ui, cancel: &Cancel, input: &str) -> ChatResult<TurnEnd> {
+        // 只在本回合内有效：最近一次成功请求的用量。
+        let mut usage: Option<TokenUsage> = None;
+        let end = self.turn_inner(ui, cancel, input, &mut usage)?;
+        // 终端写失败时再写只会重复失败：状态栏跳过。
+        if !matches!(end, TurnEnd::Fatal(_)) {
+            emit(ui, RenderEvent::Status(self.status_line(usage)));
+        }
+        Ok(end)
+    }
+
+    /// 工具循环本体。`usage` 从每次完成的请求刷新，提前返回的路径也把它带出去。
+    fn turn_inner(
+        &mut self,
+        ui: &mut dyn Ui,
+        cancel: &Cancel,
+        input: &str,
+        usage: &mut Option<TokenUsage>,
+    ) -> ChatResult<TurnEnd> {
         // 本轮工具步数（每次用户输入触发的回合局部计数）。
         let mut steps: u32 = 0;
         self.history.push(Msg::User(input.to_string()));
@@ -192,7 +233,10 @@ impl Session {
             }
 
             let msg = match self.receive_stream(ui, cancel) {
-                StreamOutcome::Final(msg) => msg,
+                StreamOutcome::Final { msg, usage: u } => {
+                    *usage = u;
+                    msg
+                }
                 StreamOutcome::Error(e) => return Ok(TurnEnd::Error(e)),
                 StreamOutcome::Cancelled => return Ok(TurnEnd::Cancelled),
                 StreamOutcome::Quit => return Err(Quit),
@@ -263,6 +307,7 @@ impl Session {
         let handle = StreamHandle { rx, cancelled };
 
         let mut final_msg: Option<AssistantMsg> = None;
+        let mut usage: Option<TokenUsage> = None;
         let mut error: Option<String> = None;
 
         loop {
@@ -297,6 +342,9 @@ impl Session {
                         emit(ui, RenderEvent::TextDelta(t));
                     }
                 }
+                StreamEvent::Usage(u) => {
+                    usage = Some(u);
+                }
                 StreamEvent::Final(msg) => {
                     final_msg = Some(*msg);
                     break;
@@ -319,7 +367,7 @@ impl Session {
             emit(ui, RenderEvent::Error(e.clone()));
             return StreamOutcome::Error(e);
         };
-        StreamOutcome::Final(msg)
+        StreamOutcome::Final { msg, usage }
     }
 
     /// 执行一批 tool_calls：每个执行前先查限额与取消标志；全部执行完返回 Done。

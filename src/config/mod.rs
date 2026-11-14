@@ -71,11 +71,28 @@ pub struct AuthConfig {
     pub headers: OrderedMap<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompatConfig {
     #[serde(default)]
     pub echo_reasoning: bool,
+    /// Chat Completions 请求 `stream_options.include_usage`；默认开启。
+    /// 不支持的供应商可设为 false，此时上游不返回用量，状态栏没有用量与命中率段。
+    #[serde(default = "default_true")]
+    pub stream_usage: bool,
+}
+
+impl Default for CompatConfig {
+    fn default() -> Self {
+        Self {
+            echo_reasoning: false,
+            stream_usage: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]

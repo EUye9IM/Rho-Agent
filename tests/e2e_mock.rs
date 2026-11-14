@@ -287,6 +287,24 @@ fn text_response(text: &str) -> String {
     out
 }
 
+/// 带 usage 的文本响应：Chat Completions 把 usage 放在 choices 为空的末尾 chunk。
+fn text_response_with_usage(text: &str) -> String {
+    let mut out = text_response(text);
+    out.insert_str(
+        out.len() - "data: [DONE]\n\n".len(),
+        &sse(&json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+                "total_tokens": 150,
+                "prompt_cache_hit_tokens": 96
+            }
+        })),
+    );
+    out
+}
+
 /// 由 mock 服务器 base_url 组装完整 TOML（测试用，不再落盘）。
 fn config_toml_with_protocol(
     base_url: &str,
@@ -910,7 +928,7 @@ fn bash_large_output_is_truncated_once_with_accurate_count() {
 }
 
 #[test]
-fn repl_adds_line_break_after_done_response() {
+fn repl_ends_each_turn_with_a_status_line() {
     let server = start_server(vec![text_response("one line")]);
     let session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
@@ -926,13 +944,44 @@ fn repl_adds_line_break_after_done_response() {
         .iter()
         .position(|e| matches!(e, RenderEvent::TextDelta(s) if s == "one line"))
         .unwrap();
-    let line_break = ui
+    let status = ui
         .rendered
         .iter()
-        .position(|e| matches!(e, RenderEvent::LineBreak))
+        .position(|e| matches!(e, RenderEvent::Status(_)))
         .unwrap();
-    assert!(text < line_break);
-    assert!(matches!(ui.rendered.last(), Some(RenderEvent::LineBreak)));
+    assert!(text < status);
+    // 斜杠命令不打状态栏，最后一个事件就是本回合的状态栏。
+    match ui.rendered.last() {
+        Some(RenderEvent::Status(s)) => {
+            assert_eq!(s.turn, 1);
+            assert_eq!(s.model, "mock/m");
+            // mock 没带 usage chunk：用量段显示未知，而不是沿用旧值。
+            assert_eq!(s.usage, None);
+        }
+        other => panic!("unexpected last event: {other:?}"),
+    }
+}
+
+#[test]
+fn status_line_carries_upstream_usage() {
+    let server = start_server(vec![text_response_with_usage("done")]);
+    let mut session = session_for(server.base_url(), "", "");
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(vec![ReadOutcome::Line("go".into())]);
+
+    session.turn(&mut ui, &cancel, "go").unwrap();
+
+    match ui.rendered.last() {
+        Some(RenderEvent::Status(s)) => {
+            let usage = s.usage.expect("usage from the final chunk");
+            assert_eq!(usage.input, 120);
+            assert_eq!(usage.output, 30);
+            assert_eq!(usage.total, 150);
+            assert_eq!(usage.cached_input, Some(96));
+            assert_eq!(s.context_window, 10_000);
+        }
+        other => panic!("unexpected last event: {other:?}"),
+    }
 }
 
 #[test]
