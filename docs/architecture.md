@@ -47,9 +47,14 @@ src/
   text.rs        文本工具函数：按 Unicode 字符截断（无内部依赖，供 tools / context / chat 使用）
   completion.rs  补全协议：CompletionProvider trait、Candidate / Completion；
                  不依赖终端、命令或 Session
-  chat.rs        会话历史（Vec<Msg>，对外只读）、通用工具循环与批次编排；
-                 StreamLauncher 注入边界（生产 worker 线程，测试可替换）；
-                 工具注册表由 Session 持有
+  chat/
+    mod.rs       会话状态（历史、选择、适配器、工具注册表；字段不对外暴露，
+                 launcher 与 tools 是测试注入边界）、/compact 流程、
+                 供应商/模型/思考档位切换（规则是 config::switch_*_selection 纯函数）
+    turn.rs      一轮回合：流接收、逐块取消判定、回合终态；worker 契约
+                 （必经 Final/Error 收尾）与放弃路径（abandon）在这里
+    batch.rs     一批 tool_calls 的执行：限额/取消/终端失败前置检查、
+                 单调用结果提交与占位补齐；历史配对不变式在这里维护
   provider/
     mod.rs       ProviderAdapter trait（Send+Sync，Arc 共享）、FinishReason / ChunkOutcome、
                  按 Provider 构造、流式请求工作线程（取消/超时/字节上限、首字节看门狗）
@@ -123,7 +128,7 @@ trait Tool: Send + Sync {
 }
 ```
 
-- `ToolRegistry` 按声明顺序保存工具，`Session.tools` 默认注册 `bash` / `read` / `write` / `edit`。provider 的 `build_body` 接收 `&[ToolSpec]`，Chat Completions 与 Responses 只负责映射成各自的 tools 数组，不再引用固定工具名。
+- `ToolRegistry` 按声明顺序保存工具，Session 默认注册 `bash` / `read` / `write` / `edit`。provider 的 `build_body` 接收 `&[ToolSpec]`，Chat Completions 与 Responses 只负责映射成各自的 tools 数组，不再引用固定工具名。
 - 每个工具自己持有 schema、`#[serde(deny_unknown_fields)]` 参数结构、语义校验和执行逻辑；公共层只做注册、JSON object 校验、调用、结果提交和历史配对。
 - `ToolStatus`：`Success` 继续；`Failure`（参数错误、非零退出、超时、文件错误等）继续让模型自纠；`Interrupted` 记录当前结果、剩余调用补占位并停止本轮。取消/超限/终端失败的占位仍由 agent 写入历史。
 
@@ -196,7 +201,7 @@ enum ReadOutcome {
 - OpenAI Responses：`openai_responses` 适配器把历史映射为 `input` items（user/assistant 文本、`function_call`、`function_call_output`），系统提示写入顶层 `instructions`；流式事件按 `response.output_text.delta` / reasoning summary / `function_call_arguments.delta` 累积，`response.completed` / `response.incomplete` 作为终态，`response.failed` / `error` 直接报错。
 - Anthropic Messages：尚未实现；`protocol` 指向未知协议时返回可展示的错误。
 
-## 四、Agent 工具循环（chat.rs）
+## 四、Agent 工具循环（chat）
 
 ```
 用户输入 → push User msg
@@ -277,7 +282,7 @@ exit 0：/exit、空闲态 Ctrl-C 双按、Ctrl-D（均正常退出）
 | `commands` 补全候选与命令文案 / `ui::helper` 的 Pair 适配 | 纯单元测试，无 TTY；`tests/repl_flow.rs` 覆盖模型切换后的候选刷新 |
 | `provider::openai` / `provider::openai_responses` 解析 | 单元测试：构造 JSON chunk/事件 → `ChunkOutcome` / `TurnAcc` |
 | `provider::dns` 报文与回退 | 单元 + 本地 mock：假 DoH 服务（std TcpListener 手写 HTTP），覆盖 A/AAAA、压缩指针、NXDOMAIN、端点失败转移、TTL 缓存；报文编解码与 `config::parse_dns_endpoint` 为纯单元测试 |
-| agent loop + tools | 集成：`Session.launcher` 与 `Session.tools` 注入边界 + `ScriptedUi`，无网络驱动分支（取消/退出各粒度、占位补齐、非法参数/未知工具、配对不变式、状态栏的轮次与用量来源；时序用 channel 握手控制）；`BashTool::invoke` 与 `read` / `write` / `edit` 单元测试覆盖参数、截断、CRLF、相似行和文件边界 |
+| agent loop + tools | 集成：`Session::with_launcher` 与 `Session::with_tools` 注入边界 + `ScriptedUi`，无网络驱动分支（取消/退出各粒度、占位补齐、非法参数/未知工具、配对不变式、状态栏的轮次与用量来源；时序用 channel 握手控制）；`BashTool::invoke` 与 `read` / `write` / `edit` 单元测试覆盖参数、截断、CRLF、相似行和文件边界 |
 | provider + HTTP 层 | 集成：本地 mock SSE 服务（std TcpListener 手写），测协议映射与流读取 |
 | 端到端工具循环 | 集成：mock SSE 服务驱动多轮真实 HTTP 请求，验证占位 Tool 消息的配对/顺序/第二次请求序列化（含 echo_reasoning） |
 | 取消/退出 | 集成：`ScriptedUi` 注入 `Line("/exit")`、`Eof` 验证退出路径；注入 `Interrupted{line_empty}` 序列验证 2 秒双按窗口、编辑中撤销、提交行清除武装（并断言 `set_ctrl_c_hint` 序列）；直接注入信号记录（第 1 次）验证流式取消路径——quit 路径（第 2 次）的计数判定由 `term.rs` 单元测试覆盖，端到端行为由 PTY 测试覆盖 |

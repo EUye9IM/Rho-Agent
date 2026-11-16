@@ -117,7 +117,7 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 
 - 纯单元：`sse.rs`、`config`、`tools` 参数校验/截断/文件边界、`render`、`commands` 补全候选
 - 协议映射：`provider::openai`（Chat Completions）与 `provider::openai_responses`（Responses）
-- agent loop + 工具：`ScriptedUi` + `StreamLauncher` / `Session.tools` 注册表注入
+- agent loop + 工具：`ScriptedUi` + `StreamLauncher` / `Session::with_tools` 注册表注入
 - 上下文压缩：`context` 纯函数（切点、预算裁剪、估算）单测；`Session::compact` 用 `RecordingLauncher` 断言请求体与历史改写
 - HTTP/SSE：`tests/e2e_mock.rs` 的本地 mock 服务
 - REPL：`tests/repl_flow.rs`
