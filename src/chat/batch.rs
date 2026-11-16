@@ -36,7 +36,7 @@ pub(super) enum ToolPhase {
 }
 
 impl Session {
-    /// 执行一批 tool_calls：每个执行前先查限额与取消标志；全部执行完返回 Done。
+    /// 执行一批 tool_calls：每个执行前先做前置检查；全部执行完返回 Done。
     /// 任何返回路径都保证剩余调用已补占位：Assistant 的每个 tool_call 都有对应 Tool 消息。
     /// 结果写入与计数集中在 commit_call_result：单调用分支再多也不会漏掉历史配对。
     pub(super) fn run_tool_calls(
@@ -50,31 +50,9 @@ impl Session {
         let mut i = 0;
 
         while i < tool_calls.len() {
-            // 限额逐个前置检查：当前及剩余调用补超限占位。
-            if *steps >= max {
-                self.placeholders(ui, &tool_calls[i..], LIMIT_PLACEHOLDER, ToolStatus::Failure);
-                return ToolPhase::Limit(max);
-            }
-
-            if let Some(sig) = cancel.pending() {
-                self.placeholders(
-                    ui,
-                    &tool_calls[i..],
-                    CANCELLED_PLACEHOLDER,
-                    ToolStatus::Interrupted,
-                );
-                return if sig == SignalState::Quit {
-                    ToolPhase::Quit
-                } else {
-                    ToolPhase::Cancelled
-                };
-            }
-
-            // 终端写失败：剩余调用补占位后上抛（exit 1；占位写入可能同样失败，
-            // 但历史配对仍由本函数保证）。
-            if let Some(e) = ui.take_fatal() {
-                self.placeholders(ui, &tool_calls[i..], FATAL_PLACEHOLDER, ToolStatus::Failure);
-                return ToolPhase::Fatal(e);
+            // 执行前三查：超限、取消/退出、终端写失败。命中即补占位并结束批次。
+            if let Some(phase) = self.check_before_call(ui, cancel, *steps, max, &tool_calls[i..]) {
+                return phase;
             }
 
             let result = {
@@ -88,36 +66,75 @@ impl Session {
             // 单一出口：渲染结果、写入历史、计数（含取消/退出路径的当前调用）。
             self.commit_call_result(ui, &tool_calls[i].name, &tool_calls[i].id, result, steps);
 
-            if interrupted {
-                self.placeholders(
-                    ui,
-                    &tool_calls[i + 1..],
-                    CANCELLED_PLACEHOLDER,
-                    ToolStatus::Interrupted,
-                );
-                // 执行/清理期间第二次 Ctrl-C：信号计数已置 quit。
-                return if cancel.is_quit() {
-                    ToolPhase::Quit
-                } else {
-                    ToolPhase::Cancelled
-                };
-            }
-
-            // 执行/清理期间第二次 Ctrl-C：信号计数已置 quit。
-            if cancel.is_quit() {
-                self.placeholders(
-                    ui,
-                    &tool_calls[i + 1..],
-                    CANCELLED_PLACEHOLDER,
-                    ToolStatus::Interrupted,
-                );
-                return ToolPhase::Quit;
+            // 工具被取消（当前结果已记录）或执行/清理期间升级为 quit：
+            // 剩余调用统一补占位后判定方向。
+            if interrupted || cancel.is_quit() {
+                return self.cancel_remaining(ui, cancel, &tool_calls[i + 1..]);
             }
             i += 1;
         }
 
         // 全部工具执行完。
         ToolPhase::Done
+    }
+
+    /// 单个调用执行前的前置检查：超限、取消/退出、终端写失败任一命中时，
+    /// 剩余调用（含当前）补对应占位并返回该阶段结果；全部通过返回 None。
+    fn check_before_call(
+        &mut self,
+        ui: &mut dyn Ui,
+        cancel: &Cancel,
+        steps: u32,
+        max: u32,
+        remaining: &[ToolCall],
+    ) -> Option<ToolPhase> {
+        // 限额逐个前置检查：剩余调用补超限占位。
+        if steps >= max {
+            self.placeholders(ui, remaining, LIMIT_PLACEHOLDER, ToolStatus::Failure);
+            return Some(ToolPhase::Limit(max));
+        }
+
+        if let Some(sig) = cancel.pending() {
+            self.placeholders(
+                ui,
+                remaining,
+                CANCELLED_PLACEHOLDER,
+                ToolStatus::Interrupted,
+            );
+            return Some(match sig {
+                SignalState::Quit => ToolPhase::Quit,
+                _ => ToolPhase::Cancelled,
+            });
+        }
+
+        // 终端写失败：剩余调用补占位后上抛（exit 1；占位写入可能同样失败，
+        // 但历史配对仍由本函数保证）。
+        if let Some(e) = ui.take_fatal() {
+            self.placeholders(ui, remaining, FATAL_PLACEHOLDER, ToolStatus::Failure);
+            return Some(ToolPhase::Fatal(e));
+        }
+        None
+    }
+
+    /// 执行/清理期间发现取消或退出后的唯一收尾：剩余调用补取消占位，
+    /// 再按当前信号状态判定 Cancelled / Quit。
+    fn cancel_remaining(
+        &mut self,
+        ui: &mut dyn Ui,
+        cancel: &Cancel,
+        remaining: &[ToolCall],
+    ) -> ToolPhase {
+        self.placeholders(
+            ui,
+            remaining,
+            CANCELLED_PLACEHOLDER,
+            ToolStatus::Interrupted,
+        );
+        if cancel.is_quit() {
+            ToolPhase::Quit
+        } else {
+            ToolPhase::Cancelled
+        }
     }
 
     /// 单个调用结果的唯一出口：渲染 ToolResult、写入历史、计数。
