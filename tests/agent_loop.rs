@@ -289,18 +289,18 @@ impl Ui for FailingUi {
 #[test]
 fn first_call_failures_do_not_block_rest() {
     let mut session = session();
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![
+    session = session.with_launcher(Arc::new(ScriptedLauncher::new(vec![
         vec![StreamEvent::Final(Box::new(assistant_with_calls(vec![
             call("c1", "nope", "{}"),
             call("c2", "bash", "{not json"),
             call("c3", "bash", CMD),
         ])))],
         vec![text_final("done")],
-    ]));
+    ])));
     // 未知工具/参数错误不影响后续调用；c3 正常执行。
-    session.tools = registry_with(PresetTool {
+    session = session.with_tools(registry_with(PresetTool {
         output: "hi".into(),
-    });
+    }));
     let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
@@ -323,13 +323,13 @@ fn first_call_failures_do_not_block_rest() {
 #[test]
 fn execution_cancel_keeps_partial_result() {
     let mut session = session();
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![StreamEvent::Final(
-        Box::new(assistant_with_calls(vec![
+    session = session.with_launcher(Arc::new(ScriptedLauncher::new(vec![vec![
+        StreamEvent::Final(Box::new(assistant_with_calls(vec![
             call("c1", "bash", CMD),
             call("c2", "bash", CMD),
-        ])),
-    )]]));
-    session.tools = registry_with(InjectingTool { injects: 1 });
+        ]))),
+    ]])));
+    session = session.with_tools(registry_with(InjectingTool { injects: 1 }));
     let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
@@ -344,14 +344,14 @@ fn execution_cancel_keeps_partial_result() {
 #[test]
 fn quit_during_cleanup_exits_after_placeholders() {
     let mut session = session();
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![StreamEvent::Final(
-        Box::new(assistant_with_calls(vec![
+    session = session.with_launcher(Arc::new(ScriptedLauncher::new(vec![vec![
+        StreamEvent::Final(Box::new(assistant_with_calls(vec![
             call("c1", "bash", CMD),
             call("c2", "bash", CMD),
-        ])),
-    )]]));
+        ]))),
+    ]])));
     // 执行中一次取消 + 清理期间升级第二次：收尾完成后退出。
-    session.tools = registry_with(InjectingTool { injects: 2 });
+    session = session.with_tools(registry_with(InjectingTool { injects: 2 }));
     let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
@@ -366,10 +366,10 @@ fn sustained_delta_is_cancellable() {
     let mut session = session();
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    session.launcher = Arc::new(ParkingLauncher {
+    session = session.with_launcher(Arc::new(ParkingLauncher {
         ready: ready_tx,
         released: Mutex::new(Some(release_rx)),
-    });
+    }));
     let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
     let injector = injector_after_ready(cancel.clone(), ready_rx, release_tx, 1);
@@ -386,10 +386,10 @@ fn quit_during_stream_returns_quit() {
     let mut session = session();
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    session.launcher = Arc::new(ParkingLauncher {
+    session = session.with_launcher(Arc::new(ParkingLauncher {
         ready: ready_tx,
         released: Mutex::new(Some(release_rx)),
-    });
+    }));
     let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
     let injector = injector_after_ready(cancel.clone(), ready_rx, release_tx, 2);
@@ -403,7 +403,7 @@ fn quit_during_stream_returns_quit() {
 fn disconnect_without_terminal_is_error() {
     let mut session = session();
     // 空脚本：事件线程立即结束，通道断开且无终态 → 防御性按 Error 收尾。
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![]]));
+    session = session.with_launcher(Arc::new(ScriptedLauncher::new(vec![vec![]])));
     let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
@@ -416,13 +416,13 @@ fn disconnect_without_terminal_is_error() {
 #[test]
 fn render_failure_during_stream_aborts_before_commit() {
     let mut session = session();
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![
+    session = session.with_launcher(Arc::new(ScriptedLauncher::new(vec![vec![
         StreamEvent::Delta {
             text: Some("partial".into()),
             reasoning: None,
         },
         text_final("done"),
-    ]]));
+    ]])));
     // 首个 Delta 渲染即失败：流收尾后不提交 Assistant，不执行工具。
     let mut ui = FailingUi::new(0);
     let cancel = Cancel::new();
@@ -437,17 +437,17 @@ fn render_failure_during_stream_aborts_before_commit() {
 #[test]
 fn render_failure_mid_batch_placeholders_remaining_then_fatal() {
     let mut session = session();
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![StreamEvent::Final(
-        Box::new(assistant_with_calls(vec![
+    session = session.with_launcher(Arc::new(ScriptedLauncher::new(vec![vec![
+        StreamEvent::Final(Box::new(assistant_with_calls(vec![
             call("c1", "bash", CMD),
             call("c2", "bash", CMD),
-        ])),
-    )]]));
+        ]))),
+    ]])));
     // 第一次 print（ToolCall 行）成功，第二个调用的结果渲染开始失败。
     let mut ui = FailingUi::new(1);
-    session.tools = registry_with(PresetTool {
+    session = session.with_tools(registry_with(PresetTool {
         output: "hi".into(),
-    });
+    }));
     let cancel = Cancel::new();
 
     match session.turn(&mut ui, &cancel, "go").unwrap() {
@@ -470,9 +470,9 @@ fn invalid_tool_call_ids_are_rejected_before_submit() {
         vec![call("c1", "bash", CMD), call("c1", "bash", CMD)],
     ] {
         let mut session = session();
-        session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![StreamEvent::Final(
-            Box::new(assistant_with_calls(calls)),
-        )]]));
+        session = session.with_launcher(Arc::new(ScriptedLauncher::new(vec![vec![
+            StreamEvent::Final(Box::new(assistant_with_calls(calls))),
+        ]])));
         let mut ui = ScriptedUi::new(vec![]);
         let cancel = Cancel::new();
 
@@ -488,14 +488,14 @@ fn invalid_tool_call_ids_are_rejected_before_submit() {
 #[test]
 fn non_object_and_invalid_tool_args_are_counted_failures() {
     let mut session = session();
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![
+    session = session.with_launcher(Arc::new(ScriptedLauncher::new(vec![
         vec![StreamEvent::Final(Box::new(assistant_with_calls(vec![
             call("c1", "bash", "[]"),
             call("c2", "bash", r#"{"command":"echo hi","extra":1}"#),
             call("c3", "bash", r#"{}"#),
         ])))],
         vec![text_final("done")],
-    ]));
+    ])));
     let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
@@ -527,14 +527,14 @@ fn builtin_write_read_edit_dispatch_through_registry() {
     })
     .to_string();
 
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![
+    session = session.with_launcher(Arc::new(ScriptedLauncher::new(vec![
         vec![StreamEvent::Final(Box::new(assistant_with_calls(vec![
             call("c1", "write", &write_args),
             call("c2", "read", &read_args),
             call("c3", "edit", &edit_args),
         ])))],
         vec![text_final("done")],
-    ]));
+    ])));
     let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
@@ -571,7 +571,7 @@ fn last_status(ui: &ScriptedUi) -> rho::render::StatusLine {
 #[test]
 fn status_reports_the_last_completed_request_in_the_turn() {
     let mut session = session();
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![
+    session = session.with_launcher(Arc::new(ScriptedLauncher::new(vec![
         // 第一次请求：调用工具，带 usage。
         vec![
             StreamEvent::Usage(usage(120, 30, 150, Some(96))),
@@ -584,10 +584,10 @@ fn status_reports_the_last_completed_request_in_the_turn() {
             StreamEvent::Usage(usage(200, 50, 250, None)),
             text_final("done"),
         ],
-    ]));
-    session.tools = registry_with(PresetTool {
+    ])));
+    session = session.with_tools(registry_with(PresetTool {
         output: "hi".into(),
-    });
+    }));
     let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
@@ -611,13 +611,13 @@ fn status_reports_the_last_completed_request_in_the_turn() {
 #[test]
 fn cancelled_turn_still_prints_status_with_earlier_usage() {
     let mut session = session();
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![
+    session = session.with_launcher(Arc::new(ScriptedLauncher::new(vec![vec![
         StreamEvent::Usage(usage(120, 30, 150, Some(96))),
         StreamEvent::Final(Box::new(assistant_with_calls(vec![call(
             "c1", "bash", CMD,
         )]))),
-    ]]));
-    session.tools = registry_with(InjectingTool { injects: 1 });
+    ]])));
+    session = session.with_tools(registry_with(InjectingTool { injects: 1 }));
     let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
@@ -636,10 +636,10 @@ fn cancelled_first_request_reports_unknown_usage() {
     let mut session = session();
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    session.launcher = Arc::new(ParkingLauncher {
+    session = session.with_launcher(Arc::new(ParkingLauncher {
         ready: ready_tx,
         released: Mutex::new(Some(release_rx)),
-    });
+    }));
     let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
     let injector = injector_after_ready(cancel.clone(), ready_rx, release_tx, 1);
@@ -653,11 +653,13 @@ fn cancelled_first_request_reports_unknown_usage() {
 #[test]
 fn quit_paths_do_not_print_status() {
     let mut session = session();
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![vec![StreamEvent::Final(
-        Box::new(assistant_with_calls(vec![call("c1", "bash", CMD)])),
-    )]]));
+    session = session.with_launcher(Arc::new(ScriptedLauncher::new(vec![vec![
+        StreamEvent::Final(Box::new(assistant_with_calls(vec![call(
+            "c1", "bash", CMD,
+        )]))),
+    ]])));
     // 执行中两次注入：升级为 quit，回合以 Err 上抛。
-    session.tools = registry_with(InjectingTool { injects: 2 });
+    session = session.with_tools(registry_with(InjectingTool { injects: 2 }));
     let mut ui = ScriptedUi::new(vec![]);
     let cancel = Cancel::new();
 
@@ -671,11 +673,11 @@ fn quit_paths_do_not_print_status() {
 #[test]
 fn status_turn_counts_user_inputs_and_resets_on_clear() {
     let mut session = session();
-    session.launcher = Arc::new(ScriptedLauncher::new(vec![
+    session = session.with_launcher(Arc::new(ScriptedLauncher::new(vec![
         vec![text_final("one")],
         vec![text_final("two")],
         vec![text_final("three")],
-    ]));
+    ])));
     let cancel = Cancel::new();
 
     let mut first = ScriptedUi::new(vec![]);
@@ -730,7 +732,7 @@ fn compact_replaces_older_turns_with_a_summary() {
         vec![text_final("CHECKPOINT")],
     ]);
     let mut session = session();
-    session.launcher = Arc::new(launcher.clone());
+    session = session.with_launcher(Arc::new(launcher.clone()));
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![]);
     fill_turns(&mut session, &mut ui, &cancel, 3);
@@ -776,7 +778,7 @@ fn compact_uses_configured_prompt_and_keep_turns() {
         vec![text_final("CHECKPOINT")],
     ]);
     let mut session = session_with("[compact]\nprompt = \"SUM\"\nkeep_turns = 1");
-    session.launcher = Arc::new(launcher.clone());
+    session = session.with_launcher(Arc::new(launcher.clone()));
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![]);
     fill_turns(&mut session, &mut ui, &cancel, 2);
@@ -797,7 +799,7 @@ fn compact_uses_configured_prompt_and_keep_turns() {
 fn compact_without_enough_turns_reports_and_sends_nothing() {
     let launcher = RecordingLauncher::new(vec![vec![text_final("a1")]]);
     let mut session = session();
-    session.launcher = Arc::new(launcher.clone());
+    session = session.with_launcher(Arc::new(launcher.clone()));
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![]);
     fill_turns(&mut session, &mut ui, &cancel, 1);
@@ -821,7 +823,7 @@ fn compact_failure_leaves_history_unchanged() {
         vec![StreamEvent::Error("上游 400".into())],
     ]);
     let mut session = session();
-    session.launcher = Arc::new(launcher.clone());
+    session = session.with_launcher(Arc::new(launcher.clone()));
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![]);
     fill_turns(&mut session, &mut ui, &cancel, 3);
@@ -854,7 +856,7 @@ fn compact_with_empty_reply_keeps_history() {
         }))],
     ]);
     let mut session = session();
-    session.launcher = Arc::new(launcher.clone());
+    session = session.with_launcher(Arc::new(launcher.clone()));
     let cancel = Cancel::new();
     let mut ui = ScriptedUi::new(vec![]);
     fill_turns(&mut session, &mut ui, &cancel, 3);

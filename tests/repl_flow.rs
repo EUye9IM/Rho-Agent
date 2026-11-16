@@ -213,12 +213,12 @@ fn provider_switch_same_provider_preserves_model_and_thinking() {
     s.switch_model("mock/n").unwrap();
     s.switch_thinking("low").unwrap();
     s.switch_provider("mock").unwrap();
-    assert_eq!(s.selection.model_id, "mock/n");
-    assert_eq!(s.selection.thinking.as_deref(), Some("low"));
+    assert_eq!(s.selection().model_id, "mock/n");
+    assert_eq!(s.selection().thinking.as_deref(), Some("low"));
 
     s.switch_provider("other").unwrap();
-    assert_eq!(s.selection.model_id, "other/m2");
-    assert_eq!(s.selection.thinking, None);
+    assert_eq!(s.selection().model_id, "other/m2");
+    assert_eq!(s.selection().thinking, None);
 }
 
 #[test]
@@ -265,8 +265,8 @@ context_window = 1000
 max_output = 100
 "#,
     );
-    assert_eq!(s.selection.provider_id, "mock");
-    assert_eq!(s.selection.model_id, "mock/m");
+    assert_eq!(s.selection().provider_id, "mock");
+    assert_eq!(s.selection().model_id, "mock/m");
     s.switch_provider("empty").unwrap_err();
 }
 
@@ -294,8 +294,8 @@ context_window = 1000
 max_output = 100
 "#,
     );
-    assert_eq!(s.selection.model_id, "mock/m");
-    assert_eq!(s.selection.provider_id, "mock");
+    assert_eq!(s.selection().model_id, "mock/m");
+    assert_eq!(s.selection().provider_id, "mock");
 }
 
 #[test]

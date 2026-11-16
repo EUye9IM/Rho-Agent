@@ -72,17 +72,19 @@ impl StreamLauncher for WorkerLauncher {
     }
 }
 
-/// 会话状态：历史 + 当前选择 + 适配器 + 工具注册表 + 工具步数。
+/// 会话状态：历史 + 当前选择 + 适配器 + 工具注册表。
 /// adapter 为 Arc 共享：会话长期持有，每轮 clone 一份按值传给 worker
-/// （thread::spawn + detach 取消语义需 'static，不能借引用）。
+/// （thread::spawn + detach 取消语义需 'static，不能借引用）；切换供应商时按新
+/// protocol/compat 重建，与 selection 保持一致由本类型的方法维护，字段不对外暴露。
 /// thinking 唯一真值源是 selection.thinking（switch_* 同步更新）。
-/// launcher 是流式请求的测试注入边界；tools 可在测试中替换为自定义注册表。
+/// launcher 与 tools 是测试注入边界：`with_launcher` / `with_tools` 替换，
+/// 配置与选择经 `cfg()` / `selection()` 只读访问。
 pub struct Session {
-    pub cfg: Config,
-    pub selection: Selection,
-    pub adapter: Arc<dyn ProviderAdapter>,
-    pub launcher: Arc<dyn StreamLauncher>,
-    pub tools: ToolRegistry,
+    cfg: Config,
+    selection: Selection,
+    adapter: Arc<dyn ProviderAdapter>,
+    launcher: Arc<dyn StreamLauncher>,
+    tools: ToolRegistry,
     /// rho 启动目录，用于解析工具的相对路径。
     cwd: PathBuf,
     /// 只由 agent loop 写入；对外只读，保证 tool_calls 与 Tool 结果的配对不变式。
@@ -160,6 +162,28 @@ impl Session {
     /// 只读历史（测试与 REPL 检查用）；写入路径留在 agent loop 内。
     pub fn history(&self) -> &[Msg] {
         &self.history
+    }
+
+    /// 当前配置（命令层与补全快照读取）。
+    pub fn cfg(&self) -> &Config {
+        &self.cfg
+    }
+
+    /// 当前选择：供应商、模型与思考档位（命令层与补全快照读取）。
+    pub fn selection(&self) -> &Selection {
+        &self.selection
+    }
+
+    /// 测试注入边界：替换流式请求启动器（生产为每轮起 worker 线程的 `WorkerLauncher`）。
+    pub fn with_launcher(mut self, launcher: Arc<dyn StreamLauncher>) -> Self {
+        self.launcher = launcher;
+        self
+    }
+
+    /// 测试注入边界：替换工具注册表（默认为内置 bash / read / write / edit）。
+    pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
+        self.tools = tools;
+        self
     }
 
     /// 会话内第几条用户输入；`/clear` 重置历史后自然归零。
