@@ -44,6 +44,7 @@ src/
                  执行只修改 Session 并返回 CommandEffect，输出由 repl 交给 Ui
   context.rs     上下文压缩的纯函数：切点规划（保留最近 N 轮）、
                  压缩请求的预算裁剪、token 粗估、内置摘要指令常量
+  text.rs        文本工具函数：按 Unicode 字符截断（无内部依赖，供 tools / context / chat 使用）
   completion.rs  补全协议：CompletionProvider trait、Candidate / Completion；
                  不依赖终端、命令或 Session
   chat.rs        会话历史（Vec<Msg>，对外只读）、通用工具循环与批次编排；
@@ -87,7 +88,7 @@ src/
     scripted.rs  测试实现 ScriptedUi（预排输入、收集渲染事件）
 ```
 
-依赖方向为 `repl → commands/chat/ui`；`commands → chat/completion`，`chat → provider → sse/message`，`chat → tools → term`，`ui → completion/render → tools`。`completion` 只定义补全协议，`ui` 只把候选适配到 rustyline；`commands` 持有命令与候选语义，`repl` 负责按调用注入当前快照。`Msg`/`AssistantMsg`/`ToolCall` 放在 `message.rs`，chat 与 provider 都只依赖这个共享模型，provider 不再反向依赖 chat。`config` 被各层读取，处于依赖关系底层。`render` 提供有状态渲染器（`Renderer`）与 `RenderEvent`：`chat` 只产生 `RenderEvent`，`ui` 持有 `Renderer` 把事件序列化为待写文本，按标准输出/标准错误分流写入终端。回合结束的 `RenderEvent::Status` 同时承担“确保行首”的职责，因此不再单独发折行事件。
+依赖方向为 `repl → commands/chat/ui`；`commands → chat/completion`，`chat → provider → sse/message`，`chat → tools → term`，`ui → completion/render → text`，`context → text`。`completion` 只定义补全协议，`ui` 只把候选适配到 rustyline；`commands` 持有命令与候选语义，`repl` 负责按调用注入当前快照。`Msg`/`AssistantMsg`/`ToolCall` 放在 `message.rs`，chat 与 provider 都只依赖这个共享模型，provider 不再反向依赖 chat。`config` 被各层读取，处于依赖关系底层。`render` 提供有状态渲染器（`Renderer`）与 `RenderEvent`：`chat` 只产生 `RenderEvent`，`ui` 持有 `Renderer` 把事件序列化为待写文本，按标准输出/标准错误分流写入终端。回合结束的 `RenderEvent::Status` 同时承担“确保行首”的职责，因此不再单独发折行事件。
 
 ## 三、关键数据类型
 

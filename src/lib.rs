@@ -3,7 +3,8 @@
 //! 集成测试（tests/）经此访问 crate 内部；bin 只是壳。
 //! 模块布局与依赖方向（单向向下）：
 //! repl → commands/chat/ui；commands → chat/completion，chat → provider → sse/message，
-//! ui → completion/render；config 被所有层读，不反向依赖。
+//! chat → tools → term；ui → completion/render → text；context → text；config 被所有层读，
+//! 不反向依赖。
 
 pub mod chat;
 pub mod commands;
@@ -16,5 +17,6 @@ pub mod render;
 pub mod repl;
 pub mod sse;
 pub mod term;
+pub mod text;
 pub mod tools;
 pub mod ui;

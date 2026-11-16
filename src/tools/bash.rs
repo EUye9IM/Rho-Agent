@@ -59,7 +59,7 @@ impl Tool for BashTool {
         args.get("command")
             .and_then(Value::as_str)
             .map(|s| truncate_chars(s, 200))
-            .unwrap_or_else(|| super::truncate_chars(&args.to_string(), 200))
+            .unwrap_or_else(|| truncate_chars(&args.to_string(), 200))
     }
 
     fn invoke(&self, args: Value, ctx: &ToolContext<'_>) -> ToolResult {

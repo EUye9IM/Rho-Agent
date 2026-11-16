@@ -15,6 +15,8 @@ use crate::term::Cancel;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+pub(crate) use crate::text::truncate_chars;
+
 /// 与协议无关的工具定义；适配层负责映射成各自的 wire format。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {
@@ -165,17 +167,6 @@ pub(crate) fn resolve_path(cwd: &Path, raw: &str) -> Result<PathBuf, String> {
 
 pub(crate) fn display_path(path: &Path) -> String {
     path.display().to_string()
-}
-
-/// 按 Unicode 字符截断，超出时补省略号。
-pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
-    let mut chars = text.chars();
-    let out: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{out}…")
-    } else {
-        out
-    }
 }
 
 #[cfg(test)]

@@ -122,12 +122,12 @@ fn shrink(head: &mut [Msg]) {
     for msg in head.iter_mut() {
         match msg {
             Msg::Tool { content, .. } => {
-                *content = crate::tools::truncate_chars(content, TOOL_RESULT_CHARS);
+                *content = crate::text::truncate_chars(content, TOOL_RESULT_CHARS);
             }
             Msg::Assistant(assistant) => {
                 assistant.reasoning = None;
                 if let Some(text) = &assistant.text {
-                    assistant.text = Some(crate::tools::truncate_chars(text, ASSISTANT_TEXT_CHARS));
+                    assistant.text = Some(crate::text::truncate_chars(text, ASSISTANT_TEXT_CHARS));
                 }
             }
             _ => {}
