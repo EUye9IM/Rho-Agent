@@ -82,7 +82,8 @@ src/
                  其余（含行首留空白的行）作为普通输入交给 agent loop
   term.rs        终端信号处理（SIGINT、进程组信号）
   ui/
-    mod.rs       Ui trait + 生产实现 TermUi（rustyline）；负责终端输出
+    mod.rs       Ui trait 与 ReadOutcome；Ui 不承载退出语义
+    term.rs      生产实现 TermUi（rustyline）：编辑器组装、渲染输出、屏幕行回收
     helper.rs    rustyline helper：Ctrl-C 灰提示 + 补全候选适配
     hint.rs      Ctrl-C 双按灰提示：提示状态、期限线程与到期擦除
     scripted.rs  测试实现 ScriptedUi（预排输入、收集渲染事件）
