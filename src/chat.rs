@@ -618,48 +618,28 @@ impl Session {
     }
 
     /// 切换供应商（REPL /provider）：联动重置模型与 thinking，并按新 provider
-    /// 重建适配器（compat / protocol 可能不同）。
+    /// 重建适配器（compat / protocol 可能不同）。规则在 config::switch_provider_selection。
     pub fn switch_provider(&mut self, id: &str) -> Result<(), String> {
-        let mut selection = config::selection_for_provider(&self.cfg, id)?;
-        // 当前模型本来就属于新 provider 时保留模型与 thinking；
-        // 只有跨 provider 才重置为该 provider 声明顺序第一个模型。
-        if config::model_provider_prefix(&self.selection.model_id) == Some(id) {
-            selection.model_id = self.selection.model_id.clone();
-            selection.model = self.selection.model.clone();
-            selection.thinking = self.selection.thinking.clone();
-        }
+        let selection = config::switch_provider_selection(&self.cfg, &self.selection, id)?;
         let adapter = provider::adapter_for(&selection.provider)?;
         self.selection = selection;
         self.adapter = adapter;
         Ok(())
     }
 
-    /// 切换模型（REPL /model）：跨 provider 拒绝；thinking 重置。
+    /// 切换模型（REPL /model）：跨供应商拒绝；thinking 重置。
+    /// 规则在 config::switch_model_selection。
     pub fn switch_model(&mut self, id: &str) -> Result<(), String> {
-        if config::find_model(&self.cfg, id).is_none() {
-            return Err(format!("未声明的模型：{id}"));
-        }
-        let prefix = config::model_provider_prefix(id)
-            .ok_or_else(|| format!("模型 id 必须带供应商前缀：{id}"))?;
-        if prefix != self.selection.provider_id {
-            return Err(format!(
-                "模型 {id} 不属于当前供应商 {}，请先 /provider {prefix}",
-                self.selection.provider_id
-            ));
-        }
-        let selection = config::selection_for_model(&self.cfg, id)?;
+        let selection = config::switch_model_selection(&self.cfg, &self.selection.provider_id, id)?;
         self.selection = selection;
         Ok(())
     }
 
     /// 切换思考档位（REPL /thinking）：无效档位拒绝；更新 selection.thinking。
+    /// 规则在 config::switch_thinking_selection。
     pub fn switch_thinking(&mut self, level: &str) -> Result<(), String> {
-        if let Some(e) =
-            config::thinking_level_err(&self.selection.model, &self.selection.model_id, level)
-        {
-            return Err(e);
-        }
-        self.selection.thinking = Some(level.to_string());
+        let selection = config::switch_thinking_selection(&self.selection, level)?;
+        self.selection = selection;
         Ok(())
     }
 }
