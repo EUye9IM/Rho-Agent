@@ -60,22 +60,12 @@ pub fn tool_call_line(name: &str, summary: &str) -> String {
     format!("{TOOL_CALL_OPEN}→ {name}: {summary}{RESET}")
 }
 
-/// 工具结果带左边栏显示，空白行不补尾随空格；成功绿色、失败红色、打断黄色。
+/// 工具结果按行输出，换行归一化为 `\n`；成功绿色、失败红色、打断黄色。
 pub fn tool_result_block(content: &str, status: ToolStatus) -> String {
     let body = if content.is_empty() {
-        "  │ （无输出）".to_string()
+        "（无输出）".to_string()
     } else {
-        content
-            .lines()
-            .map(|line| {
-                if line.is_empty() {
-                    "  │".to_string()
-                } else {
-                    format!("  │ {line}")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        content.lines().collect::<Vec<_>>().join("\n")
     };
     match status {
         ToolStatus::Success => format!("{SUCCESS_OPEN}{body}{RESET}"),
@@ -294,10 +284,10 @@ mod tests {
     }
 
     #[test]
-    fn result_block_uses_left_rail_and_green_success() {
+    fn result_block_is_green_on_success() {
         assert_eq!(
             tool_result_block("a\nb", ToolStatus::Success),
-            "\x1b[32m  │ a\n  │ b\x1b[0m"
+            "\x1b[32ma\nb\x1b[0m"
         );
     }
 
@@ -305,15 +295,23 @@ mod tests {
     fn result_block_handles_empty_output() {
         assert_eq!(
             tool_result_block("", ToolStatus::Success),
-            "\x1b[32m  │ （无输出）\x1b[0m"
+            "\x1b[32m（无输出）\x1b[0m"
         );
     }
 
     #[test]
-    fn result_block_keeps_blank_lines() {
+    fn result_block_keeps_blank_lines_and_drops_trailing_newline() {
         assert_eq!(
-            tool_result_block("a\n\nb", ToolStatus::Success),
-            "\x1b[32m  │ a\n  │\n  │ b\x1b[0m"
+            tool_result_block("a\n\nb\n", ToolStatus::Success),
+            "\x1b[32ma\n\nb\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn result_block_normalizes_crlf() {
+        assert_eq!(
+            tool_result_block("a\r\nb", ToolStatus::Success),
+            "\x1b[32ma\nb\x1b[0m"
         );
     }
 
@@ -321,7 +319,7 @@ mod tests {
     fn failure_result_is_red() {
         assert_eq!(
             tool_result_block("x", ToolStatus::Failure),
-            "\x1b[31m  │ x\x1b[0m"
+            "\x1b[31mx\x1b[0m"
         );
     }
 
@@ -329,7 +327,7 @@ mod tests {
     fn interrupted_result_is_yellow() {
         assert_eq!(
             tool_result_block("x", ToolStatus::Interrupted),
-            "\x1b[33m  │ x\x1b[0m"
+            "\x1b[33mx\x1b[0m"
         );
     }
 
@@ -482,14 +480,14 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_uses_left_rail_and_newline() {
+    fn tool_result_starts_with_content_and_ends_with_newline() {
         let mut r = Renderer::new();
         let out = r.event(&RenderEvent::ToolResult {
             name: "bash".into(),
             display: Some("a\nb".into()),
             status: ToolStatus::Success,
         });
-        assert_eq!(stdout(&out), "\x1b[32m  │ a\n  │ b\x1b[0m\n");
+        assert_eq!(stdout(&out), "\x1b[32ma\nb\x1b[0m\n");
     }
 
     #[test]

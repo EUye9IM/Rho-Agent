@@ -525,7 +525,7 @@ fn prompt_input_tool_call_and_success_result_are_colored() {
         rho.raw_tail(3000)
     );
     assert!(rho.raw_contains("\x1b[35m→ bash: echo hi\x1b[0m"));
-    assert!(rho.raw_contains("\x1b[32m  │ [status] completed"));
+    assert!(rho.raw_contains("\x1b[32m[status] completed"));
     // 第二次请求会因 mock 单连接关闭而失败；回到提示符后正常退出。
     rho.expect_screen("rho>", Duration::from_secs(8));
     std::thread::sleep(SETTLE);
