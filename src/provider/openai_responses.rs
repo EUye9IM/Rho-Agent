@@ -58,6 +58,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                 Msg::Tool {
                     tool_call_id,
                     content,
+                    ..
                 } => input.push(json!({
                     "type": "function_call_output",
                     "call_id": tool_call_id,
@@ -426,7 +427,10 @@ mod tests {
             }),
             Msg::Tool {
                 tool_call_id: "call_1".into(),
+                name: "bash".into(),
                 content: "ok".into(),
+                display: Some("ok".into()),
+                status: crate::message::ToolStatus::Success,
             },
         ];
         let thinking = json!({ "reasoning": { "effort": "low" } });

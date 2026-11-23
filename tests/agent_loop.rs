@@ -11,7 +11,7 @@ use rho::tools::{Tool, ToolContext, ToolRegistry, ToolResult, ToolSpec, ToolStat
 use rho::ui::{ReadOutcome, ScriptedUi, Ui};
 
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -689,7 +689,8 @@ fn status_turn_counts_user_inputs_and_resets_on_clear() {
     assert_eq!(last_status(&second).turn, 2);
 
     // /clear 重置历史：轮次归零，下一次输入重新算作第 1 轮。
-    session.clear();
+    let mut clear_ui = ScriptedUi::new(vec![]);
+    session.clear(&mut clear_ui);
     let mut third = ScriptedUi::new(vec![]);
     session.turn(&mut third, &cancel, "go").unwrap();
     assert_eq!(last_status(&third).turn, 1);
@@ -870,4 +871,158 @@ fn compact_with_empty_reply_keeps_history() {
         .rendered
         .iter()
         .any(|e| matches!(e, rho::render::RenderEvent::Error(t) if t.contains("返回空内容"))));
+}
+
+// ---------------------------------------------------------------------------
+// 会话持久化：写入点、恢复后继续对话、/clear 快照
+// ---------------------------------------------------------------------------
+
+static STORE_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+fn temp_store() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "rho-agent-store-{}-{}.json",
+        std::process::id(),
+        STORE_SEQ.fetch_add(1, Ordering::SeqCst)
+    ))
+}
+
+#[test]
+fn turn_persists_history_after_tool_batch() {
+    let path = temp_store();
+    let launcher = RecordingLauncher::new(vec![
+        vec![StreamEvent::Final(Box::new(assistant_with_calls(vec![
+            call("c1", "bash", "{\"command\":\"ls\"}"),
+        ])))],
+        vec![text_final("done")],
+    ]);
+    let registry = registry_with(PresetTool {
+        output: "工具输出".into(),
+    });
+    let mut session = session()
+        .with_launcher(Arc::new(launcher))
+        .with_tools(registry)
+        .with_store(path.clone());
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(vec![]);
+
+    session.turn(&mut ui, &cancel, "跑一下").unwrap();
+
+    let saved = rho::store::load(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(saved.len(), session.history().len());
+    // 历史里 Tool 消息带着重放需要的三个字段。
+    let tool = saved
+        .iter()
+        .find(|m| matches!(m, Msg::Tool { .. }))
+        .expect("tool message missing");
+    match tool {
+        Msg::Tool {
+            name,
+            content,
+            display,
+            status,
+            ..
+        } => {
+            assert_eq!(name, "bash");
+            assert_eq!(content, "工具输出");
+            assert_eq!(display, &None, "PresetTool 不展示结果体");
+            assert_eq!(*status, ToolStatus::Success);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn restored_history_is_sent_with_next_request() {
+    let path = temp_store();
+    let restored = vec![
+        Msg::System("旧系统提示".into()),
+        Msg::User("之前的问题".into()),
+        Msg::Assistant(AssistantMsg {
+            text: Some("之前的回答".into()),
+            reasoning: Some("旧思考".into()),
+            tool_calls: vec![],
+        }),
+    ];
+    rho::store::save(&path, &restored).unwrap();
+
+    let launcher = RecordingLauncher::new(vec![vec![text_final("继续")]]);
+    let mut session = session()
+        .with_launcher(Arc::new(launcher.clone()))
+        .with_store(path.clone());
+    session.replace_history(rho::store::load(&path).unwrap());
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(vec![]);
+
+    session.turn(&mut ui, &cancel, "接着聊").unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    let bodies = launcher.bodies();
+    let messages = bodies[0]["messages"].as_array().unwrap();
+    // 旧 system 原样保留（会话自包含），后面是旧 user / assistant 与本次输入。
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], "旧系统提示");
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[1]["content"], "之前的问题");
+    assert_eq!(messages[2]["role"], "assistant");
+    assert_eq!(messages[2]["content"], "之前的回答");
+    // 测试配置未打开 echo_reasoning：旧思考不进请求体。
+    assert!(messages[2].get("reasoning_content").is_none());
+    assert_eq!(messages[3]["content"], "接着聊");
+}
+
+#[test]
+fn restored_history_is_replayed_to_the_screen() {
+    let mut session = session();
+    session.replace_history(vec![
+        Msg::System("sys".into()),
+        Msg::User("q1".into()),
+        Msg::Assistant(AssistantMsg {
+            text: Some("a1".into()),
+            reasoning: Some("r1".into()),
+            tool_calls: vec![call("c1", "bash", "{\"command\":\"ls\"}")],
+        }),
+        Msg::Tool {
+            tool_call_id: "c1".into(),
+            name: "bash".into(),
+            content: "out".into(),
+            display: Some("out".into()),
+            status: ToolStatus::Failure,
+        },
+        Msg::Summary("旧摘要".into()),
+    ]);
+
+    let mut ui = ScriptedUi::new(vec![]);
+    session.replay(&mut ui);
+
+    let events = &ui.rendered;
+    assert!(matches!(&events[0], rho::render::RenderEvent::UserInput(s) if s == "q1"));
+    assert!(matches!(&events[1], rho::render::RenderEvent::ReasoningDelta(s) if s == "r1"));
+    assert!(matches!(&events[2], rho::render::RenderEvent::TextDelta(s) if s == "a1"));
+    assert!(
+        matches!(&events[3], rho::render::RenderEvent::ToolCall { name, .. } if name == "bash")
+    );
+    assert!(matches!(
+        &events[4],
+        rho::render::RenderEvent::ToolResult { status: ToolStatus::Failure, display: Some(t), .. } if t == "out"
+    ));
+    assert!(matches!(&events[5], rho::render::RenderEvent::Summary(s) if s == "旧摘要"));
+    assert_eq!(events.len(), 6, "system 消息不重放");
+}
+
+#[test]
+fn clear_writes_snapshot_without_history() {
+    let path = temp_store();
+    let mut session = session().with_store(path.clone());
+    session.replace_history(vec![Msg::User("x".into())]);
+    let mut ui = ScriptedUi::new(vec![]);
+
+    session.clear(&mut ui);
+
+    let saved = rho::store::load(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(saved.is_empty(), "测试配置没有 system_prompt");
+    assert!(session.history().is_empty());
 }

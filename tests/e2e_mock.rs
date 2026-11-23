@@ -384,6 +384,7 @@ fn full_tool_loop_with_mock_sse() {
         Msg::Tool {
             tool_call_id,
             content,
+            ..
         } => {
             assert_eq!(tool_call_id, "call_1");
             assert!(content.contains("hi"));
@@ -449,6 +450,7 @@ fn responses_protocol_full_tool_loop() {
         Msg::Tool {
             tool_call_id,
             content,
+            ..
         } => {
             assert_eq!(tool_call_id, "call_1");
             assert!(content.contains("hi"));
@@ -726,10 +728,12 @@ fn multiple_tool_calls_are_paired_in_order() {
             Msg::Tool {
                 tool_call_id: a,
                 content: ca,
+                ..
             },
             Msg::Tool {
                 tool_call_id: b,
                 content: cb,
+                ..
             },
         ) => {
             assert_eq!(a, "call_a");
@@ -760,10 +764,12 @@ fn max_tool_steps_placeholders_remaining_calls() {
             Msg::Tool {
                 tool_call_id: a,
                 content: ca,
+                ..
             },
             Msg::Tool {
                 tool_call_id: b,
                 content: cb,
+                ..
             },
         ) => {
             assert_eq!(a, "call_a");

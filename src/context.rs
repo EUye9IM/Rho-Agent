@@ -218,7 +218,10 @@ mod tests {
     fn tool(content: &str) -> Msg {
         Msg::Tool {
             tool_call_id: "c1".into(),
+            name: "bash".into(),
             content: content.into(),
+            display: Some(content.into()),
+            status: crate::message::ToolStatus::Success,
         }
     }
 

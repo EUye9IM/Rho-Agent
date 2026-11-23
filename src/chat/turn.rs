@@ -80,6 +80,8 @@ impl Session {
         // 本轮工具步数（每次用户输入触发的回合局部计数）。
         let mut steps: u32 = 0;
         self.history.push(Msg::User(input.to_string()));
+        // 用户输入已入历史：先落盘，后面即使请求失败也能恢复到这一轮。
+        self.save(ui);
 
         loop {
             // 工具执行完回到请求前再查一次：取消/退出不进入下一次请求。
@@ -108,6 +110,8 @@ impl Session {
 
             if msg.tool_calls.is_empty() {
                 self.history.push(Msg::Assistant(msg));
+                // 回合终态：历史里没有未配对的 tool_calls。
+                self.save(ui);
                 // 若恰在此窗口收到第二次 Ctrl-C，直接走退出，不等下一次输入。
                 if cancel.is_quit() {
                     return Err(Quit);
@@ -130,7 +134,12 @@ impl Session {
             let tool_calls = msg.tool_calls.clone();
             self.history.push(Msg::Assistant(msg));
 
-            match self.run_tool_calls(ui, cancel, &mut steps, &tool_calls) {
+            let phase = self.run_tool_calls(ui, cancel, &mut steps, &tool_calls);
+            // 一批工具调用返回时，所有 tool_calls 都已配上 Tool 消息（含占位），
+            // 历史回到合法边界：这是唯一写盘点，不在单个结果提交后写。
+            self.save(ui);
+
+            match phase {
                 // 全部工具执行完：带上 Tool 结果继续请求。
                 ToolPhase::Done => continue,
                 ToolPhase::Cancelled => {

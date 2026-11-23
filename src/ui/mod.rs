@@ -18,10 +18,9 @@ pub use term::{TermUi, TermUiInitError};
 
 use crate::completion::CompletionProvider;
 use crate::render::RenderEvent;
+/// 提示符（定义在 `render`，与重放共用同一份文本）。
+pub(crate) use crate::render::PROMPT;
 use std::sync::Arc;
-
-/// 提示符。宽度按字节数算（纯 ASCII）。
-pub(crate) const PROMPT: &str = "rho> ";
 
 /// 读取一行输入的结果。
 #[derive(Debug)]

@@ -76,6 +76,8 @@ pub enum CommandEffect {
     Continue(String),
     /// 压缩历史：需要发起流式请求，由 REPL 交给 `Session::compact`。
     Compact,
+    /// 清空历史：由 REPL 交给 `Session::clear`（需要 Ui 报告写盘失败）。
+    Clear,
     /// 正常退出。
     Exit,
 }
@@ -103,10 +105,7 @@ pub fn execute(session: &mut Session, line: &str) -> Result<CommandEffect, Strin
             }
             Ok(CommandEffect::Compact)
         }
-        Command::Clear => {
-            session.clear();
-            Ok(CommandEffect::Continue("已清空对话历史".into()))
-        }
+        Command::Clear => Ok(CommandEffect::Clear),
         Command::Exit => Ok(CommandEffect::Exit),
     }
 }

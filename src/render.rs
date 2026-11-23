@@ -8,7 +8,8 @@
 use crate::message::TokenUsage;
 use crate::tools::ToolStatus;
 
-/// 渲染事件（agent loop → ui.print 的载荷；具体形态实现期定）。
+/// 渲染事件（agent loop → ui.print 的载荷）。
+/// `UserInput` 与 `Summary` 只在恢复会话的重放路径上出现。
 #[derive(Debug)]
 pub enum RenderEvent {
     /// 思考内容增量（暗淡色实时输出）
@@ -26,9 +27,16 @@ pub enum RenderEvent {
         display: Option<String>,
         status: ToolStatus,
     },
+    /// 历史回放：用户输入行（提示符 + 着色输入 + 换行）。
+    UserInput(String),
+    /// 历史回放：`/compact` 产出的上下文摘要（暗淡标记行 + 正文）。
+    Summary(String),
     /// 错误展示（轮内错误，回 REPL）
     Error(String),
 }
+
+/// 提示符。宽度按字节数算（纯 ASCII）。
+pub const PROMPT: &str = "rho> ";
 
 /// ANSI 样式（固定转义，无颜色开关；终态由 Ui/term 决定是否解释）。
 const RESET: &str = "\x1b[0m";
@@ -39,6 +47,9 @@ const TOOL_CALL_OPEN: &str = "\x1b[35m";
 const SUCCESS_OPEN: &str = "\x1b[32m";
 const FAILURE_OPEN: &str = "\x1b[31m";
 const INTERRUPTED_OPEN: &str = "\x1b[33m";
+
+/// 重放 `Msg::Summary` 时的标记行。
+const SUMMARY_MARKER: &str = "── 上下文摘要 ──";
 
 /// ANSI 暗淡色包裹单个片段（`ui/helper.rs` 的灰提示使用）。
 pub fn dim(s: &str) -> String {
@@ -232,6 +243,20 @@ impl Renderer {
                     out.stdout.push('\n');
                 }
             }
+            RenderEvent::UserInput(text) => {
+                // 重放没有回合状态栏收尾：半截正文或思考块必须先折行。
+                self.ensure_line_start(&mut out.stdout);
+                out.stdout.push_str(&prompt(PROMPT));
+                out.stdout.push_str(&input(text));
+                out.stdout.push('\n');
+            }
+            RenderEvent::Summary(text) => {
+                self.ensure_line_start(&mut out.stdout);
+                out.stdout.push_str(&dim(SUMMARY_MARKER));
+                out.stdout.push('\n');
+                out.stdout.push_str(&dim(text));
+                out.stdout.push('\n');
+            }
             RenderEvent::Error(msg) => {
                 self.close(&mut out.stdout);
                 out.stderr.push_str("错误：");
@@ -251,6 +276,15 @@ impl Renderer {
             RESET
         } else {
             ""
+        }
+    }
+
+    /// 让下一个事件从行首开始：块还开着就先收尾并补一个换行。
+    /// 实时路径的收尾由回合状态栏负责；重放与用户输入行走这里。
+    fn ensure_line_start(&mut self, stdout: &mut String) {
+        if self.block != Block::Idle {
+            self.close(stdout);
+            stdout.push('\n');
         }
     }
 
@@ -281,6 +315,48 @@ mod tests {
     fn prompt_and_input_have_distinct_styles() {
         assert_eq!(prompt("rho> "), "\x1b[1;36mrho> \x1b[0m");
         assert_eq!(input("ls"), "\x1b[36mls\x1b[0m");
+    }
+
+    #[test]
+    fn user_input_replays_prompt_and_input() {
+        let mut r = Renderer::new();
+        let out = r.event(&RenderEvent::UserInput("ls".into()));
+        assert_eq!(out.stdout, "\x1b[1;36mrho> \x1b[0m\x1b[36mls\x1b[0m\n");
+        assert!(out.stderr.is_empty());
+    }
+
+    #[test]
+    fn summary_replays_dimmed_block() {
+        let mut r = Renderer::new();
+        let out = r.event(&RenderEvent::Summary("早先内容".into()));
+        assert_eq!(
+            out.stdout,
+            format!("{}\n{}\n", dim("── 上下文摘要 ──"), dim("早先内容"))
+        );
+    }
+
+    #[test]
+    fn user_input_after_text_starts_on_a_new_line() {
+        let mut r = Renderer::new();
+        let _ = r.event(&RenderEvent::TextDelta("回答".into()));
+        let out = r.event(&RenderEvent::UserInput("下一个".into()));
+        assert_eq!(
+            out.stdout,
+            "\n\x1b[1;36mrho> \x1b[0m\x1b[36m下一个\x1b[0m\n"
+        );
+    }
+
+    #[test]
+    fn replay_events_close_open_reasoning_block() {
+        let mut r = Renderer::new();
+        let _ = r.event(&RenderEvent::ReasoningDelta("想".into()));
+
+        let out = r.event(&RenderEvent::UserInput("ls".into()));
+        assert!(out.stdout.starts_with(RESET), "out was {:?}", out.stdout);
+
+        let _ = r.event(&RenderEvent::ReasoningDelta("想".into()));
+        let out = r.event(&RenderEvent::Summary("摘要".into()));
+        assert!(out.stdout.starts_with(RESET), "out was {:?}", out.stdout);
     }
 
     #[test]

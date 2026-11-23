@@ -79,6 +79,7 @@ impl ProviderAdapter for OpenAiChatAdapter {
                 Msg::Tool {
                     tool_call_id,
                     content,
+                    ..
                 } => {
                     json!({ "role": "tool", "tool_call_id": tool_call_id, "content": content })
                 }
@@ -326,7 +327,10 @@ mod tests {
             }),
             Msg::Tool {
                 tool_call_id: "id".into(),
+                name: "bash".into(),
                 content: "ok".into(),
+                display: Some("ok".into()),
+                status: crate::message::ToolStatus::Success,
             },
         ];
         let thinking = json!({ "thinking": { "type": "enabled" } });

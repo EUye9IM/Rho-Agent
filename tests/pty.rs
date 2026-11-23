@@ -14,8 +14,10 @@
 //! 人类敲键延迟（~100ms）撞不上该窗口；用例统一在提示符后稳定 50ms 再发输入。
 
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use rho::message::{AssistantMsg, Msg, ToolStatus};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -194,6 +196,8 @@ max_output = 1000
 /// PTY 里运行的 rho：按键写入、屏幕断言、退出码。
 struct PtyRho {
     child: Box<dyn Child + Send + Sync>,
+    /// 本次运行独占的 XDG_STATE_HOME：会话文件写在这里，不碰真实主目录。
+    state_dir: PathBuf,
     _master: Box<dyn MasterPty + Send>,
     raw: Arc<Mutex<Vec<u8>>>,
     writer: Box<dyn std::io::Write + Send>,
@@ -204,7 +208,19 @@ struct PtyRho {
 
 impl PtyRho {
     /// 起一个挂 mock 配置的 rho（不依赖外部环境变量）。
+    /// 每次运行使用独立的 XDG_STATE_HOME，会话文件不会落到真实主目录。
     fn spawn(config_path: &str) -> Self {
+        let state = std::env::temp_dir().join(format!(
+            "rho-pty-state-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        Self::spawn_in_state(config_path, state, &[])
+    }
+
+    /// 指定状态目录与额外参数启动（`-c` 用例需要预置会话文件）。
+    fn spawn_in_state(config_path: &str, state_dir: PathBuf, extra_args: &[&str]) -> Self {
+        let _ = std::fs::create_dir_all(&state_dir);
         let pty = NativePtySystem::default()
             .openpty(PtySize {
                 rows: ROWS,
@@ -215,6 +231,10 @@ impl PtyRho {
         let mut cmd = CommandBuilder::new(RHO_BIN);
         cmd.arg("--config");
         cmd.arg(config_path);
+        for arg in extra_args {
+            cmd.arg(arg);
+        }
+        cmd.env("XDG_STATE_HOME", &state_dir);
         if std::env::var("RHO_PTY_TRACE").is_ok() {
             cmd.env("RHO_PTY_TRACE", "1");
         }
@@ -254,6 +274,7 @@ impl PtyRho {
         });
         PtyRho {
             child,
+            state_dir,
             _master: pty.master,
             writer,
             screen,
@@ -363,6 +384,7 @@ impl Drop for PtyRho {
         self.killed.store(true, Ordering::SeqCst);
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.state_dir);
     }
 }
 
@@ -547,6 +569,78 @@ fn bash_timeout_shows_annotation_and_returns_to_prompt() {
     // 超时结果喂回后继续请求（mock 单连接已关：第二次请求失败）——回提示符即收尾。
     rho.expect_screen("rho>", Duration::from_secs(8));
     std::thread::sleep(SETTLE);
+    rho.send_line("/exit");
+    assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 会话恢复：`-c` 读取会话文件并重放
+// ---------------------------------------------------------------------------
+
+/// 预置会话文件路径（`XDG_STATE_HOME/rho/session.json`）。
+fn session_file(state_dir: &Path) -> PathBuf {
+    state_dir.join("rho").join("session.json")
+}
+
+#[test]
+fn continue_replays_persisted_history() {
+    let config = write_config("http://127.0.0.1:1");
+    let state = std::env::temp_dir().join(format!(
+        "rho-pty-continue-{}-{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    let path = session_file(&state);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    rho::store::save(
+        &path,
+        &[
+            Msg::User("之前的问题".into()),
+            Msg::Assistant(AssistantMsg {
+                text: Some("之前的回答".into()),
+                reasoning: Some("旧思考".into()),
+                tool_calls: vec![],
+            }),
+            Msg::Tool {
+                tool_call_id: "c1".into(),
+                name: "bash".into(),
+                content: "工具输出".into(),
+                display: Some("工具输出".into()),
+                status: ToolStatus::Success,
+            },
+            Msg::Summary("更早的摘要".into()),
+        ],
+    )
+    .unwrap();
+
+    let mut rho = PtyRho::spawn_in_state(&config, state, &["-c"]);
+
+    // 用户输入行走重放路径（提示符 + 输入），不是 rustyline 的回显。
+    rho.expect_screen("rho> 之前的问题", SCREEN_TIMEOUT);
+    rho.expect_screen("之前的回答", SCREEN_TIMEOUT);
+    rho.expect_screen("旧思考", SCREEN_TIMEOUT);
+    rho.expect_screen("工具输出", SCREEN_TIMEOUT);
+    rho.expect_screen("上下文摘要", SCREEN_TIMEOUT);
+    rho.expect_screen("已恢复 4 条消息（1 轮）", SCREEN_TIMEOUT);
+
+    rho.send_line("/exit");
+    assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
+}
+
+#[test]
+fn continue_without_session_file_starts_fresh() {
+    let config = write_config("http://127.0.0.1:1");
+    let state = std::env::temp_dir().join(format!(
+        "rho-pty-nosession-{}-{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+
+    let mut rho = PtyRho::spawn_in_state(&config, state, &["-c"]);
+
+    rho.expect_screen("没有可恢复的会话", SCREEN_TIMEOUT);
+    rho.expect_screen("rho>", SCREEN_TIMEOUT);
+
     rho.send_line("/exit");
     assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
 }

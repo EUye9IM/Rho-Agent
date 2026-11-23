@@ -39,7 +39,10 @@ src/
     mod.rs       结构定义、配置来源解析（--config > 默认路径 > 内置）、--init 写出内置配置、内置默认配置（include_str! + 解析）
     validate.rs  悬空引用 / 前缀对应 / 取值校验，一次收集全部语义错误并报告配置路径
     expand.rs    header 值 ${VAR} 展开；明文密钥告警
-  message.rs     与协议解耦的消息模型 Msg / AssistantMsg / ToolCall（chat 与 provider 共用）
+  message.rs     与协议解耦的消息模型 Msg / AssistantMsg / ToolCall / ToolStatus
+                 （chat 与 provider 共用；serde 表示即会话文件格式）
+  store.rs       会话文件：默认路径、全量快照的原子写（临时文件 + rename）、
+                 读取失败的分工（不存在 / 损坏）与损坏文件备份
   commands.rs    斜杠命令元数据、解析、执行与补全候选；
                  执行只修改 Session 并返回 CommandEffect，输出由 repl 交给 Ui
   context.rs     上下文压缩的纯函数：切点规划（保留最近 N 轮）、
@@ -49,8 +52,9 @@ src/
                  不依赖终端、命令或 Session
   chat/
     mod.rs       会话状态（历史、选择、适配器、工具注册表；字段不对外暴露，
-                 launcher 与 tools 是测试注入边界）、/compact 流程、
-                 供应商/模型/思考档位切换（规则是 config::switch_*_selection 纯函数）
+                 launcher / tools / store 是测试注入边界）、/compact 流程、
+                 会话文件的落盘与重放、供应商/模型/思考档位切换
+                 （规则是 config::switch_*_selection 纯函数）
     turn.rs      一轮回合：流接收、逐块取消判定、回合终态；worker 契约
                  （必经 Final/Error 收尾）与放弃路径（abandon）在这里
     batch.rs     一批 tool_calls 的执行：限额/取消/终端失败前置检查、
@@ -94,7 +98,7 @@ src/
     scripted.rs  测试实现 ScriptedUi（预排输入、收集渲染事件）
 ```
 
-依赖方向为 `repl → commands/chat/ui`；`commands → chat/completion`，`chat → provider → sse/message`，`chat → tools → term`，`ui → completion/render → text`，`context → text`。`completion` 只定义补全协议，`ui` 只把候选适配到 rustyline；`commands` 持有命令与候选语义，`repl` 负责按调用注入当前快照。`Msg`/`AssistantMsg`/`ToolCall` 放在 `message.rs`，chat 与 provider 都只依赖这个共享模型，provider 不再反向依赖 chat。`config` 被各层读取，处于依赖关系底层。`render` 提供有状态渲染器（`Renderer`）与 `RenderEvent`：`chat` 只产生 `RenderEvent`，`ui` 持有 `Renderer` 把事件序列化为待写文本，按标准输出/标准错误分流写入终端。回合结束的 `RenderEvent::Status` 同时承担“确保行首”的职责，因此不再单独发折行事件。
+依赖方向为 `repl → commands/chat/ui`；`commands → chat/completion`，`chat → provider → sse/message`，`chat → tools → term`，`chat → store → message`，`ui → completion/render → text`，`context → text`。`store` 只依赖 `message`：文件格式就是 `Msg` 的 serde 表示，路径由 `main` 计算并注入 `Session`。`completion` 只定义补全协议，`ui` 只把候选适配到 rustyline；`commands` 持有命令与候选语义，`repl` 负责按调用注入当前快照。`Msg`/`AssistantMsg`/`ToolCall` 放在 `message.rs`，chat 与 provider 都只依赖这个共享模型，provider 不再反向依赖 chat。`config` 被各层读取，处于依赖关系底层。`render` 提供有状态渲染器（`Renderer`）与 `RenderEvent`：`chat` 只产生 `RenderEvent`，`ui` 持有 `Renderer` 把事件序列化为待写文本，按标准输出/标准错误分流写入终端。回合结束的 `RenderEvent::Status` 同时承担“确保行首”的职责，因此不再单独发折行事件。
 
 ## 三、关键数据类型
 
@@ -105,7 +109,13 @@ enum Msg {
     Summary(String),                      // /compact 产出的检查点，位于 system 之后
     User(String),
     Assistant(AssistantMsg),   // 载荷见下；流终态与历史共用同一类型
-    Tool { tool_call_id: String, content: String },
+    Tool {
+        tool_call_id: String,
+        name: String,            // 重放用；适配层不读
+        content: String,         // 给模型
+        display: Option<String>, // 当时给用户看的文本；None 表示不展示
+        status: ToolStatus,      // 重放用；适配层不读
+    },
 }
 struct AssistantMsg { text: Option<String>, reasoning: Option<String>, tool_calls: Vec<ToolCall> }
 struct ToolCall { id: String, name: String, arguments: String } // arguments 保持原始 JSON 字符串
@@ -114,7 +124,7 @@ struct ToolCall { id: String, name: String, arguments: String } // arguments 保
 ```rust
 // tools/mod.rs
 struct ToolSpec { name: String, description: String, parameters: Value }
-enum ToolStatus { Success, Failure, Interrupted }
+// ToolStatus 定义在 message.rs（随 Msg::Tool 落盘），tools 重新导出
 struct ToolResult {
     output: String,             // 给模型
     display: Option<String>,    // 给用户；None 表示不展示结果体
@@ -238,6 +248,7 @@ loop {
 - **提交资格（worker 侧）**：`finish_reason` 为 `stop`/`tool_calls`/空才发 `Final`；`length`/`content_filter` 等截断原因在 worker 内直接发 `Error`，被截断的 tool_calls 丢弃。主线程收到 `Final` 才提交，收到 `Error`（含通道断开）就按错误收尾。
 - **取消在两个粒度检查**：接收循环逐事件检查（含持续有事件时）；工具序列逐个调用前检查。任一处发现取消即按占位规则收尾。终端 I/O 失败（fatal）同样在流收尾与逐个调用前检查：流收尾后发现则不提交 Assistant 直接上抛；批次中途发现则剩余调用补“终端输出失败”占位后上抛；两者均映射 exit 1。
 - **限额逐个前置检查**：每个调用执行前先检查限额；所有模型发起的调用都计数（含参数解析失败/未知工具/工具内部错误），防止错误调用无限循环。
+- **单会话持久化**：`Session` 默认不持有存储（构造会话不接触文件系统），`main` 用 `with_store(path)` 注入 `$XDG_STATE_HOME/rho/session.json`（未设置时为 `$HOME/.local/state/rho/session.json`）。写入点是「历史回到合法边界」：`turn_inner` 的 push `Msg::User` 之后、无 tool_calls 的 Assistant 提交之后、`run_tool_calls` 返回之后（所有占位已补齐），以及 `/compact` 成功与 `/clear` 之后；单个工具结果提交后不写，避免留下未配对的 `Assistant(tool_calls)`。每次写都是全量快照：同目录 `session.json.tmp` + `rename`。写盘失败不打断对话，同一进程内只输出一行暗淡提示。`-c` 加载失败时区分「文件不存在」与「解析失败」：后者把原文件改名为 `session.json.bad` 再开新会话。恢复后 `Session::replay` 在第一个提示符前把历史交给 `Renderer`（`UserInput` / `ReasoningDelta` / `TextDelta` / `ToolCall` / `ToolResult` / `Summary`），`Msg::System` 不重放；文件里的 `Msg::System` 与 `Msg::Summary` 原样保留，会话自包含。
 - **历史即上下文**：历史（`Vec<Msg>`）原样序列化进请求；窗口超限时展示错误，用户可 `/compact` 或 `/clear`。
 - **压缩（`/compact`）**：`context::plan` 从 `Msg::User` 边界切开历史——前缀被摘要替换，最近 `compact.keep_turns` 轮原样保留，因此 `Assistant(tool_calls)` 与随后的 `Tool` 消息不会被拆开。请求是前缀的副本 + 末尾一条 `compact.prompt`（没有 `[compact].prompt` 时用 `context::DEFAULT_COMPACT_PROMPT`），`build_body` 与 `tools` 与普通回合一致、thinking 片段传 `None`；副本里的工具结果截到 500 字符、assistant 正文截到 2000 字符，仍超出 `context_window - max_output - 1024` 的估算预算就从最旧一轮整轮丢弃。收流复用 `drive_stream(render = false)`：不渲染正文，仍逐块轮询取消。摘要正文原样使用；成功时 `history.splice` 换成一条 `Msg::Summary`，失败/空回复/取消都不改动历史。压缩不是对话回合，不产生状态栏。
 - **回合状态栏**：`Session::turn` 拆成薄包装与 `turn_inner`，包装层在本回合结束时发一条 `RenderEvent::Status`；fatal 与 `Err(Quit)` 路径不发。用量只是 `turn_inner` 的局部变量（每次成功的请求覆盖），不进会话状态；轮次由 `history` 中 `Msg::User` 的条数派生，`/clear` 后自然归零。斜杠命令（含 `/compact`）不产生状态栏。
@@ -282,6 +293,7 @@ exit 0：/exit、空闲态 Ctrl-C 双按、Ctrl-D（均正常退出）
 | `commands` 补全候选与命令文案 / `ui::helper` 的 Pair 适配 | 纯单元测试，无 TTY；`tests/repl_flow.rs` 覆盖模型切换后的候选刷新 |
 | `provider::openai` / `provider::openai_responses` 解析 | 单元测试：构造 JSON chunk/事件 → `ChunkOutcome` / `TurnAcc` |
 | `provider::dns` 报文与回退 | 单元 + 本地 mock：假 DoH 服务（std TcpListener 手写 HTTP），覆盖 A/AAAA、压缩指针、NXDOMAIN、端点失败转移、TTL 缓存；报文编解码与 `config::parse_dns_endpoint` 为纯单元测试 |
+| 会话持久化 | `store` 纯单元（各消息变体往返、原子写无残留临时文件、损坏文件备份）；agent loop 集成（`with_store` 落盘内容与历史一致、恢复后下一请求带旧历史、`/clear` 快照）；PTY 断言 `-c` 重放的用户输入行、暗淡思考、着色工具结果与摘要标记 |
 | agent loop + tools | 集成：`Session::with_launcher` 与 `Session::with_tools` 注入边界 + `ScriptedUi`，无网络驱动分支（取消/退出各粒度、占位补齐、非法参数/未知工具、配对不变式、状态栏的轮次与用量来源；时序用 channel 握手控制）；`BashTool::invoke` 与 `read` / `write` / `edit` 单元测试覆盖参数、截断、CRLF、相似行和文件边界 |
 | provider + HTTP 层 | 集成：本地 mock SSE 服务（std TcpListener 手写），测协议映射与流读取 |
 | 端到端工具循环 | 集成：mock SSE 服务驱动多轮真实 HTTP 请求，验证占位 Tool 消息的配对/顺序/第二次请求序列化（含 echo_reasoning） |

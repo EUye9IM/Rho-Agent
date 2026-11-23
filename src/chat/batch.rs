@@ -152,13 +152,16 @@ impl Session {
             ui,
             RenderEvent::ToolResult {
                 name: name.to_string(),
-                display: result.display,
+                display: result.display.clone(),
                 status: result.status,
             },
         );
         self.history.push(Msg::Tool {
             tool_call_id: call_id.to_string(),
+            name: name.to_string(),
             content: result.output,
+            display: result.display,
+            status: result.status,
         });
         *steps += 1;
     }
@@ -181,7 +184,10 @@ impl Session {
             );
             self.history.push(Msg::Tool {
                 tool_call_id: call.id.clone(),
+                name: call.name.clone(),
                 content: content.to_string(),
+                display: Some(content.to_string()),
+                status,
             });
         }
     }

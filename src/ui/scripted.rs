@@ -47,6 +47,8 @@ impl Ui for ScriptedUi {
                 display: display.clone(),
                 status: *status,
             },
+            RenderEvent::UserInput(s) => RenderEvent::UserInput(s.clone()),
+            RenderEvent::Summary(s) => RenderEvent::Summary(s.clone()),
             RenderEvent::Error(s) => RenderEvent::Error(s.clone()),
         });
     }

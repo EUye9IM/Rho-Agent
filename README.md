@@ -22,6 +22,7 @@ Implementation: [docs/architecture.md](docs/architecture.md).
 - **Tab completion** — slash command names and the arguments of `/model`, `/provider` and `/thinking` complete from the current session state; candidates refresh after a provider or model switch.
 - **Manual context compaction** — `/compact` asks the model for a structured checkpoint of the older turns and replaces them with it, keeping the most recent turns verbatim; the instruction is configurable.
 - **Per-turn status line** — each turn ends with one dim line showing the turn number, model, thinking level, prompt-cache hit rate and context usage.
+- **One resumable session** — every turn is snapshotted to `$XDG_STATE_HOME/rho/session.json`; `rho -c` reloads it and replays the history (prompt/input lines, dimmed reasoning, colored tool results) before the first prompt.
 - **Strict config validation** — unknown fields, dangling references and missing required fields fail loudly with the config path (TOML syntax errors also include a line number), exit code 2.
 
 ## Requirements
@@ -73,6 +74,7 @@ cargo build --release --locked --target armv7-unknown-linux-musleabihf
 ```sh
 export DEEPSEEK_API_KEY=sk-...
 rho
+rho -c     # continue the last session
 ```
 
 ```
@@ -96,10 +98,13 @@ rho --init           # write the default config to ~/.config/rho/config.toml
 | `--provider <id>` | Initial provider (overrides config default). |
 | `--model <id>` | Initial model (must be `provider/model`, overrides config default). |
 | `--thinking <level>` | Initial thinking level (must exist for the chosen model). |
-| `--init` | Write the built-in config to the `--config` path or the default path; refuses to overwrite an existing file. |
+| `-c`, `--continue` | Load the saved session and replay it before the first prompt. Missing file or unreadable JSON starts a fresh session; a corrupt file is renamed to `session.json.bad` first. |
+| `--init` | Write the built-in config to the `--config` path or the default path; refuses to overwrite an existing file. Mutually exclusive with `-c`. |
 | `--version`, `-V` | Print the rho version and exit. |
 
 Config source priority: `--config <path>` > the default path `$XDG_CONFIG_HOME/rho/config.toml` (or `$HOME/.config/rho/config.toml` when unset) > the built-in config. A missing default-path file falls back to the built-in config; an existing one that fails to parse or validate is an error (exit code 2). `rho --init` writes the full built-in config for you to edit incrementally. `${VAR}` in auth headers is expanded from the environment. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` control proxy routing. The working directory is fixed to the directory `rho` was started in.
+
+The session file lives at `$XDG_STATE_HOME/rho/session.json` (`$HOME/.local/state/rho/session.json` when unset). It holds the whole history, including reasoning and tool output, and is rewritten as a single snapshot after each turn; SQLite-style append-only logs are not used. One session exists at a time: starting rho without `-c` begins a fresh one and the first write replaces the old file, as does `/clear`.
 
 ### REPL commands
 

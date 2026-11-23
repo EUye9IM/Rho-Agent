@@ -122,6 +122,11 @@ fn handle_command(
             session.compact(ui, cancel).map_err(|_| ReplExit::Quit)?;
             Ok(CommandResult::Continue)
         }
+        Ok(CommandEffect::Clear) => {
+            session.clear(ui);
+            text(ui, "已清空对话历史");
+            Ok(CommandResult::Continue)
+        }
         Err(e) => {
             emit_error(ui, e);
             Ok(CommandResult::Continue)

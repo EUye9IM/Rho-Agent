@@ -22,6 +22,7 @@ rho 要做一个运行在资源受限 Linux 设备上的本地 agent：单二进
 - **Tab 补全** —— 补全斜杠命令名以及 `/model`、`/provider`、`/thinking` 的参数，候选来自当前会话状态；切换供应商或模型后自动刷新。
 - **手动压缩上下文** —— `/compact` 让模型对较早的轮次产出结构化检查点并替换掉它们，最近几轮保持原文；指令文案可配置。
 - **回合状态栏** —— 每个对话回合结束打一行暗淡状态栏：轮次、模型、思考档位、缓存命中率与上下文占用。
+- **单会话可恢复** —— 每次历史回到合法边界就快照到 `$XDG_STATE_HOME/rho/session.json`；`rho -c` 加载并在第一个提示符前重放历史（提示符与输入、暗淡思考、着色工具结果）。
 - **严格配置校验** —— 未知字段、悬空引用、缺失必填字段一律硬报错并给出配置路径（TOML 语法错误另带行号），退出码 2。
 
 ## 环境要求
@@ -72,6 +73,7 @@ cargo build --release --locked --target armv7-unknown-linux-musleabihf
 ```sh
 export DEEPSEEK_API_KEY=sk-...
 rho
+rho -c     # 继续上一次会话
 ```
 
 ```
@@ -95,10 +97,13 @@ rho --init           # 生成默认配置文件到 ~/.config/rho/config.toml
 | `--provider <id>` | 初始供应商（覆盖配置默认）。 |
 | `--model <id>` | 初始模型（须为 `provider/model` 形式，覆盖配置默认）。 |
 | `--thinking <level>` | 初始思考档位（须属于所选模型）。 |
+| `-c`、`--continue` | 加载保存的会话并在第一个提示符前重放。文件不存在或内容无法解析时开始新会话；损坏的文件先改名成 `session.json.bad`。与 `--init` 互斥。 |
 | `--init` | 把内置配置写到 `--config` 路径或默认路径；目标已存在时报错不覆盖。 |
 | `--version`、`-V` | 打印 rho 版本并退出。 |
 
 配置来源优先级：`--config <path>` > 默认路径 `$XDG_CONFIG_HOME/rho/config.toml`（未设置时 `$HOME/.config/rho/config.toml`）> 内置配置。默认路径文件不存在时回退内置配置，存在但解析/校验失败则报错（退出码 2）。`rho --init` 一次性写出完整的内置配置，供你在此基础上增量修改。认证 header 中的 `${VAR}` 从环境变量展开；`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与 `NO_PROXY` 控制代理路由。会话工作目录恒为进程启动目录，全程不可修改。
+
+会话文件位于 `$XDG_STATE_HOME/rho/session.json`（未设置时为 `$HOME/.local/state/rho/session.json`）。它保存完整历史（含思考内容与工具输出），每次回合结束按全量快照重写。同一时刻只有一个会话：不带 `-c` 启动即开新会话，第一次写入覆盖旧文件，`/clear` 同样覆盖。
 
 ### REPL 命令
 

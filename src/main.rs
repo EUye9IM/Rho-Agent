@@ -3,10 +3,12 @@
 use rho::chat::Session;
 use rho::config;
 use rho::provider;
+use rho::render::{self, RenderEvent};
 use rho::repl::{self, ReplExit};
+use rho::store;
 use rho::term;
-use rho::ui;
-use std::path::PathBuf;
+use rho::ui::{self, Ui};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// CLI 参数（手写解析）。
@@ -15,6 +17,7 @@ pub struct Args {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub thinking: Option<String>,
+    pub continue_session: bool,
     pub init: bool,
     pub version: bool,
 }
@@ -28,7 +31,7 @@ fn main() -> ExitCode {
     let args = match parse_args(std::env::args().skip(1).collect()) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("用法错误：{e}\n用法：rho [--config <path>] [--provider <id>] [--model <id>] [--thinking <level>] [--init] [--version]");
+            eprintln!("用法错误：{e}\n用法：rho [--config <path>] [--provider <id>] [--model <id>] [--thinking <level>] [-c|--continue] [--init] [--version]");
             return ExitCode::from(EXIT_USAGE);
         }
     };
@@ -121,7 +124,19 @@ fn run(args: Args) -> u8 {
         }
     };
 
-    let session = Session::new(cfg, selection, adapter);
+    let mut session = Session::new(cfg, selection, adapter);
+    if let Some(path) = store::default_path() {
+        if args.continue_session {
+            resume(&mut session, &mut term_ui, &path);
+        }
+        session = session.with_store(path);
+    } else if args.continue_session {
+        warn(
+            &mut term_ui,
+            "无法确定会话文件路径：HOME 与 XDG_STATE_HOME 均未设置",
+        );
+    }
+
     match repl::run(&mut term_ui, session, &cancel) {
         Ok(()) | Err(ReplExit::Quit) => EXIT_OK,
         Err(ReplExit::Fatal(e)) => {
@@ -131,8 +146,39 @@ fn run(args: Args) -> u8 {
     }
 }
 
-/// 解析 --thinking：None → 保持 selection.thinking（模型 thinking_default）；
-/// Some(档位) → 须属该模型档位表，写入 selection.thinking。
+/// `-c`：加载唯一会话文件并重放。恢复失败不阻塞启动。
+fn resume(session: &mut Session, ui: &mut dyn Ui, path: &Path) {
+    match store::load(path) {
+        Ok(history) => {
+            let total = history.len();
+            let turns = history
+                .iter()
+                .filter(|msg| matches!(msg, rho::message::Msg::User(_)))
+                .count();
+            session.replace_history(history);
+            session.replay(ui);
+            warn(ui, &format!("已恢复 {total} 条消息（{turns} 轮）"));
+        }
+        Err(store::LoadError::Missing) => warn(ui, "没有可恢复的会话，已开始新会话"),
+        Err(store::LoadError::Corrupt(e)) => {
+            let detail = match store::backup_corrupt(path) {
+                Ok(backup) => format!("{e}；已备份为 {}", backup.display()),
+                Err(backup_err) => format!("{e}；{backup_err}"),
+            };
+            warn(ui, &detail);
+        }
+    }
+}
+
+/// 不以退出码表达的状态提示：暗淡一行，走正常输出流。
+fn warn(ui: &mut dyn Ui, message: &str) {
+    ui.print(&RenderEvent::TextDelta(format!(
+        "{}\n",
+        render::dim(&format!("[{message}]"))
+    )));
+}
+
+/// 解析 --thinking：None → 保持 selection.thinking（模型 thinking_default）；/// Some(档位) → 须属该模型档位表，写入 selection.thinking。
 fn resolve_thinking(selection: &mut config::Selection, cli: Option<&str>) -> Result<(), String> {
     let Some(level) = cli else { return Ok(()) };
     // 与 Session::switch_thinking 共用判定（config::thinking_level_err）；CLI 文案附加提示。
@@ -152,6 +198,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         provider: None,
         model: None,
         thinking: None,
+        continue_session: false,
         init: false,
         version: false,
     };
@@ -201,6 +248,15 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                 }
                 args.init = true;
             }
+            "-c" | "--continue" => {
+                if inline.is_some() {
+                    return Err("--continue 不接受值".into());
+                }
+                if args.continue_session {
+                    return Err("--continue 重复".into());
+                }
+                args.continue_session = true;
+            }
             "--version" | "-V" => {
                 if inline.is_some() {
                     return Err("--version 不接受值".into());
@@ -212,6 +268,9 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
             }
             other => return Err(format!("未知参数 {other}")),
         }
+    }
+    if args.init && args.continue_session {
+        return Err("--init 与 --continue 不能同时使用".into());
     }
     Ok(args)
 }
@@ -257,6 +316,7 @@ mod tests {
             provider: None,
             model: None,
             thinking: None,
+            continue_session: false,
             init: true,
             version: false,
         };
@@ -266,6 +326,26 @@ mod tests {
         assert!(init_config(&args).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_continue_flags() {
+        assert!(parse_args(["-c".into()].to_vec()).unwrap().continue_session);
+        assert!(
+            parse_args(["--continue".into()].to_vec())
+                .unwrap()
+                .continue_session
+        );
+        assert!(parse_args(["--continue=1".into()].to_vec()).is_err());
+        assert!(parse_args(["-c".into(), "--continue".into()].to_vec()).is_err());
+    }
+
+    #[test]
+    fn continue_conflicts_with_init() {
+        match parse_args(["--init".into(), "-c".into()].to_vec()) {
+            Err(e) => assert!(e.contains("--init"), "error was {e}"),
+            Ok(_) => panic!("expected --init 与 --continue 互斥"),
+        }
     }
 
     #[test]

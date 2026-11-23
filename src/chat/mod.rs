@@ -2,18 +2,22 @@
 //! 一轮回合的流接收循环与取消判定在 `turn` 子模块；一批 tool_calls 的执行、
 //! 结果提交与占位补齐在 `batch` 子模块。供应商/模型/思考档位的切换规则是
 //! 配置域纯函数（`config::switch_*_selection`），这里只持有结果并按需重建适配器。
+//! 持久化是可选能力（`with_store`）：每次历史回到合法边界写一份全量快照，
+//! `-c` 恢复时由 `replace_history` + `replay` 把历史交还给渲染器。
 
 mod batch;
 mod turn;
 
+pub use crate::message::ToolStatus;
 pub use crate::message::{AssistantMsg, Msg, TokenUsage, ToolCall};
 
 use crate::config::{self, Config, Provider, Selection};
 use crate::context;
 use crate::provider::{self, ProviderAdapter, StreamEvent};
-use crate::render::RenderEvent;
+use crate::render::{self, RenderEvent};
+use crate::store;
 use crate::term::Cancel;
-use crate::tools::ToolRegistry;
+use crate::tools::{truncate_chars, ToolRegistry};
 use crate::ui::Ui;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -84,6 +88,10 @@ pub struct Session {
     cwd: PathBuf,
     /// 只由 agent loop 写入；对外只读，保证 tool_calls 与 Tool 结果的配对不变式。
     history: Vec<Msg>,
+    /// 会话文件路径；None 表示纯内存会话（测试与未启用持久化时）。
+    store: Option<PathBuf>,
+    /// 写盘失败已提示过：同一进程内只提示一次。
+    save_failed: bool,
 }
 
 /// REPL → agent loop 的内部错误通道。
@@ -119,6 +127,8 @@ impl Session {
             tools: ToolRegistry::builtin(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             history,
+            store: None,
+            save_failed: false,
         }
     }
 
@@ -149,9 +159,97 @@ impl Session {
         self
     }
 
-    /// `/clear`：历史重置为仅含 system 消息（播种语义同 new）。
-    pub fn clear(&mut self) {
+    /// 启用会话持久化：此后每次历史回到合法边界就写一次全量快照。
+    /// 默认不持有存储，构造会话本身不接触文件系统。
+    pub fn with_store(mut self, path: PathBuf) -> Self {
+        self.store = Some(path);
+        self
+    }
+
+    /// 用恢复的会话替换当前历史（`-c` 路径）。
+    /// 文件里的 `Msg::System` / `Msg::Summary` 原样保留：会话是自包含的，
+    /// 后续压缩语义变更不影响已存下的摘要。
+    pub fn replace_history(&mut self, history: Vec<Msg>) {
+        self.history = history;
+    }
+
+    /// 把历史重放到终端：`-c` 恢复后进 REPL 之前调用。
+    /// `Msg::System` 不重放（原会话启动时也没有显示过），其余按原顺序交给渲染器，
+    /// 与当时的屏幕输出走同一条路径。
+    pub fn replay(&self, ui: &mut dyn Ui) {
+        for msg in &self.history {
+            match msg {
+                Msg::System(_) => {}
+                Msg::Summary(text) => emit(ui, RenderEvent::Summary(text.clone())),
+                Msg::User(text) => emit(ui, RenderEvent::UserInput(text.clone())),
+                Msg::Assistant(msg) => {
+                    if let Some(reasoning) = &msg.reasoning {
+                        emit(ui, RenderEvent::ReasoningDelta(reasoning.clone()));
+                    }
+                    if let Some(text) = &msg.text {
+                        emit(ui, RenderEvent::TextDelta(text.clone()));
+                    }
+                    for call in &msg.tool_calls {
+                        emit(
+                            ui,
+                            RenderEvent::ToolCall {
+                                name: call.name.clone(),
+                                summary: self.call_summary(call),
+                            },
+                        );
+                    }
+                }
+                Msg::Tool {
+                    name,
+                    display,
+                    status,
+                    ..
+                } => emit(
+                    ui,
+                    RenderEvent::ToolResult {
+                        name: name.clone(),
+                        display: display.clone(),
+                        status: *status,
+                    },
+                ),
+            }
+        }
+    }
+
+    /// 重放工具调用行的摘要：与实时路径同规则（解析参数后交给工具，失败则用原始参数）。
+    fn call_summary(&self, call: &ToolCall) -> String {
+        let summary = match serde_json::from_str::<Value>(&call.arguments) {
+            Ok(args) => self
+                .tools
+                .get(&call.name)
+                .map(|tool| tool.summary(&args))
+                .unwrap_or_else(|| args.to_string()),
+            Err(_) => call.arguments.clone(),
+        };
+        truncate_chars(&summary, 200)
+    }
+
+    /// 写一次全量快照。写盘失败不影响对话：同一进程内只提示一次。
+    fn save(&mut self, ui: &mut dyn Ui) {
+        let Some(path) = &self.store else { return };
+        if let Err(e) = store::save(path, &self.history) {
+            if !self.save_failed {
+                self.save_failed = true;
+                emit(
+                    ui,
+                    RenderEvent::TextDelta(format!(
+                        "{}\n",
+                        render::dim(&format!("[会话未保存：{e}]"))
+                    )),
+                );
+            }
+        }
+    }
+
+    /// `/clear`：历史重置为仅含 system 消息（播种语义同 new），并立即落盘。
+    pub fn clear(&mut self, ui: &mut dyn Ui) {
         self.history = system_history(self.cfg.system_prompt.as_deref());
+        self.save(ui);
     }
 
     /// `/compact`：把较早的若干轮换成一条 `Msg::Summary`。
@@ -214,6 +312,8 @@ impl Session {
                         "已压缩 {dropped} 条消息 → 摘要（约 {before} → {after} tokens）\n"
                     )),
                 );
+                // 压缩是最贵的一次请求，结果立即落盘：中途退出也不会白做。
+                self.save(ui);
                 Ok(())
             }
             // 错误与取消已由 drive_stream 渲染。
