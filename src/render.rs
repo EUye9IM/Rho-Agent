@@ -5,6 +5,7 @@
 //! 各自只输出一次 ANSI（思考块一次 `\x1b[2m` … 一次 `\x1b[0m`），不随每个 delta
 //! 重复包裹。它只返回要写的文本，不直接写终端；去向由 `ui` 决定。
 
+use crate::markdown::Markdown;
 use crate::message::TokenUsage;
 use crate::tools::ToolStatus;
 
@@ -183,6 +184,8 @@ enum Block {
 #[derive(Debug, Default)]
 pub struct Renderer {
     block: Block,
+    /// 正文的 markdown 流式状态：跨 delta 的未完成行与块结构。
+    markdown: Markdown,
 }
 
 impl Renderer {
@@ -213,7 +216,7 @@ impl Renderer {
                     out.stdout.push('\n');
                 }
                 self.block = Block::Text;
-                out.stdout.push_str(s);
+                out.stdout.push_str(&self.markdown.push(s));
             }
             RenderEvent::Status(status) => {
                 // 思考块开着先关样式；正文块（含被取消的半截输出）先折行，
@@ -270,27 +273,32 @@ impl Renderer {
     /// 退出前复位：若思考块仍开着则返回关闭序列，否则返回空串。
     /// 用于把终端交还给提示符之前（`read_line` 开头）以及 Ctrl-C 中途退出等
     /// 没有后续事件的路径，避免暗淡色残留到提示符或退出后的终端。
-    pub fn reset(&mut self) -> &'static str {
-        if self.block == Block::Reasoning {
-            self.block = Block::Idle;
-            RESET
-        } else {
-            ""
+    pub fn reset(&mut self) -> String {
+        let tail = self.markdown.flush();
+        let mut out = String::new();
+        out.push_str(&tail);
+        if self.block == Block::Reasoning || !tail.is_empty() {
+            out.push_str(RESET);
         }
+        self.block = Block::Idle;
+        out
     }
 
     /// 让下一个事件从行首开始：块还开着就先收尾并补一个换行。
     /// 实时路径的收尾由回合状态栏负责；重放与用户输入行走这里。
     fn ensure_line_start(&mut self, stdout: &mut String) {
-        if self.block != Block::Idle {
-            self.close(stdout);
+        let open = self.block != Block::Idle;
+        self.close(stdout);
+        if open {
             stdout.push('\n');
         }
     }
 
-    /// 收尾当前块：思考块补关闭序列，其余无输出。块回到 Idle。
+    /// 收尾当前块：先把 markdown 未完成的行吐出来，再补关闭序列。块回到 Idle。
     fn close(&mut self, stdout: &mut String) {
-        if self.block == Block::Reasoning {
+        let tail = self.markdown.flush();
+        stdout.push_str(&tail);
+        if self.block == Block::Reasoning || !tail.is_empty() {
             stdout.push_str(RESET);
         }
         self.block = Block::Idle;
@@ -469,6 +477,28 @@ mod tests {
                 context_window: 1_000,
             }),
             "── #1 · mock/m · 100/1k (10.0%)"
+        );
+    }
+
+    #[test]
+    fn text_delta_renders_markdown_inline() {
+        let mut r = Renderer::new();
+        let out = r.event(&RenderEvent::TextDelta("**a**\n".into()));
+        assert_eq!(out.stdout, "\x1b[1ma\x1b[22m\n");
+    }
+
+    #[test]
+    fn status_flushes_the_unfinished_line_before_the_bar() {
+        let mut r = Renderer::new();
+        assert_eq!(r.event(&RenderEvent::TextDelta("**bo".into())).stdout, "");
+
+        let out = r.event(&RenderEvent::Status(status(None)));
+        // 未闭合的 `**bo` 按字面量收尾（补 RESET），然后折行输出状态栏。
+        assert!(out.stdout.starts_with("**bo"), "out was {:?}", out.stdout);
+        assert!(
+            out.stdout.contains("\n\x1b[2m── "),
+            "out was {:?}",
+            out.stdout
         );
     }
 

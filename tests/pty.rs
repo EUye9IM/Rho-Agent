@@ -109,6 +109,28 @@ fn start_mock(respond: impl FnOnce(&mut TcpStream) + Send + 'static) -> MockServ
     MockServer { base_url, stop }
 }
 
+/// 文本响应：每个元素一个 content chunk，末尾补 finish_reason 与 [DONE]。
+fn text_response(chunks: &[&str]) -> impl FnOnce(&mut TcpStream) + Send + 'static {
+    let mut body = String::new();
+    for chunk in chunks {
+        let event = serde_json::json!({
+            "choices": [{ "delta": { "content": chunk } }]
+        });
+        body.push_str(&format!("data: {event}\n\n"));
+    }
+    let done = serde_json::json!({
+        "choices": [{ "delta": {}, "finish_reason": "stop" }]
+    });
+    body.push_str(&format!("data: {done}\n\ndata: [DONE]\n\n"));
+    move |stream: &mut TcpStream| {
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        );
+        let _ = stream.write_all(body.as_bytes());
+        let _ = stream.flush();
+    }
+}
+
 /// tool_calls 响应（触发 bash 执行）：一条 bash 调用后 finish。
 fn tool_call_response(command: &str, timeout: u64) -> impl FnOnce(&mut TcpStream) + Send {
     let args = serde_json::json!({ "command": command, "timeout": timeout }).to_string();
@@ -641,6 +663,66 @@ fn continue_without_session_file_starts_fresh() {
     rho.expect_screen("没有可恢复的会话", SCREEN_TIMEOUT);
     rho.expect_screen("rho>", SCREEN_TIMEOUT);
 
+    rho.send_line("/exit");
+    assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
+}
+
+/// markdown 正文：行内样式与列表在真实终端上的表现。
+#[test]
+fn markdown_renders_inline_styles_and_lists() {
+    let server = start_mock(text_response(&[
+        "**加粗** 和 *斜体*\n\n- 项目一\n- 项目二\n",
+    ]));
+    let config = write_config(&server.base_url);
+    let mut rho = PtyRho::spawn(&config);
+
+    rho.expect_screen("rho>", SCREEN_TIMEOUT);
+    std::thread::sleep(SETTLE);
+    rho.send_line("go");
+
+    // 屏幕上是去掉标记后的正文。
+    rho.expect_screen("加粗 和 斜体", SCREEN_TIMEOUT);
+    rho.expect_screen("- 项目一", SCREEN_TIMEOUT);
+    rho.expect_screen("- 项目二", SCREEN_TIMEOUT);
+    // 原始输出里带着样式序列。
+    assert!(
+        rho.raw_contains("\x1b[1m加粗\x1b[22m"),
+        "raw tail:\n{}",
+        rho.raw_tail(3000)
+    );
+    assert!(
+        rho.raw_contains("\x1b[3m斜体\x1b[23m"),
+        "raw tail:\n{}",
+        rho.raw_tail(3000)
+    );
+
+    rho.expect_screen("rho>", Duration::from_secs(8));
+    std::thread::sleep(SETTLE);
+    rho.send_line("/exit");
+    assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
+}
+
+/// 跨 delta 切断的标记：一行分两次到达，渲染结果与整块到达一致。
+#[test]
+fn markdown_survives_split_deltas() {
+    let server = start_mock(text_response(&["**加", "粗**\n- 项", "目\n"]));
+    let config = write_config(&server.base_url);
+    let mut rho = PtyRho::spawn(&config);
+
+    rho.expect_screen("rho>", SCREEN_TIMEOUT);
+    std::thread::sleep(SETTLE);
+    rho.send_line("go");
+
+    rho.expect_screen("加粗", SCREEN_TIMEOUT);
+    rho.expect_screen("- 项目", SCREEN_TIMEOUT);
+    assert!(
+        rho.raw_contains("\x1b[1m加粗\x1b[22m"),
+        "raw tail:\n{}",
+        rho.raw_tail(3000)
+    );
+
+    rho.expect_screen("rho>", Duration::from_secs(8));
+    std::thread::sleep(SETTLE);
     rho.send_line("/exit");
     assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
 }
