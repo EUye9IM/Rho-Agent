@@ -134,8 +134,9 @@ fn handle_command(
     }
 }
 
+/// 命令输出：界面文本，不走 markdown 渲染。
 fn text(ui: &mut dyn Ui, message: &str) {
-    ui.print(&RenderEvent::TextDelta(format!("{message}\n")));
+    ui.print(&RenderEvent::Notice(format!("{message}\n")));
 }
 
 fn emit_error(ui: &mut dyn Ui, message: impl Into<String>) {

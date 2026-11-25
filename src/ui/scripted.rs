@@ -49,6 +49,7 @@ impl Ui for ScriptedUi {
             },
             RenderEvent::UserInput(s) => RenderEvent::UserInput(s.clone()),
             RenderEvent::Summary(s) => RenderEvent::Summary(s.clone()),
+            RenderEvent::Notice(s) => RenderEvent::Notice(s.clone()),
             RenderEvent::Error(s) => RenderEvent::Error(s.clone()),
         });
     }

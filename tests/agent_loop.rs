@@ -763,7 +763,7 @@ fn compact_replaces_older_turns_with_a_summary() {
 
     // 一行结果，且不产生状态栏（压缩不是对话回合）。
     assert!(ui.rendered.iter().any(
-        |e| matches!(e, rho::render::RenderEvent::TextDelta(t) if t.contains("已压缩 2 条消息"))
+        |e| matches!(e, rho::render::RenderEvent::Notice(t) if t.contains("已压缩 2 条消息"))
     ));
     assert!(!ui
         .rendered

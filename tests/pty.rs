@@ -131,6 +131,27 @@ fn text_response(chunks: &[&str]) -> impl FnOnce(&mut TcpStream) + Send + 'stati
     }
 }
 
+/// 思考 + 正文响应：reasoning_content 与 content 各一个 chunk。
+fn reasoning_response(reasoning: &str, text: &str) -> impl FnOnce(&mut TcpStream) + Send + 'static {
+    let think = serde_json::json!({
+        "choices": [{ "delta": { "reasoning_content": reasoning } }]
+    });
+    let answer = serde_json::json!({
+        "choices": [{ "delta": { "content": text } }]
+    });
+    let done = serde_json::json!({
+        "choices": [{ "delta": {}, "finish_reason": "stop" }]
+    });
+    let body = format!("data: {think}\n\ndata: {answer}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+    move |stream: &mut TcpStream| {
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        );
+        let _ = stream.write_all(body.as_bytes());
+        let _ = stream.flush();
+    }
+}
+
 /// tool_calls 响应（触发 bash 执行）：一条 bash 调用后 finish。
 fn tool_call_response(command: &str, timeout: u64) -> impl FnOnce(&mut TcpStream) + Send {
     let args = serde_json::json!({ "command": command, "timeout": timeout }).to_string();
@@ -717,6 +738,56 @@ fn markdown_survives_split_deltas() {
     rho.expect_screen("- 项目", SCREEN_TIMEOUT);
     assert!(
         rho.raw_contains("\x1b[1m加粗\x1b[22m"),
+        "raw tail:\n{}",
+        rho.raw_tail(3000)
+    );
+
+    rho.expect_screen("rho>", Duration::from_secs(8));
+    std::thread::sleep(SETTLE);
+    rho.send_line("/exit");
+    assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
+}
+
+/// 表格：整块对齐后输出，表头与分隔线可见。
+#[test]
+fn markdown_renders_tables() {
+    let server = start_mock(text_response(&[
+        "| 名称 | 大小 |\n|------|-----:|\n| rho | 1.9M |\n",
+    ]));
+    let config = write_config(&server.base_url);
+    let mut rho = PtyRho::spawn(&config);
+
+    rho.expect_screen("rho>", SCREEN_TIMEOUT);
+    std::thread::sleep(SETTLE);
+    rho.send_line("go");
+
+    rho.expect_screen("名称", SCREEN_TIMEOUT);
+    rho.expect_screen("rho", SCREEN_TIMEOUT);
+    rho.expect_screen("1.9M", SCREEN_TIMEOUT);
+    rho.expect_screen("├──", SCREEN_TIMEOUT);
+
+    rho.expect_screen("rho>", Duration::from_secs(8));
+    std::thread::sleep(SETTLE);
+    rho.send_line("/exit");
+    assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
+}
+
+/// 思考块也走 markdown：加粗结束后暗淡色要接回来（SGR 22 会同时关掉 dim）。
+#[test]
+fn reasoning_renders_markdown_and_stays_dim() {
+    let server = start_mock(reasoning_response("**重点**\n", "回答\n"));
+    let config = write_config(&server.base_url);
+    let mut rho = PtyRho::spawn(&config);
+
+    rho.expect_screen("rho>", SCREEN_TIMEOUT);
+    std::thread::sleep(SETTLE);
+    rho.send_line("go");
+
+    rho.expect_screen("重点", SCREEN_TIMEOUT);
+    rho.expect_screen("回答", SCREEN_TIMEOUT);
+    // 加粗关闭后重新开暗淡色。
+    assert!(
+        rho.raw_contains("\x1b[1m重点\x1b[22m\x1b[2m"),
         "raw tail:\n{}",
         rho.raw_tail(3000)
     );

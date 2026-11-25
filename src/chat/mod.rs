@@ -237,7 +237,7 @@ impl Session {
                 self.save_failed = true;
                 emit(
                     ui,
-                    RenderEvent::TextDelta(format!(
+                    RenderEvent::Notice(format!(
                         "{}\n",
                         render::dim(&format!("[会话未保存：{e}]"))
                     )),
@@ -308,7 +308,7 @@ impl Session {
                 self.history.splice(start..end, [Msg::Summary(summary)]);
                 emit(
                     ui,
-                    RenderEvent::TextDelta(format!(
+                    RenderEvent::Notice(format!(
                         "已压缩 {dropped} 条消息 → 摘要（约 {before} → {after} tokens）\n"
                     )),
                 );

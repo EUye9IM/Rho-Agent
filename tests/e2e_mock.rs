@@ -1061,7 +1061,7 @@ fn compact_rewrites_history_and_next_request_carries_summary() {
     assert!(ui
         .rendered
         .iter()
-        .any(|e| matches!(e, RenderEvent::TextDelta(t) if t.contains("已压缩 2 条消息"))));
+        .any(|e| matches!(e, RenderEvent::Notice(t) if t.contains("已压缩 2 条消息"))));
 
     // 下一回合的请求体：摘要作为第一条 system 消息，早期内容不再发送。
     session.turn(&mut ui, &cancel, "u4").unwrap();

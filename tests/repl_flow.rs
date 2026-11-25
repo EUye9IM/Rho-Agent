@@ -101,7 +101,7 @@ fn slash_commands_then_exit() {
     assert!(ui
         .rendered
         .iter()
-        .any(|e| matches!(e, RenderEvent::TextDelta(t) if t.contains("可用模型"))));
+        .any(|e| matches!(e, RenderEvent::Notice(t) if t.contains("可用模型"))));
     assert!(ui
         .rendered
         .iter()
@@ -146,7 +146,7 @@ fn leading_space_sends_the_line_as_input() {
     assert!(!ui
         .rendered
         .iter()
-        .any(|e| matches!(e, RenderEvent::TextDelta(t) if t.contains("命令："))));
+        .any(|e| matches!(e, RenderEvent::Notice(t) if t.contains("命令："))));
     let turns = ui
         .rendered
         .iter()
@@ -168,7 +168,7 @@ fn help_and_model_list_follow_current_provider() {
         .rendered
         .iter()
         .filter_map(|e| match e {
-            RenderEvent::TextDelta(t) => Some(t.as_str()),
+            RenderEvent::TextDelta(t) | RenderEvent::Notice(t) => Some(t.as_str()),
             _ => None,
         })
         .collect();
@@ -200,7 +200,7 @@ fn help_hides_thinking_for_model_without_table() {
         .rendered
         .iter()
         .filter_map(|e| match e {
-            RenderEvent::TextDelta(t) => Some(t.as_str()),
+            RenderEvent::TextDelta(t) | RenderEvent::Notice(t) => Some(t.as_str()),
             _ => None,
         })
         .collect();
@@ -331,7 +331,7 @@ max_output = 100
         .rendered
         .iter()
         .filter_map(|e| match e {
-            RenderEvent::TextDelta(t) => Some(t.as_str()),
+            RenderEvent::TextDelta(t) | RenderEvent::Notice(t) => Some(t.as_str()),
             _ => None,
         })
         .collect();

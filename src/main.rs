@@ -170,9 +170,9 @@ fn resume(session: &mut Session, ui: &mut dyn Ui, path: &Path) {
     }
 }
 
-/// 不以退出码表达的状态提示：暗淡一行，走正常输出流。
+/// 不以退出码表达的状态提示：暗淡一行，走界面文本（不经过 markdown）。
 fn warn(ui: &mut dyn Ui, message: &str) {
-    ui.print(&RenderEvent::TextDelta(format!(
+    ui.print(&RenderEvent::Notice(format!(
         "{}\n",
         render::dim(&format!("[{message}]"))
     )));

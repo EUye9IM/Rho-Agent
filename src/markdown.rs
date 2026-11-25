@@ -6,6 +6,7 @@
 //! 才原样输出，其余留到换行或 `flush`。
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use unicode_width::UnicodeWidthStr;
 
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";
@@ -33,18 +34,59 @@ struct Fence {
     len: usize,
 }
 
+/// 表格收集状态。表格必须整块对齐，因此先缓冲再一次性输出。
+#[derive(Debug)]
+enum TableState {
+    /// 首行以 `|` 开头，等待下一行确认是否为分隔行。
+    Candidate(String),
+    /// 已确认是表格：表头、分隔行与后续数据行。
+    Collecting(Vec<String>),
+}
+
+/// 单元格对齐方式（来自分隔行的冒号位置）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Align {
+    Left,
+    Center,
+    Right,
+}
+
 /// 流式 markdown 渲染器。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Markdown {
+    /// 关闭样式后要重新应用的基础样式（思考块的暗淡色）；正文为空串。
+    base: &'static str,
     /// 已收到但尚未换行的当前行。
     pending: String,
     /// 代码块状态：Some 表示当前行在围栏内。
     fence: Option<Fence>,
+    /// 表格缓冲。
+    table: Option<TableState>,
+    /// 块级公式：`$$ ... $$` 跨行时置位。
+    display_math: bool,
+}
+
+impl Default for Markdown {
+    fn default() -> Self {
+        Self::with_base("")
+    }
 }
 
 impl Markdown {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 带基础样式：每次关闭一段样式后重新应用它。
+    /// 用于叠加暗淡色——SGR 22 会同时关闭 bold 与 dim。
+    pub fn with_base(base: &'static str) -> Self {
+        Self {
+            base,
+            pending: String::new(),
+            fence: None,
+            table: None,
+            display_math: false,
+        }
     }
 
     /// 追加流式正文，返回本次可以写终端的文本。
@@ -58,14 +100,14 @@ impl Markdown {
             self.render_line(&line, true, &mut out);
         }
         // 未完成行：把行内标记都已闭合的部分立刻渲染出来，剩下的等换行。
-        if !self.pending.is_empty() && !self.in_open_block() {
+        if !self.pending.is_empty() && !self.in_open_block() && self.table.is_none() {
             let stable = stable_prefix_len(&self.pending);
             if stable > 0 {
                 let part: String = self.pending[..stable].to_string();
                 // pulldown-cmark 会吃掉段落尾随空白；逐段输出时要原样补回，
                 // 否则下一次到达的文本会和这里粘在一起。
                 let body = part.trim_end();
-                render_inline(body, &mut out);
+                render_inline(body, self.base, &mut out);
                 out.push_str(&part[body.len()..]);
                 self.pending.drain(..stable);
             }
@@ -77,11 +119,19 @@ impl Markdown {
     /// 不补行尾换行：调用方随后会写 `\n` 或状态栏。
     pub fn flush(&mut self) -> String {
         let mut out = String::new();
-        if self.pending.is_empty() {
-            return out;
+        // 未完成的行先按正常流程走一遍：它可能是表格的分隔行或最后一行数据。
+        if !self.pending.is_empty() {
+            let line = std::mem::take(&mut self.pending);
+            self.render_line(&line, false, &mut out);
         }
-        let line = std::mem::take(&mut self.pending);
-        self.render_line(&line, false, &mut out);
+        // 表格可能仍在收集：整块输出。
+        match self.table.take() {
+            Some(TableState::Candidate(first)) => {
+                render_inline(first.trim_start(), self.base, &mut out)
+            }
+            Some(TableState::Collecting(rows)) => render_table(&rows, self.base, &mut out),
+            None => {}
+        }
         out
     }
 
@@ -101,6 +151,7 @@ impl Markdown {
             out.push_str(CODE_INDENT);
             out.push_str(line);
             out.push_str(RESET);
+            out.push_str(self.base);
             if newline {
                 out.push('\n');
             }
@@ -117,13 +168,69 @@ impl Markdown {
             quote += 1;
             rest = after.strip_prefix(' ').unwrap_or(after);
         }
-        let prefix = raw_quote_prefix(quote);
+        let prefix = raw_quote_prefix(quote, self.base);
+
+        // 块级公式：`$$ ... $$` 整块缩进，内容不再做行内解析。
+        if self.display_math {
+            if rest.trim() == "$$" {
+                self.display_math = false;
+                return;
+            }
+            render_math_line(rest, &prefix, self.base, newline, out);
+            return;
+        }
+        if let Some(body) = single_display_math(rest) {
+            render_math_line(body, &prefix, self.base, newline, out);
+            return;
+        }
+        if rest.trim_start().starts_with("$$") {
+            self.display_math = true;
+            let body = rest.trim_start().trim_start_matches("$$");
+            if !body.is_empty() {
+                render_math_line(body, &prefix, self.base, newline, out);
+            }
+            return;
+        }
+
+        // 表格收集：整块对齐后才能输出，先缓冲。行内容已剥掉引用前缀。
+        match self.table.take() {
+            Some(TableState::Candidate(first)) => {
+                if is_table_delimiter(rest) {
+                    self.table = Some(TableState::Collecting(vec![first, rest.to_string()]));
+                } else {
+                    // 不是表格：首行按段落渲染，当前行按正常流程继续。
+                    render_inline(first.trim_start(), self.base, out);
+                    if newline {
+                        out.push('\n');
+                    }
+                    self.render_line(line, newline, out);
+                }
+                return;
+            }
+            Some(TableState::Collecting(mut rows)) => {
+                if is_table_row(rest) {
+                    rows.push(rest.to_string());
+                    self.table = Some(TableState::Collecting(rows));
+                } else {
+                    render_table(&rows, self.base, out);
+                    self.render_line(line, newline, out);
+                }
+                return;
+            }
+            None => {}
+        }
 
         if rest.trim().is_empty() {
             out.push_str(&prefix);
             if newline {
                 out.push('\n');
             }
+            return;
+        }
+
+        // 以 `|` 开头的行先记为表格候选；下一行是分隔行才确认。
+        if is_table_row(rest) {
+            self.table = Some(TableState::Candidate(rest.to_string()));
             return;
         }
 
@@ -137,17 +244,22 @@ impl Markdown {
             out.push_str(DIM);
             out.push_str(&"─".repeat(RULE_WIDTH));
             out.push_str(RESET);
+            out.push_str(self.base);
             if newline {
                 out.push('\n');
             }
             return;
         }
 
-        if let Some((_, text)) = heading(rest) {
+        if let Some((level, text)) = heading(rest) {
             out.push_str(&prefix);
+            // 保留原始 `#` 数量：纯靠颜色分不出六级标题。
+            out.push_str(&"#".repeat(level));
+            out.push(' ');
             out.push_str(HEADING_ON);
-            render_inline(text, out);
+            render_inline(text, self.base, out);
             out.push_str(RESET);
+            out.push_str(self.base);
             if newline {
                 out.push('\n');
             }
@@ -162,7 +274,7 @@ impl Markdown {
             }
             out.push_str(marker);
             out.push(' ');
-            render_inline(text, out);
+            render_inline(text, self.base, out);
             if newline {
                 out.push('\n');
             }
@@ -170,7 +282,7 @@ impl Markdown {
         }
 
         out.push_str(&prefix);
-        render_inline(rest, out);
+        render_inline(rest, self.base, out);
         if newline {
             out.push('\n');
         }
@@ -178,27 +290,34 @@ impl Markdown {
 }
 
 /// 引用前缀：每层一个竖线加空格，暗淡色。
-fn raw_quote_prefix(depth: usize) -> String {
+fn raw_quote_prefix(depth: usize, base: &str) -> String {
     if depth == 0 {
         return String::new();
     }
-    format!("{DIM}{}{RESET}", "│ ".repeat(depth))
+    format!("{DIM}{}{RESET}{base}", "│ ".repeat(depth))
+}
+
+/// 关闭一段样式后重新应用基础样式。
+fn close_style(out: &mut String, sequence: &str, base: &str) {
+    out.push_str(sequence);
+    out.push_str(base);
 }
 
 /// 行内标记 → ANSI。完整行调用时标记已确定成对，未闭合的按字面量输出。
-fn render_inline(text: &str, out: &mut String) {
+fn render_inline(text: &str, base: &str, out: &mut String) {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_MATH);
     let mut link: Option<String> = None;
 
     for event in Parser::new_ext(text, options) {
         match event {
             Event::Start(Tag::Strong) => out.push_str(BOLD_ON),
-            Event::End(TagEnd::Strong) => out.push_str(BOLD_OFF),
+            Event::End(TagEnd::Strong) => close_style(out, BOLD_OFF, base),
             Event::Start(Tag::Emphasis) => out.push_str(ITALIC_ON),
-            Event::End(TagEnd::Emphasis) => out.push_str(ITALIC_OFF),
+            Event::End(TagEnd::Emphasis) => close_style(out, ITALIC_OFF, base),
             Event::Start(Tag::Strikethrough) => out.push_str(STRIKE_ON),
-            Event::End(TagEnd::Strikethrough) => out.push_str(STRIKE_OFF),
+            Event::End(TagEnd::Strikethrough) => close_style(out, STRIKE_OFF, base),
             Event::Start(Tag::Link { dest_url, .. }) => link = Some(dest_url.to_string()),
             Event::End(TagEnd::Link) => {
                 if let Some(url) = link.take() {
@@ -206,20 +325,195 @@ fn render_inline(text: &str, out: &mut String) {
                     out.push('(');
                     out.push_str(&url);
                     out.push(')');
-                    out.push_str(RESET);
+                    close_style(out, RESET, base);
                 }
             }
             Event::Code(code) => {
                 out.push_str(CODE_ON);
                 out.push_str(&code);
-                out.push_str(CODE_OFF);
+                close_style(out, CODE_OFF, base);
             }
             Event::Text(text) => out.push_str(&text),
+            // 公式只去掉定界符：\frac、^、_ 这类仍是字面量，终端无法排版。
+            Event::InlineMath(math) | Event::DisplayMath(math) => {
+                out.push_str(ITALIC_ON);
+                out.push_str(DIM);
+                out.push_str(&math);
+                close_style(out, RESET, base);
+            }
             Event::SoftBreak | Event::HardBreak => out.push(' '),
             Event::Html(html) | Event::InlineHtml(html) => out.push_str(&html),
             _ => {}
         }
     }
+}
+
+/// 单行块级公式：`$$x$$` 返回中间的内容。
+fn single_display_math(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed.len() <= 4 {
+        return None;
+    }
+    trimmed
+        .strip_prefix("$$")?
+        .strip_suffix("$$")
+        .map(str::trim)
+}
+
+/// 块级公式的一行：四空格缩进 + 暗淡斜体。
+fn render_math_line(text: &str, prefix: &str, base: &str, newline: bool, out: &mut String) {
+    out.push_str(prefix);
+    out.push_str(CODE_INDENT);
+    out.push_str(ITALIC_ON);
+    out.push_str(DIM);
+    out.push_str(text);
+    close_style(out, RESET, base);
+    if newline {
+        out.push('\n');
+    }
+}
+
+/// 表格行：以 `|` 开头。
+fn is_table_row(line: &str) -> bool {
+    line.trim_start().starts_with('|')
+}
+
+/// 分隔行：`|---|:--:|` 这类，每个单元格是可选冒号包裹的短横线。
+fn is_table_delimiter(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('|') {
+        return false;
+    }
+    let cells: Vec<&str> = trimmed
+        .split('|')
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    !cells.is_empty() && cells.iter().all(|cell| is_delim_cell(cell))
+}
+
+fn is_delim_cell(cell: &str) -> bool {
+    let inner = cell.strip_prefix(':').unwrap_or(cell);
+    let inner = inner.strip_suffix(':').unwrap_or(inner);
+    !inner.is_empty() && inner.chars().all(|c| c == '-')
+}
+
+/// 按 `|` 切单元格，去掉首尾的边框竖线。
+fn split_cells(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let body = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let body = body.strip_suffix('|').unwrap_or(body);
+    body.split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
+}
+
+/// 单元格的显示宽度：按行内渲染后的纯文本算，忽略标记与 ANSI。
+fn plain_width(text: &str) -> usize {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_MATH);
+    let mut width = 0;
+    for event in Parser::new_ext(text, options) {
+        match event {
+            Event::Text(text) | Event::Code(text) => width += UnicodeWidthStr::width(text.as_ref()),
+            _ => {}
+        }
+    }
+    width
+}
+
+/// 分隔行的冒号位置决定每列对齐。
+fn parse_aligns(cells: &[String]) -> Vec<Align> {
+    cells
+        .iter()
+        .map(|cell| match (cell.starts_with(':'), cell.ends_with(':')) {
+            (true, true) => Align::Center,
+            (false, true) => Align::Right,
+            _ => Align::Left,
+        })
+        .collect()
+}
+
+/// 整块渲染表格：列宽按单元格纯文本的最大显示宽度，CJK 按双宽计算。
+fn render_table(rows: &[String], base: &str, out: &mut String) {
+    let parsed: Vec<Vec<String>> = rows.iter().map(|row| split_cells(row)).collect();
+    let header = parsed.first().cloned().unwrap_or_default();
+    let aligns = parsed
+        .get(1)
+        .map(|row| parse_aligns(row))
+        .unwrap_or_default();
+    let body = parsed.get(2..).unwrap_or_default();
+    let cols = parsed.iter().map(Vec::len).max().unwrap_or(0);
+    if cols == 0 {
+        return;
+    }
+
+    let mut widths = vec![0usize; cols];
+    for (index, row) in parsed.iter().enumerate() {
+        // 分隔行只是排版语法，不参与列宽。
+        if index == 1 {
+            continue;
+        }
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(plain_width(cell));
+        }
+    }
+
+    write_row(out, &header, &widths, &aligns, true, base);
+
+    out.push_str(DIM);
+    out.push('├');
+    for (i, width) in widths.iter().enumerate() {
+        if i > 0 {
+            out.push('┼');
+        }
+        out.push_str(&"─".repeat(width + 2));
+    }
+    out.push('┤');
+    close_style(out, RESET, base);
+    out.push('\n');
+
+    for row in body {
+        write_row(out, row, &widths, &aligns, false, base);
+    }
+}
+
+fn write_row(
+    out: &mut String,
+    row: &[String],
+    widths: &[usize],
+    aligns: &[Align],
+    header: bool,
+    base: &str,
+) {
+    out.push_str(DIM);
+    out.push('│');
+    close_style(out, RESET, base);
+    for (i, &width) in widths.iter().enumerate() {
+        let cell = row.get(i).map(String::as_str).unwrap_or("");
+        let pad = width.saturating_sub(plain_width(cell));
+        let (left, right) = match aligns.get(i).copied().unwrap_or(Align::Left) {
+            Align::Left => (0, pad),
+            Align::Center => (pad / 2, pad - pad / 2),
+            Align::Right => (pad, 0),
+        };
+        out.push(' ');
+        out.push_str(&" ".repeat(left));
+        if header {
+            out.push_str(HEADING_ON);
+        }
+        render_inline(cell, base, out);
+        if header {
+            close_style(out, RESET, base);
+        }
+        out.push_str(&" ".repeat(right));
+        out.push(' ');
+        out.push_str(DIM);
+        out.push('│');
+        close_style(out, RESET, base);
+    }
+    out.push('\n');
 }
 
 /// 未完成行里可以立即渲染的字节长度。
@@ -270,6 +564,20 @@ fn stable_prefix_len(line: &str) -> usize {
                     i += 1;
                 }
             }
+            b'$' => {
+                // 行内与块级公式分别按定界符长度配对。
+                let n = run_len(bytes, i, b'$').min(2);
+                match open
+                    .iter()
+                    .rposition(|&(_, ch, len)| ch == b'$' && len == n)
+                {
+                    Some(pos) => {
+                        open.remove(pos);
+                    }
+                    None => open.push((i, b'$', n)),
+                }
+                i += n;
+            }
             b'[' => {
                 open.push((i, b'[', 1));
                 i += 1;
@@ -295,7 +603,10 @@ fn head_settled(line: &str) -> bool {
     if first.is_ascii_digit() {
         return false;
     }
-    !matches!(first, '#' | '>' | '-' | '+' | '*' | '_' | '`' | '~' | '|')
+    !matches!(
+        first,
+        '#' | '>' | '-' | '+' | '*' | '_' | '`' | '~' | '|' | '$'
+    )
 }
 
 /// 从 `start` 开始连续 `byte` 的个数。
@@ -408,10 +719,50 @@ mod tests {
     }
 
     #[test]
-    fn heading_drops_hashes_and_colors_the_text() {
-        assert_eq!(render("## 标题\n"), "\x1b[1;36m标题\x1b[0m\n");
+    fn heading_keeps_hashes_and_colors_the_text() {
+        assert_eq!(render("## 标题\n"), "## \x1b[1;36m标题\x1b[0m\n");
+        assert_eq!(render("# 一级\n"), "# \x1b[1;36m一级\x1b[0m\n");
         // 没有空格的 `#tag` 不是标题。
         assert_eq!(render("#tag\n"), "#tag\n");
+    }
+
+    #[test]
+    fn inline_math_drops_delimiters_and_is_dim_italic() {
+        assert_eq!(
+            render("$E = mc^2$\n"),
+            format!("{ITALIC_ON}{DIM}E = mc^2{RESET}\n")
+        );
+    }
+
+    #[test]
+    fn single_line_display_math_is_indented() {
+        assert_eq!(
+            render("$$x + y$$\n"),
+            format!("{CODE_INDENT}{ITALIC_ON}{DIM}x + y{RESET}\n")
+        );
+    }
+
+    #[test]
+    fn multi_line_display_math_is_indented_per_line() {
+        let out = render("$$\na = b\nc = d\n$$\n");
+        let line = format!("{CODE_INDENT}{ITALIC_ON}{DIM}");
+        assert_eq!(out.matches(&line).count(), 2, "out was {out:?}");
+        assert!(!out.contains("$$"), "out was {out:?}");
+    }
+
+    #[test]
+    fn display_math_does_not_parse_inline_markup() {
+        let out = render("$$\n**raw**\n$$\n");
+        assert!(out.contains("**raw**"), "out was {out:?}");
+        assert!(!out.contains("\x1b[1m"), "out was {out:?}");
+    }
+
+    #[test]
+    fn unclosed_dollar_buffers_until_the_line_ends() {
+        let mut md = Markdown::new();
+        // `$` 未闭合期间只输出它之前的前缀。
+        assert_eq!(md.push("花费 $5"), "花费 ");
+        assert_eq!(md.push(" 再算\n"), "$5 再算\n");
     }
 
     #[test]
@@ -514,8 +865,71 @@ mod tests {
     }
 
     #[test]
-    fn table_rows_pass_through_as_text() {
-        assert_eq!(render("| a | b |\n"), "| a | b |\n");
+    fn table_rows_without_a_delimiter_stay_text() {
+        // 没有分隔行确认：按普通段落输出。
+        assert_eq!(render("| a | b |\n"), "| a | b |");
+        // 不以 `|` 开头的行永远不是表格。
+        assert_eq!(render("a | b\n"), "a | b\n");
+    }
+
+    #[test]
+    fn table_aligns_columns_and_keeps_cjk_width() {
+        let out = render("| 名称 | 大小 |\n|------|-----:|\n| rho | 1.9M |\n");
+        let expected = format!(
+            "{DIM}│{RESET} {HEADING_ON}名称{RESET} {DIM}│{RESET} {HEADING_ON}大小{RESET} {DIM}│{RESET}\n\
+             {DIM}├──────┼──────┤{RESET}\n\
+             {DIM}│{RESET} rho  {DIM}│{RESET} 1.9M {DIM}│{RESET}\n"
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn table_centers_with_double_colons() {
+        let out = render("| a |\n|:-:|\n| x |\n");
+        assert!(
+            out.contains(&format!("{DIM}│{RESET} x {DIM}│{RESET}")),
+            "out was {out:?}"
+        );
+        // 分隔行不参与列宽：单字符列宽为 1。
+        assert!(out.contains("├───┤"), "out was {out:?}");
+    }
+
+    #[test]
+    fn table_cells_render_inline_markdown() {
+        let out = render("| a |\n|---|\n| **b** |\n");
+        assert!(out.contains("\x1b[1mb\x1b[22m"), "out was {out:?}");
+    }
+
+    #[test]
+    fn table_ends_at_the_first_non_table_line() {
+        let out = render("| a |\n|---|\n| 1 |\n结尾\n");
+        assert!(out.contains("├───┤"), "out was {out:?}");
+        assert!(out.ends_with("结尾\n"), "out was {out:?}");
+    }
+
+    #[test]
+    fn table_flushes_when_the_stream_ends() {
+        let mut md = Markdown::new();
+        assert_eq!(md.push("| a | b |\n|---|"), "");
+        let out = md.flush();
+        assert!(out.contains("├───┼───┤"), "out was {out:?}");
+    }
+
+    #[test]
+    fn table_survives_split_deltas() {
+        let whole = render("| a | b |\n|---|---|\n| 1 | 2 |\n");
+        let chunked = render_chunked(&["| a |", " b |\n|-", "--|---|\n| 1 | 2 |\n"]);
+        assert_eq!(whole, chunked);
+    }
+
+    #[test]
+    fn base_style_is_reapplied_after_each_close() {
+        // SGR 22 会同时关闭 bold 与 dim，所以基础样式要补回来。
+        let mut md = Markdown::with_base("\x1b[2m");
+        assert_eq!(md.push("**x**\n"), "\x1b[1mx\x1b[22m\x1b[2m\n");
+
+        let mut md = Markdown::with_base("\x1b[2m");
+        assert_eq!(md.push("- x\n"), "- x\n");
     }
 
     #[test]

@@ -32,6 +32,8 @@ pub enum RenderEvent {
     UserInput(String),
     /// 历史回放：`/compact` 产出的上下文摘要（暗淡标记行 + 正文）。
     Summary(String),
+    /// 界面文本（命令输出、会话提示）：原样写出，不经过 markdown 渲染。
+    Notice(String),
     /// 错误展示（轮内错误，回 REPL）
     Error(String),
 }
@@ -181,11 +183,23 @@ enum Block {
 }
 
 /// 有状态渲染器：跨事件维护当前块，样式在进入块时开一次、离开块时关一次。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Renderer {
     block: Block,
     /// 正文的 markdown 流式状态：跨 delta 的未完成行与块结构。
-    markdown: Markdown,
+    text: Markdown,
+    /// 思考块的 markdown 状态：基础样式是暗淡色。
+    reasoning: Markdown,
+}
+
+impl Default for Renderer {
+    fn default() -> Self {
+        Self {
+            block: Block::Idle,
+            text: Markdown::new(),
+            reasoning: Markdown::with_base(DIM_OPEN),
+        }
+    }
 }
 
 impl Renderer {
@@ -202,21 +216,22 @@ impl Renderer {
                 match self.block {
                     Block::Idle => out.stdout.push_str(DIM_OPEN),
                     Block::Text => {
+                        self.close(&mut out.stdout);
                         out.stdout.push('\n');
                         out.stdout.push_str(DIM_OPEN);
                     }
                     Block::Reasoning => {}
                 }
                 self.block = Block::Reasoning;
-                out.stdout.push_str(s);
+                out.stdout.push_str(&self.reasoning.push(s));
             }
             RenderEvent::TextDelta(s) => {
                 if self.block == Block::Reasoning {
-                    out.stdout.push_str(RESET);
+                    self.close(&mut out.stdout);
                     out.stdout.push('\n');
                 }
                 self.block = Block::Text;
-                out.stdout.push_str(&self.markdown.push(s));
+                out.stdout.push_str(&self.text.push(s));
             }
             RenderEvent::Status(status) => {
                 // 思考块开着先关样式；正文块（含被取消的半截输出）先折行，
@@ -260,6 +275,10 @@ impl Renderer {
                 out.stdout.push_str(&dim(text));
                 out.stdout.push('\n');
             }
+            RenderEvent::Notice(text) => {
+                self.ensure_line_start(&mut out.stdout);
+                out.stdout.push_str(text);
+            }
             RenderEvent::Error(msg) => {
                 self.close(&mut out.stdout);
                 out.stderr.push_str("错误：");
@@ -274,13 +293,8 @@ impl Renderer {
     /// 用于把终端交还给提示符之前（`read_line` 开头）以及 Ctrl-C 中途退出等
     /// 没有后续事件的路径，避免暗淡色残留到提示符或退出后的终端。
     pub fn reset(&mut self) -> String {
-        let tail = self.markdown.flush();
         let mut out = String::new();
-        out.push_str(&tail);
-        if self.block == Block::Reasoning || !tail.is_empty() {
-            out.push_str(RESET);
-        }
-        self.block = Block::Idle;
+        self.close(&mut out);
         out
     }
 
@@ -294,9 +308,14 @@ impl Renderer {
         }
     }
 
-    /// 收尾当前块：先把 markdown 未完成的行吐出来，再补关闭序列。块回到 Idle。
+    /// 收尾当前块：先把对应 markdown 未完成的行吐出来，再补关闭序列。
+    /// 块回到 Idle。
     fn close(&mut self, stdout: &mut String) {
-        let tail = self.markdown.flush();
+        let tail = match self.block {
+            Block::Reasoning => self.reasoning.flush(),
+            Block::Text => self.text.flush(),
+            Block::Idle => String::new(),
+        };
         stdout.push_str(&tail);
         if self.block == Block::Reasoning || !tail.is_empty() {
             stdout.push_str(RESET);
@@ -477,6 +496,36 @@ mod tests {
                 context_window: 1_000,
             }),
             "── #1 · mock/m · 100/1k (10.0%)"
+        );
+    }
+
+    #[test]
+    fn notice_is_written_verbatim() {
+        let mut r = Renderer::new();
+        let out = r.event(&RenderEvent::Notice("**不是加粗** [id]\n".into()));
+        assert_eq!(out.stdout, "**不是加粗** [id]\n");
+        assert!(out.stderr.is_empty());
+    }
+
+    #[test]
+    fn notice_starts_on_a_fresh_line() {
+        let mut r = Renderer::new();
+        let _ = r.event(&RenderEvent::TextDelta("正文".into()));
+        let out = r.event(&RenderEvent::Notice("提示\n".into()));
+        assert!(out.stdout.contains("\n提示\n"), "out was {:?}", out.stdout);
+    }
+
+    #[test]
+    fn reasoning_renders_markdown_and_keeps_dim() {
+        let mut r = Renderer::new();
+        let out = r.event(&RenderEvent::ReasoningDelta("**重点**\n".into()));
+        assert!(out.stdout.starts_with(DIM_OPEN), "out was {:?}", out.stdout);
+        assert!(out.stdout.contains("\x1b[1m"), "out was {:?}", out.stdout);
+        // 关闭加粗（SGR 22 也会关 dim）后重新应用暗淡色。
+        assert!(
+            out.stdout.contains(&format!("\x1b[22m{DIM_OPEN}")),
+            "out was {:?}",
+            out.stdout
         );
     }
 

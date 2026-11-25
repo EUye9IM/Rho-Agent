@@ -86,8 +86,9 @@ src/
     read.rs      全文文本校验、行偏移、行号、50k 字符与 2000 行上限
     write.rs     仅新建、自动建父目录、拒绝 NUL、直接写入
     edit.rs      顺序 edits、精确匹配、replace_all、换行归一化、失败相似行提示
-  render.rs      有状态渲染器 Renderer + RenderEvent：思考块暗淡色、正文经
-                 `markdown` 渲染、提示符/输入/工具调用着色、整块着色的工具结果
+  render.rs      有状态渲染器 Renderer + RenderEvent：思考块暗淡色 + `markdown`
+                 渲染、正文经 `markdown` 渲染、界面文本原样输出、
+                 提示符/输入/工具调用着色、整块着色的工具结果
                  （成功绿、失败红、打断黄）、回合状态栏单行；返回待写文本，
                  不直接写终端（颜色固定使用 ANSI 转义，暗色终端下仍可用）
   repl.rs        REPL 循环、Ctrl-C 语义；`/` 紧贴行首的输入才当命令，
@@ -252,7 +253,7 @@ loop {
 - **取消在两个粒度检查**：接收循环逐事件检查（含持续有事件时）；工具序列逐个调用前检查。任一处发现取消即按占位规则收尾。终端 I/O 失败（fatal）同样在流收尾与逐个调用前检查：流收尾后发现则不提交 Assistant 直接上抛；批次中途发现则剩余调用补“终端输出失败”占位后上抛；两者均映射 exit 1。
 - **限额逐个前置检查**：每个调用执行前先检查限额；所有模型发起的调用都计数（含参数解析失败/未知工具/工具内部错误），防止错误调用无限循环。
 - **单会话持久化**：`Session` 默认不持有存储（构造会话不接触文件系统），`main` 用 `with_store(path)` 注入 `$XDG_STATE_HOME/rho/session.json`（未设置时为 `$HOME/.local/state/rho/session.json`）。写入点是「历史回到合法边界」：`turn_inner` 的 push `Msg::User` 之后、无 tool_calls 的 Assistant 提交之后、`run_tool_calls` 返回之后（所有占位已补齐），以及 `/compact` 成功与 `/clear` 之后；单个工具结果提交后不写，避免留下未配对的 `Assistant(tool_calls)`。每次写都是全量快照：同目录 `session.json.tmp` + `rename`。写盘失败不打断对话，同一进程内只输出一行暗淡提示。`-c` 加载失败时区分「文件不存在」与「解析失败」：后者把原文件改名为 `session.json.bad` 再开新会话。恢复后 `Session::replay` 在第一个提示符前把历史交给 `Renderer`（`UserInput` / `ReasoningDelta` / `TextDelta` / `ToolCall` / `ToolResult` / `Summary`），`Msg::System` 不重放；文件里的 `Msg::System` 与 `Msg::Summary` 原样保留，会话自包含。
-- **正文 markdown 渲染**：`TextDelta` 先交给 `markdown::Markdown` 再写终端。行内加粗/斜体/删除线/行内代码/链接映射为 ANSI；块级识别标题、无序与有序列表（按缩进每层两空格，保留原文标记）、引用（每行 `│ ` 前缀）、围栏代码块（四空格缩进 + 暗淡，内容不做行内解析）、分隔线（固定 40 字符）。流式切分以行为界：行内标记都已闭合的前缀立即渲染，未闭合的尾部留到换行或 `flush`；`Renderer::close` 在状态栏、工具行、错误之前 flush 未完成的行。表格、图片、HTML、脚注按原文输出；不做语法高亮、折行对齐与终端宽度感知。
+- **正文与思考块的 markdown 渲染**：`TextDelta` 与 `ReasoningDelta` 各持一个 `markdown::Markdown` 实例，状态互不干扰；思考块实例的基础样式是暗淡色，每次关闭样式后重新应用（SGR 22 会同时关闭 bold 与 dim）。行内加粗/斜体/删除线/行内代码/链接映射为 ANSI；行内 `$...$` 以暗淡斜体输出；块级 `$$...$$`（单行与跨行两种）去掉定界符后整块四空格缩进、逐行暗淡斜体，内容不做行内解析（`\frac`、`^`、`_` 仍是字面量）；块级识别标题（保留 `#` 数量，统一青色加粗）、无序与有序列表（按缩进每层两空格，保留原文标记）、引用（每行 `│ ` 前缀）、围栏代码块（四空格缩进 + 暗淡，内容不做行内解析）、分隔线（固定 40 字符）、表格（`|` 开头且下一行是分隔行才确认，整块缓冲后按列宽对齐，列宽取单元格纯文本的 `unicode-width`，分隔行的冒号决定左/中/右对齐）。流式切分以行为界：行内标记都已闭合的前缀立即渲染，未闭合的尾部留到换行或 `flush`；`Renderer::close` 在状态栏、工具行、错误之前 flush 未完成的行。表格在流式过程里等整块结束才显示；图片、HTML、脚注按原文输出。不做语法高亮、折行对齐、终端宽度感知与超宽表格截断。`RenderEvent::Notice` 是界面文本（命令输出、会话与写盘提示），由 `Renderer` 原样写出，不经过 markdown。
 - **历史即上下文**：历史（`Vec<Msg>`）原样序列化进请求；窗口超限时展示错误，用户可 `/compact` 或 `/clear`。
 - **压缩（`/compact`）**：`context::plan` 从 `Msg::User` 边界切开历史——前缀被摘要替换，最近 `compact.keep_turns` 轮原样保留，因此 `Assistant(tool_calls)` 与随后的 `Tool` 消息不会被拆开。请求是前缀的副本 + 末尾一条 `compact.prompt`（没有 `[compact].prompt` 时用 `context::DEFAULT_COMPACT_PROMPT`），`build_body` 与 `tools` 与普通回合一致、thinking 片段传 `None`；副本里的工具结果截到 500 字符、assistant 正文截到 2000 字符，仍超出 `context_window - max_output - 1024` 的估算预算就从最旧一轮整轮丢弃。收流复用 `drive_stream(render = false)`：不渲染正文，仍逐块轮询取消。摘要正文原样使用；成功时 `history.splice` 换成一条 `Msg::Summary`，失败/空回复/取消都不改动历史。压缩不是对话回合，不产生状态栏。
 - **回合状态栏**：`Session::turn` 拆成薄包装与 `turn_inner`，包装层在本回合结束时发一条 `RenderEvent::Status`；fatal 与 `Err(Quit)` 路径不发。用量只是 `turn_inner` 的局部变量（每次成功的请求覆盖），不进会话状态；轮次由 `history` 中 `Msg::User` 的条数派生，`/clear` 后自然归零。斜杠命令（含 `/compact`）不产生状态栏。
