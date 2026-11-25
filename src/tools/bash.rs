@@ -59,7 +59,7 @@ impl Tool for BashTool {
         args.get("command")
             .and_then(Value::as_str)
             .map(|s| truncate_chars(s, 200))
-            .unwrap_or_else(|| super::truncate_chars(&args.to_string(), 200))
+            .unwrap_or_else(|| truncate_chars(&args.to_string(), 200))
     }
 
     fn invoke(&self, args: Value, ctx: &ToolContext<'_>) -> ToolResult {
@@ -295,11 +295,25 @@ fn run_bash(command: &str, timeout: Duration, cwd: &Path, cancel: &Cancel) -> Ba
 
 fn make_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
     let mut fds = [0i32; 2];
-    // SAFETY: fds 是合法的两元素数组，pipe2 成功后返回两个新 fd。
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+    // macOS 的 libc 没有 pipe2：用 pipe + fcntl 设 CLOEXEC。建 pipe 与设标志之间
+    // 没有 fork 并发（信号线程不 fork），不依赖 pipe2 的原子性。
+    // SAFETY: fds 是合法的两元素数组，pipe 成功后返回两个新 fd。
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: fd 由 pipe2 创建，交给 File 管理。
+    for fd in fds {
+        // SAFETY: fd 由 pipe 返回，合法。
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            let e = std::io::Error::last_os_error();
+            // SAFETY: close 只在 pipe 成功后调用；失败路径关掉另一端。
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(e);
+        }
+    }
+    // SAFETY: fd 由 pipe 创建，交给 File 管理。
     unsafe {
         Ok((
             std::fs::File::from_raw_fd(fds[0]),

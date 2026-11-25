@@ -33,7 +33,7 @@ impl Ui for ScriptedUi {
         self.rendered.push(match ev {
             RenderEvent::ReasoningDelta(s) => RenderEvent::ReasoningDelta(s.clone()),
             RenderEvent::TextDelta(s) => RenderEvent::TextDelta(s.clone()),
-            RenderEvent::LineBreak => RenderEvent::LineBreak,
+            RenderEvent::Status(status) => RenderEvent::Status(status.clone()),
             RenderEvent::ToolCall { name, summary } => RenderEvent::ToolCall {
                 name: name.clone(),
                 summary: summary.clone(),
@@ -47,6 +47,9 @@ impl Ui for ScriptedUi {
                 display: display.clone(),
                 status: *status,
             },
+            RenderEvent::UserInput(s) => RenderEvent::UserInput(s.clone()),
+            RenderEvent::Summary(s) => RenderEvent::Summary(s.clone()),
+            RenderEvent::Notice(s) => RenderEvent::Notice(s.clone()),
             RenderEvent::Error(s) => RenderEvent::Error(s.clone()),
         });
     }

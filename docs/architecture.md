@@ -2,6 +2,9 @@
 
 本文描述 rho 当前的实现结构：单 crate、单二进制、模块边界少而清晰，阻塞 I/O + 线程。
 
+供应商协议与 OpenAI 标准的差异、各 `compat` 开关的含义和上游文档地址见
+[providers.md](providers.md)。
+
 ## 一、总体结构
 
 ```
@@ -36,14 +39,29 @@ src/
     mod.rs       结构定义、配置来源解析（--config > 默认路径 > 内置）、--init 写出内置配置、内置默认配置（include_str! + 解析）
     validate.rs  悬空引用 / 前缀对应 / 取值校验，一次收集全部语义错误并报告配置路径
     expand.rs    header 值 ${VAR} 展开；明文密钥告警
-  message.rs     与协议解耦的消息模型 Msg / AssistantMsg / ToolCall（chat 与 provider 共用）
+  message.rs     与协议解耦的消息模型 Msg / AssistantMsg / ToolCall / ToolStatus
+                 （chat 与 provider 共用；serde 表示即会话文件格式）
+  store.rs       会话文件：默认路径、全量快照的原子写（临时文件 + rename）、
+                 读取失败的分工（不存在 / 损坏）与损坏文件备份
   commands.rs    斜杠命令元数据、解析、执行与补全候选；
                  执行只修改 Session 并返回 CommandEffect，输出由 repl 交给 Ui
+  context.rs     上下文压缩的纯函数：切点规划（保留最近 N 轮）、
+                 压缩请求的预算裁剪、token 粗估、内置摘要指令常量
+  text.rs        文本工具函数：按 Unicode 字符截断（无内部依赖，供 tools / context / chat 使用）
+  markdown.rs    正文 markdown 的流式渲染：行首块识别（标题/列表/引用/围栏代码块/
+                 分隔线）、行内标记经 pulldown-cmark 映射为 ANSI、未完成行的
+                 安全前缀判定；只返回待写文本
   completion.rs  补全协议：CompletionProvider trait、Candidate / Completion；
                  不依赖终端、命令或 Session
-  chat.rs        会话历史（Vec<Msg>，对外只读）、通用工具循环与批次编排；
-                 StreamLauncher 注入边界（生产 worker 线程，测试可替换）；
-                 工具注册表由 Session 持有
+  chat/
+    mod.rs       会话状态（历史、选择、适配器、工具注册表；字段不对外暴露，
+                 launcher / tools / store 是测试注入边界）、/compact 流程、
+                 会话文件的落盘与重放、供应商/模型/思考档位切换
+                 （规则是 config::switch_*_selection 纯函数）
+    turn.rs      一轮回合：流接收、逐块取消判定、回合终态；worker 契约
+                 （必经 Final/Error 收尾）与放弃路径（abandon）在这里
+    batch.rs     一批 tool_calls 的执行：限额/取消/终端失败前置检查、
+                 单调用结果提交与占位补齐；历史配对不变式在这里维护
   provider/
     mod.rs       ProviderAdapter trait（Send+Sync，Arc 共享）、FinishReason / ChunkOutcome、
                  按 Provider 构造、流式请求工作线程（取消/超时/字节上限、首字节看门狗）
@@ -54,8 +72,10 @@ src/
     dns.rs       DoH 解析器：配置的端点优先，按顺序查 A/AAAA；端点全部失败
                  才回退系统解析器，结果按应答 TTL 缓存
                  （Android/Termux 等系统解析器不可用的环境靠它解析域名）
-    openai.rs    openai_chat：/chat/completions、messages、max_tokens、reasoning_content
-                 （echo_reasoning 构造时注入）、`[DONE]` 结束标记
+    openai.rs    openai_chat：/chat/completions、messages、reasoning_content
+                 （echo_reasoning 构造时注入）、`[DONE]` 结束标记、
+                 输出上限字段按 legacy_max_tokens 选 max_tokens / max_completion_tokens、
+                 usage 解析（含 stream_options.include_usage 与缓存命中字段）
     openai_responses.rs
                  openai_responses：/responses、input items、max_output_tokens、
                  function_call / function_call_output、reasoning summary 与最终 response 事件
@@ -66,20 +86,23 @@ src/
     read.rs      全文文本校验、行偏移、行号、50k 字符与 2000 行上限
     write.rs     仅新建、自动建父目录、拒绝 NUL、直接写入
     edit.rs      顺序 edits、精确匹配、replace_all、换行归一化、失败相似行提示
-  render.rs      有状态渲染器 Renderer + RenderEvent：思考块暗淡色、正文原样、
-                 提示符/输入/工具调用着色、带左边栏的工具结果
-                 （成功绿、失败红、打断黄）；返回待写文本，不直接写终端
-                 （颜色固定使用 ANSI 转义，暗色终端下仍可用）
-  repl.rs        REPL 循环、Ctrl-C 语义；斜杠命令委托给 commands，输出经 Ui
+  render.rs      有状态渲染器 Renderer + RenderEvent：思考块暗淡色 + `markdown`
+                 渲染、正文经 `markdown` 渲染、界面文本原样输出、
+                 提示符/输入/工具调用着色、整块着色的工具结果
+                 （成功绿、失败红、打断黄）、回合状态栏单行；返回待写文本，
+                 不直接写终端（颜色固定使用 ANSI 转义，暗色终端下仍可用）
+  repl.rs        REPL 循环、Ctrl-C 语义；`/` 紧贴行首的输入才当命令，
+                 其余（含行首留空白的行）作为普通输入交给 agent loop
   term.rs        终端信号处理（SIGINT、进程组信号）
   ui/
-    mod.rs       Ui trait + 生产实现 TermUi（rustyline）；负责终端输出
+    mod.rs       Ui trait 与 ReadOutcome；Ui 不承载退出语义
+    term.rs      生产实现 TermUi（rustyline）：编辑器组装、渲染输出、屏幕行回收
     helper.rs    rustyline helper：Ctrl-C 灰提示 + 补全候选适配
     hint.rs      Ctrl-C 双按灰提示：提示状态、期限线程与到期擦除
     scripted.rs  测试实现 ScriptedUi（预排输入、收集渲染事件）
 ```
 
-依赖方向为 `repl → commands/chat/ui`；`commands → chat/completion`，`chat → provider → sse/message`，`chat → tools → term`，`ui → completion/render → tools`。`completion` 只定义补全协议，`ui` 只把候选适配到 rustyline；`commands` 持有命令与候选语义，`repl` 负责按调用注入当前快照。`Msg`/`AssistantMsg`/`ToolCall` 放在 `message.rs`，chat 与 provider 都只依赖这个共享模型，provider 不再反向依赖 chat。`config` 被各层读取，处于依赖关系底层。`render` 提供有状态渲染器（`Renderer`）与 `RenderEvent`：`chat` 只产生 `RenderEvent`，`ui` 持有 `Renderer` 把事件序列化为待写文本，按标准输出/标准错误分流写入终端。
+依赖方向为 `repl → commands/chat/ui`；`commands → chat/completion`，`chat → provider → sse/message`，`chat → tools → term`，`chat → store → message`，`ui → completion/render → text`，`context → text`。`render` 是 `markdown` 的唯一调用方；`markdown` 只依赖 pulldown-cmark 与自身，不读终端宽度、不写终端。`store` 只依赖 `message`：文件格式就是 `Msg` 的 serde 表示，路径由 `main` 计算并注入 `Session`。`completion` 只定义补全协议，`ui` 只把候选适配到 rustyline；`commands` 持有命令与候选语义，`repl` 负责按调用注入当前快照。`Msg`/`AssistantMsg`/`ToolCall` 放在 `message.rs`，chat 与 provider 都只依赖这个共享模型，provider 不再反向依赖 chat。`config` 被各层读取，处于依赖关系底层。`render` 提供有状态渲染器（`Renderer`）与 `RenderEvent`：`chat` 只产生 `RenderEvent`，`ui` 持有 `Renderer` 把事件序列化为待写文本，按标准输出/标准错误分流写入终端。回合结束的 `RenderEvent::Status` 同时承担“确保行首”的职责，因此不再单独发折行事件。
 
 ## 三、关键数据类型
 
@@ -87,9 +110,16 @@ src/
 // message.rs — 内部消息模型（与协议解耦，适配层负责映射）
 enum Msg {
     System(String),
+    Summary(String),                      // /compact 产出的检查点，位于 system 之后
     User(String),
     Assistant(AssistantMsg),   // 载荷见下；流终态与历史共用同一类型
-    Tool { tool_call_id: String, content: String },
+    Tool {
+        tool_call_id: String,
+        name: String,            // 重放用；适配层不读
+        content: String,         // 给模型
+        display: Option<String>, // 当时给用户看的文本；None 表示不展示
+        status: ToolStatus,      // 重放用；适配层不读
+    },
 }
 struct AssistantMsg { text: Option<String>, reasoning: Option<String>, tool_calls: Vec<ToolCall> }
 struct ToolCall { id: String, name: String, arguments: String } // arguments 保持原始 JSON 字符串
@@ -98,7 +128,7 @@ struct ToolCall { id: String, name: String, arguments: String } // arguments 保
 ```rust
 // tools/mod.rs
 struct ToolSpec { name: String, description: String, parameters: Value }
-enum ToolStatus { Success, Failure, Interrupted }
+// ToolStatus 定义在 message.rs（随 Msg::Tool 落盘），tools 重新导出
 struct ToolResult {
     output: String,             // 给模型
     display: Option<String>,    // 给用户；None 表示不展示结果体
@@ -112,7 +142,7 @@ trait Tool: Send + Sync {
 }
 ```
 
-- `ToolRegistry` 按声明顺序保存工具，`Session.tools` 默认注册 `bash` / `read` / `write` / `edit`。provider 的 `build_body` 接收 `&[ToolSpec]`，Chat Completions 与 Responses 只负责映射成各自的 tools 数组，不再引用固定工具名。
+- `ToolRegistry` 按声明顺序保存工具，Session 默认注册 `bash` / `read` / `write` / `edit`。provider 的 `build_body` 接收 `&[ToolSpec]`，Chat Completions 与 Responses 只负责映射成各自的 tools 数组，不再引用固定工具名。
 - 每个工具自己持有 schema、`#[serde(deny_unknown_fields)]` 参数结构、语义校验和执行逻辑；公共层只做注册、JSON object 校验、调用、结果提交和历史配对。
 - `ToolStatus`：`Success` 继续；`Failure`（参数错误、非零退出、超时、文件错误等）继续让模型自纠；`Interrupted` 记录当前结果、剩余调用补占位并停止本轮。取消/超限/终端失败的占位仍由 agent 写入历史。
 
@@ -120,6 +150,7 @@ trait Tool: Send + Sync {
 // provider/mod.rs
 enum StreamEvent {
     Delta { text: Option<String>, reasoning: Option<String> }, // 渲染用增量（正文/思考文本）
+    Usage(TokenUsage),                          // 单次请求的 token 用量（总在 Final 之前，缺失表示上游未提供）
     Final(Box<AssistantMsg>),                   // worker 组装完成的完整 Assistant 消息
     Error(String),                              // HTTP 错误 / 断流 / 非法 JSON / finish_reason=length|content_filter 等截断；异常 EOF 按错误处理
 }
@@ -143,7 +174,7 @@ trait ProviderAdapter: Send + Sync {
     fn parse_chunk(&self, chunk: &Value, acc: &mut TurnAcc) -> ChunkOutcome;
 }
 // 适配器按 Provider 构造（adapter_for(&Provider) -> Result<Arc<dyn ProviderAdapter>, String>）：
-// compat 开关（echo_reasoning）构造时注入；Session 长期持有 Arc，每轮 clone 一份按值传给 worker
+// compat 开关（echo_reasoning / stream_usage / legacy_max_tokens）构造时整份注入；Session 长期持有 Arc，每轮 clone 一份按值传给 worker
 // （thread::spawn + detach 取消语义需 'static，不能借引用）；/provider 切换时重建。
 // Protocol::parse 决定 openai_chat / openai_responses；未知协议返回可展示的 Err。
 ```
@@ -168,7 +199,7 @@ enum ReadOutcome {
 }
 ```
 
-- 退出语义：`read_line` 只返回 `Line`/`Interrupted`/`Eof`；`/exit` 作为普通 `Line` 由 REPL 层解析为退出（斜杠命令由 commands.rs 解析）。空行 Ctrl-C 返回 `Interrupted`；REPL 层按 2 秒双按窗口判定——窗口内第二次才退出，第一次只武装并在提示符行尾显示灰提示，编辑中（`line_empty: false`）按 Ctrl-C 清行并撤销武装，任何提交的行（含空行）都清掉武装。
+- 退出语义：`read_line` 只返回 `Line`/`Interrupted`/`Eof`；`/exit` 作为普通 `Line` 由 REPL 层解析为退出（斜杠命令由 commands.rs 解析）。命令判定用**原始行**：首字符就是 `/` 才进 commands，否则即使 trim 后以 `/` 开头也作为普通输入发送（发送前 `trim` 掉首尾空白），所以 `/home/x` 这类路径加一个前导空格就能交给模型。空行 Ctrl-C 返回 `Interrupted`；REPL 层按 2 秒双按窗口判定——窗口内第二次才退出，第一次只武装并在提示符行尾显示灰提示，编辑中（`line_empty: false`）按 Ctrl-C 清行并撤销武装，任何提交的行（含空行）都清掉武装。
 - **Ctrl-C 的唯一记录生产者是专用信号线程**（活动操作）：终端保持 ISIG，Ctrl-C 产生 SIGINT，经 self-pipe（socketpair）由信号线程在锁内追加记录；记录只由信号线程追加，计数只有一份。
 - **rustyline 输入路径**：rustyline 原始模式会接管 SIGINT，Ctrl-C 由 rustyline 返回 `Interrupted`，REPL 层直接处理（清行/进入双按窗口）。这条路径属于按键输入；信号线程只处理活动操作（流式/工具）的 SIGINT。两套路径在时间上互斥，计数保持唯一；`readline` 返回后到下一次关掉 ISIG 之间有一段 cooked 模式缝隙，落在缝隙里的 Ctrl-C 会被记成当前轮的 cancel，切轮时按旧轮单条记录作废（见五）。
 - **Ui trait 只负责输入和输出**：退出有两条路径——① REPL 层判定（`/exit`、`Eof`、空行 Ctrl-C 双按）发生在回合之间的输入阶段，此时没有进行中的调用，直接退出；② 活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测，按占位规则收尾、完成工具进程清理后以 `ChatResult` 的 `Err(Quit)` 上抛退出。`Quit` 只承载路径 ② 的回合内传播。
@@ -180,11 +211,11 @@ enum ReadOutcome {
 - 补全：`completion::CompletionProvider` 定义 `complete(line, pos) -> Completion`；`commands::completion_provider(&session)` 从当前 provider/model/thinking 生成快照，`repl` 在每次 `read_line` 前传入。模型或供应商切换发生在命令执行后，下一次读取自然拿到新候选，因此 UI 不持久保存 completion 状态。`ui::helper::ReplHelper` 只把 `Candidate` 映射为 rustyline 的 `Pair`，命令名与参数语义留在 `commands`。rustyline 使用 `CompletionType::List`：先补公共前缀，再列出候选。
 - 测试实现 `ScriptedUi`：预排输入队列 + 收集渲染事件，驱动 `repl → agent loop → tools` 全链路。
 
-- `TurnAcc`（worker 线程的每流累加器）：按 `index` 组装多段 `tool_calls`、累积 text/reasoning；流正常结束时组装为完整 Assistant 消息经 `Final` 交付主线程。取消时主线程 drop Receiver，累加器随 worker 结束一起丢弃。
+- `TurnAcc`（worker 线程的每流累加器）：按 `index` 组装多段 `tool_calls`、累积 text/reasoning 与上游 `usage`；流正常结束时组装为完整 Assistant 消息经 `Final` 交付主线程（`usage` 走前置的 `Usage` 事件）。取消时主线程 drop Receiver，累加器随 worker 结束一起丢弃。
 - OpenAI Responses：`openai_responses` 适配器把历史映射为 `input` items（user/assistant 文本、`function_call`、`function_call_output`），系统提示写入顶层 `instructions`；流式事件按 `response.output_text.delta` / reasoning summary / `function_call_arguments.delta` 累积，`response.completed` / `response.incomplete` 作为终态，`response.failed` / `error` 直接报错。
 - Anthropic Messages：尚未实现；`protocol` 指向未知协议时返回可展示的错误。
 
-## 四、Agent 工具循环（chat.rs）
+## 四、Agent 工具循环（chat）
 
 ```
 用户输入 → push User msg
@@ -221,8 +252,13 @@ loop {
 - **提交资格（worker 侧）**：`finish_reason` 为 `stop`/`tool_calls`/空才发 `Final`；`length`/`content_filter` 等截断原因在 worker 内直接发 `Error`，被截断的 tool_calls 丢弃。主线程收到 `Final` 才提交，收到 `Error`（含通道断开）就按错误收尾。
 - **取消在两个粒度检查**：接收循环逐事件检查（含持续有事件时）；工具序列逐个调用前检查。任一处发现取消即按占位规则收尾。终端 I/O 失败（fatal）同样在流收尾与逐个调用前检查：流收尾后发现则不提交 Assistant 直接上抛；批次中途发现则剩余调用补“终端输出失败”占位后上抛；两者均映射 exit 1。
 - **限额逐个前置检查**：每个调用执行前先检查限额；所有模型发起的调用都计数（含参数解析失败/未知工具/工具内部错误），防止错误调用无限循环。
-- **历史即上下文**：历史（`Vec<Msg>`）原样序列化进请求；窗口超限时展示错误并提示 `/clear`。
-- **reasoning 默认留在本地**：`echo_reasoning = true` 时随历史回传，其余情况序列化时丢弃（适配层职责）。
+- **单会话持久化**：`Session` 默认不持有存储（构造会话不接触文件系统），`main` 用 `with_store(path)` 注入 `$XDG_STATE_HOME/rho/session.json`（未设置时为 `$HOME/.local/state/rho/session.json`）。写入点是「历史回到合法边界」：`turn_inner` 的 push `Msg::User` 之后、无 tool_calls 的 Assistant 提交之后、`run_tool_calls` 返回之后（所有占位已补齐），以及 `/compact` 成功与 `/clear` 之后；单个工具结果提交后不写，避免留下未配对的 `Assistant(tool_calls)`。每次写都是全量快照：同目录 `session.json.tmp` + `rename`。写盘失败不打断对话，同一进程内只输出一行暗淡提示。`-c` 加载失败时区分「文件不存在」与「解析失败」：后者把原文件改名为 `session.json.bad` 再开新会话。恢复后 `Session::replay` 在第一个提示符前把历史交给 `Renderer`（`UserInput` / `ReasoningDelta` / `TextDelta` / `ToolCall` / `ToolResult` / `Summary`），`Msg::System` 不重放；文件里的 `Msg::System` 与 `Msg::Summary` 原样保留，会话自包含。
+- **正文与思考块的 markdown 渲染**：`TextDelta` 与 `ReasoningDelta` 各持一个 `markdown::Markdown` 实例，状态互不干扰；思考块实例的基础样式是暗淡色，每次关闭样式后重新应用（SGR 22 会同时关闭 bold 与 dim）。行内加粗/斜体/删除线/行内代码/链接映射为 ANSI；行内 `$...$` 以暗淡斜体输出；块级 `$$...$$`（单行与跨行两种）去掉定界符后整块四空格缩进、逐行暗淡斜体，内容不做行内解析（`\frac`、`^`、`_` 仍是字面量）；块级识别标题（保留 `#` 数量，统一青色加粗）、无序与有序列表（按缩进每层两空格，保留原文标记）、引用（每行 `│ ` 前缀）、围栏代码块（四空格缩进 + 暗淡，内容不做行内解析）、分隔线（固定 40 字符）、表格（`|` 开头且下一行是分隔行才确认，整块缓冲后按列宽对齐，列宽取单元格纯文本的 `unicode-width`，分隔行的冒号决定左/中/右对齐）。流式切分以行为界：行内标记都已闭合的前缀立即渲染，未闭合的尾部留到换行或 `flush`；`Renderer::close` 在状态栏、工具行、错误之前 flush 未完成的行。表格在流式过程里等整块结束才显示；图片、HTML、脚注按原文输出。不做语法高亮、折行对齐、终端宽度感知与超宽表格截断。`RenderEvent::Notice` 是界面文本（命令输出、会话与写盘提示），由 `Renderer` 原样写出，不经过 markdown。
+- **历史即上下文**：历史（`Vec<Msg>`）原样序列化进请求；窗口超限时展示错误，用户可 `/compact` 或 `/clear`。
+- **压缩（`/compact`）**：`context::plan` 从 `Msg::User` 边界切开历史——前缀被摘要替换，最近 `compact.keep_turns` 轮原样保留，因此 `Assistant(tool_calls)` 与随后的 `Tool` 消息不会被拆开。请求是前缀的副本 + 末尾一条 `compact.prompt`（没有 `[compact].prompt` 时用 `context::DEFAULT_COMPACT_PROMPT`），`build_body` 与 `tools` 与普通回合一致、thinking 片段传 `None`；副本里的工具结果截到 500 字符、assistant 正文截到 2000 字符，仍超出 `context_window - max_output - 1024` 的估算预算就从最旧一轮整轮丢弃。收流复用 `drive_stream(render = false)`：不渲染正文，仍逐块轮询取消。摘要正文原样使用；成功时 `history.splice` 换成一条 `Msg::Summary`，失败/空回复/取消都不改动历史。压缩不是对话回合，不产生状态栏。
+- **回合状态栏**：`Session::turn` 拆成薄包装与 `turn_inner`，包装层在本回合结束时发一条 `RenderEvent::Status`；fatal 与 `Err(Quit)` 路径不发。用量只是 `turn_inner` 的局部变量（每次成功的请求覆盖），不进会话状态；轮次由 `history` 中 `Msg::User` 的条数派生，`/clear` 后自然归零。斜杠命令（含 `/compact`）不产生状态栏。
+- **usage 采集**：Chat Completions 在 `build_body` 里按 `compat.stream_usage` 发 `stream_options.include_usage`；usage 通常出现在 `choices` 为空的末尾 chunk，因此适配器在判空之前读取，缓存命中取 `prompt_tokens_details.cached_tokens` 或 DeepSeek 的 `prompt_cache_hit_tokens`。Responses 从 `response.completed` 的 `usage.input_tokens_details.cached_tokens` 取。worker 在 `Final` 之前发 `Usage`，主线程只在收到 `Final` 时采纳，保证失败或取消的请求不会污染状态栏。
+- **reasoning 随历史回传由 `compat.echo_reasoning` 决定**：打开时序列化进 assistant 消息，关闭时丢弃（适配层职责）；`CompatConfig` 默认与 OpenAI 标准一致（不回传、发 `max_completion_tokens`、带流式用量），内置 DeepSeek 配置显式打开 `echo_reasoning` 与 `legacy_max_tokens`。
 - **两条退出路径**：REPL 层将 `/exit` 命令、空行 Ctrl-C 双按、`Eof`（Ctrl-D）映射为退出——判定发生在输入阶段（回合之间），直接退出；活动操作中信号路径的 quit（当前轮第二次 Ctrl-C）由 agent loop/工具等待循环直接检测，先完成剩余调用占位补齐与工具进程清理再退出。
 
 ## 五、线程与取消（term.rs / repl.rs）
@@ -258,11 +294,12 @@ exit 0：/exit、空闲态 Ctrl-C 双按、Ctrl-D（均正常退出）
 | 层 | 方式 |
 |---|---|
 | `sse.rs` / `config` / `tools` 参数校验与截断 / `expand` | 纯单元测试，录制夹具 |
-| `render` 格式 / `ui::prompt_rows`（回收时上移的行数）/ `ui::should_erase_hint` / `repl::within_window`（双按窗口） | 纯单元测试，无 TTY |
+| `render` 格式（含状态栏字段省略规则、用量压缩单位）/ `ui::prompt_rows`（回收时上移的行数）/ `ui::should_erase_hint` / `repl::within_window`（双按窗口） | 纯单元测试，无 TTY |
 | `commands` 补全候选与命令文案 / `ui::helper` 的 Pair 适配 | 纯单元测试，无 TTY；`tests/repl_flow.rs` 覆盖模型切换后的候选刷新 |
 | `provider::openai` / `provider::openai_responses` 解析 | 单元测试：构造 JSON chunk/事件 → `ChunkOutcome` / `TurnAcc` |
 | `provider::dns` 报文与回退 | 单元 + 本地 mock：假 DoH 服务（std TcpListener 手写 HTTP），覆盖 A/AAAA、压缩指针、NXDOMAIN、端点失败转移、TTL 缓存；报文编解码与 `config::parse_dns_endpoint` 为纯单元测试 |
-| agent loop + tools | 集成：`Session.launcher` 与 `Session.tools` 注入边界 + `ScriptedUi`，无网络驱动分支（取消/退出各粒度、占位补齐、非法参数/未知工具、配对不变式；时序用 channel 握手控制）；`BashTool::invoke` 与 `read` / `write` / `edit` 单元测试覆盖参数、截断、CRLF、相似行和文件边界 |
+| 会话持久化 | `store` 纯单元（各消息变体往返、原子写无残留临时文件、损坏文件备份）；agent loop 集成（`with_store` 落盘内容与历史一致、恢复后下一请求带旧历史、`/clear` 快照）；PTY 断言 `-c` 重放的用户输入行、暗淡思考、着色工具结果与摘要标记 |
+| agent loop + tools | 集成：`Session::with_launcher` 与 `Session::with_tools` 注入边界 + `ScriptedUi`，无网络驱动分支（取消/退出各粒度、占位补齐、非法参数/未知工具、配对不变式、状态栏的轮次与用量来源；时序用 channel 握手控制）；`BashTool::invoke` 与 `read` / `write` / `edit` 单元测试覆盖参数、截断、CRLF、相似行和文件边界 |
 | provider + HTTP 层 | 集成：本地 mock SSE 服务（std TcpListener 手写），测协议映射与流读取 |
 | 端到端工具循环 | 集成：mock SSE 服务驱动多轮真实 HTTP 请求，验证占位 Tool 消息的配对/顺序/第二次请求序列化（含 echo_reasoning） |
 | 取消/退出 | 集成：`ScriptedUi` 注入 `Line("/exit")`、`Eof` 验证退出路径；注入 `Interrupted{line_empty}` 序列验证 2 秒双按窗口、编辑中撤销、提交行清除武装（并断言 `set_ctrl_c_hint` 序列）；直接注入信号记录（第 1 次）验证流式取消路径——quit 路径（第 2 次）的计数判定由 `term.rs` 单元测试覆盖，端到端行为由 PTY 测试覆盖 |

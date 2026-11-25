@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::{Model, Protocol, Provider};
-use crate::message::{AssistantMsg, Msg, ToolCall};
+use crate::message::{AssistantMsg, Msg, TokenUsage, ToolCall};
 use crate::sse::SseParser;
 use crate::tools::ToolSpec;
 use serde_json::Value;
@@ -37,6 +37,8 @@ pub enum StreamEvent {
         text: Option<String>,
         reasoning: Option<String>,
     },
+    /// 上游返回的单次请求 token 用量（在 Final 之前发送）
+    Usage(TokenUsage),
     /// worker 组装完成的完整 Assistant 消息；收到它才提交
     Final(Box<AssistantMsg>),
     /// HTTP 错误 / 断流 / 非法 JSON / finish_reason=length|content_filter 等截断
@@ -103,6 +105,8 @@ pub struct TurnAcc {
     pub tool_calls: std::collections::BTreeMap<usize, PartialToolCall>,
     /// 最后一个 chunk 的 finish_reason；结束时据此判断提交资格
     pub finish_reason: Option<FinishReason>,
+    /// 上游返回的 token 用量；缺失表示供应商未提供
+    pub usage: Option<TokenUsage>,
 }
 
 impl TurnAcc {
@@ -150,9 +154,7 @@ pub trait ProviderAdapter: Send + Sync {
 /// protocol 不认识则报"不支持"（可展示错误，非 panic）。
 pub fn adapter_for(provider: &Provider) -> Result<Arc<dyn ProviderAdapter>, String> {
     match Protocol::parse(&provider.protocol) {
-        Some(Protocol::OpenAiChat) => Ok(Arc::new(OpenAiChatAdapter::new(
-            provider.compat.echo_reasoning,
-        ))),
+        Some(Protocol::OpenAiChat) => Ok(Arc::new(OpenAiChatAdapter::new(provider.compat.clone()))),
         Some(Protocol::OpenAiResponses) => Ok(Arc::new(OpenAiResponsesAdapter::new())),
         None => Err(format!(
             "不支持的协议族：{}（支持 openai_chat、openai_responses）",
@@ -425,7 +427,16 @@ pub fn stream_request(
             return;
         }
     }
-    send(&tx, StreamEvent::Final(Box::new(acc.into_msg())));
+    // usage 在 Final 之前交付：主线程只有收到 Final 才会提交历史，
+    // 避免本轮最终失败时把半途的用量写进会话统计。
+    let usage = acc.usage;
+    let msg = acc.into_msg();
+    if let Some(usage) = usage {
+        if !send(&tx, StreamEvent::Usage(usage)) {
+            return;
+        }
+    }
+    send(&tx, StreamEvent::Final(Box::new(msg)));
 }
 
 #[cfg(test)]

@@ -101,11 +101,58 @@ fn slash_commands_then_exit() {
     assert!(ui
         .rendered
         .iter()
-        .any(|e| matches!(e, RenderEvent::TextDelta(t) if t.contains("可用模型"))));
+        .any(|e| matches!(e, RenderEvent::Notice(t) if t.contains("可用模型"))));
     assert!(ui
         .rendered
         .iter()
         .any(|e| matches!(e, RenderEvent::Error(t) if t.contains("未知命令"))));
+}
+
+#[test]
+fn compact_without_enough_history_reports_error() {
+    let mut ui = ScriptedUi::new(vec![
+        ReadOutcome::Line("/compact".into()),
+        ReadOutcome::Line("/compact extra".into()),
+        ReadOutcome::Line("/exit".into()),
+    ]);
+    let cancel = Cancel::new();
+    repl::run(&mut ui, session(), &cancel).unwrap();
+    assert!(ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, RenderEvent::Error(t) if t.contains("历史不足以压缩"))));
+    assert!(ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, RenderEvent::Error(t) if t.contains("用法：/compact"))));
+    // 命令不产生回合状态栏。
+    assert!(!ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, RenderEvent::Status(_))));
+}
+
+#[test]
+fn leading_space_sends_the_line_as_input() {
+    // 命令的 `/` 必须紧贴行首：前导空白让本行按普通输入进一个回合。
+    let mut ui = ScriptedUi::new(vec![
+        ReadOutcome::Line(" /help".into()),
+        ReadOutcome::Line("  /exit".into()),
+        ReadOutcome::Line("/exit".into()),
+    ]);
+    let cancel = Cancel::new();
+    repl::run(&mut ui, session(), &cancel).unwrap();
+    // 两行都没执行命令：既没有 help 正文，也没有提前退出（否则第二条读不到）。
+    assert!(!ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, RenderEvent::Notice(t) if t.contains("命令："))));
+    let turns = ui
+        .rendered
+        .iter()
+        .filter(|e| matches!(e, RenderEvent::Status(_)))
+        .count();
+    assert_eq!(turns, 2);
 }
 
 #[test]
@@ -121,16 +168,24 @@ fn help_and_model_list_follow_current_provider() {
         .rendered
         .iter()
         .filter_map(|e| match e {
-            RenderEvent::TextDelta(t) => Some(t.as_str()),
+            RenderEvent::TextDelta(t) | RenderEvent::Notice(t) => Some(t.as_str()),
             _ => None,
         })
         .collect();
     // mock/m 声明了思考档位，help 应包含 /thinking。
     assert!(text.contains("/thinking"));
+    // 用量只在回合结束的状态栏展示，不是命令。
+    assert!(!text.contains("/usage"));
+    assert!(text.contains("/compact"));
     // /model 只列当前 provider 的模型。
     assert!(text.contains("mock/m"));
     assert!(text.contains("mock/n"));
     assert!(!text.contains("other/m2"));
+    // 斜杠命令不触发状态栏，只有对话回合才有。
+    assert!(!ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, RenderEvent::Status(_))));
 }
 
 #[test]
@@ -145,7 +200,7 @@ fn help_hides_thinking_for_model_without_table() {
         .rendered
         .iter()
         .filter_map(|e| match e {
-            RenderEvent::TextDelta(t) => Some(t.as_str()),
+            RenderEvent::TextDelta(t) | RenderEvent::Notice(t) => Some(t.as_str()),
             _ => None,
         })
         .collect();
@@ -158,12 +213,12 @@ fn provider_switch_same_provider_preserves_model_and_thinking() {
     s.switch_model("mock/n").unwrap();
     s.switch_thinking("low").unwrap();
     s.switch_provider("mock").unwrap();
-    assert_eq!(s.selection.model_id, "mock/n");
-    assert_eq!(s.selection.thinking.as_deref(), Some("low"));
+    assert_eq!(s.selection().model_id, "mock/n");
+    assert_eq!(s.selection().thinking.as_deref(), Some("low"));
 
     s.switch_provider("other").unwrap();
-    assert_eq!(s.selection.model_id, "other/m2");
-    assert_eq!(s.selection.thinking, None);
+    assert_eq!(s.selection().model_id, "other/m2");
+    assert_eq!(s.selection().thinking, None);
 }
 
 #[test]
@@ -210,8 +265,8 @@ context_window = 1000
 max_output = 100
 "#,
     );
-    assert_eq!(s.selection.provider_id, "mock");
-    assert_eq!(s.selection.model_id, "mock/m");
+    assert_eq!(s.selection().provider_id, "mock");
+    assert_eq!(s.selection().model_id, "mock/m");
     s.switch_provider("empty").unwrap_err();
 }
 
@@ -239,8 +294,8 @@ context_window = 1000
 max_output = 100
 "#,
     );
-    assert_eq!(s.selection.model_id, "mock/m");
-    assert_eq!(s.selection.provider_id, "mock");
+    assert_eq!(s.selection().model_id, "mock/m");
+    assert_eq!(s.selection().provider_id, "mock");
 }
 
 #[test]
@@ -276,7 +331,7 @@ max_output = 100
         .rendered
         .iter()
         .filter_map(|e| match e {
-            RenderEvent::TextDelta(t) => Some(t.as_str()),
+            RenderEvent::TextDelta(t) | RenderEvent::Notice(t) => Some(t.as_str()),
             _ => None,
         })
         .collect();

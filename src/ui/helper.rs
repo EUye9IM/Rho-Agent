@@ -1,9 +1,9 @@
 //! rustyline helper：把 Ctrl-C 灰提示和补全提供者接到编辑器上。
 //! 命令语义与候选生成在 `commands`，这里只负责 rustyline 类型适配。
 
+use super::hint::{HintArm, CTRL_C_HINT};
 use crate::completion::CompletionProvider;
 use crate::render;
-use crate::ui::hint::{HintArm, CTRL_C_HINT};
 use std::borrow::Cow;
 use std::sync::Arc;
 

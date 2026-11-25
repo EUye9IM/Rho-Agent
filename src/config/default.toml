@@ -11,6 +11,46 @@ system_prompt = """
 不要执行与用户请求无关或具有破坏性的命令。
 """
 
+[compact]
+# 压缩时原样保留的最近轮数。
+keep_turns = 2
+# 压缩指令：作为压缩请求的最后一条 user 消息。改这段可调整检查点的结构、语言与详略。
+prompt = """
+你现在作为这个 AI 编程助手的压缩引擎。将上面的对话浓缩成一个结构化检查点，使另一个模型能够在不丢失关键上下文的情况下继续工作。
+
+严格输出下面的 Markdown 结构：保留每个部分，并按顺序排列。使用简洁的项目符号，而不是散文段落。空部分写"(none)"——绝不要删除任何部分。
+
+## 主要请求与意图
+- [用户的原始目标和不断演变的目标；在确切措辞很重要时逐字引用]
+
+## 关键技术概念
+- [涉及的技术、框架、模式和约定]
+
+## 文件与代码
+- [确切路径：为什么重要，关键改动或代码片段]
+
+## 错误与修复
+- [错误：如何解决的，以及相关的用户反馈]
+
+## 待办任务
+- [已明确请求但尚未完成的工作]
+
+## 当前工作
+- [在此检查点时，精确说明正在进行的工作]
+
+## 下一步
+- [与最近请求直接一致的单一下一步行动，或"(none)"]
+
+## 关键上下文
+- [决策及其理由、约束、用户偏好、未决问题、继续所需的数据]
+
+规则：
+- 用简洁的中文工程性语言书写。保留确切的文件路径、命令、错误字符串、标识符、数值、函数签名和语法片段。
+- 忠实记录用户反馈和明确指令，尤其是纠正意见。
+- 不要提及本次摘要请求，也不要提及上下文已被压缩。
+- 只输出检查点文本：不要调用任何工具或采取任何其他操作。
+- 如果上面已经包含一个先前的检查点（上一轮的压缩摘要，以系统消息给出），不要逐字照搬：保留仍然成立的事实，丢弃过时信息，把较新的信息合并进同一结构下的单一汇总摘要。"""
+
 [providers.deepseek]
 protocol = "openai_chat"
 base_url = "https://api.deepseek.com"
@@ -19,7 +59,11 @@ base_url = "https://api.deepseek.com"
 headers = { Authorization = "Bearer ${DEEPSEEK_API_KEY}" }
 
 [providers.deepseek.compat]
-echo_reasoning = false
+# 非标准行为：DeepSeek 只认 max_tokens，且带 tools 的请求要回传 reasoning_content。
+# 换到 OpenAI 时把这两项删除或改回 false。
+legacy_max_tokens = true
+echo_reasoning = true
+stream_usage = true
 
 [models."deepseek/deepseek-flash"]
 context_window = 1000000

@@ -12,6 +12,7 @@ enum Command {
     Model,
     Provider,
     Thinking,
+    Compact,
     Clear,
     Exit,
 }
@@ -43,6 +44,12 @@ const COMMANDS: &[CommandSpec] = &[
         description: "切换或列出思考档位",
     },
     CommandSpec {
+        command: Command::Compact,
+        name: "/compact",
+        usage: "/compact",
+        description: "把较早的对话压缩成摘要",
+    },
+    CommandSpec {
         command: Command::Clear,
         name: "/clear",
         usage: "/clear",
@@ -67,6 +74,10 @@ const COMMANDS: &[CommandSpec] = &[
 pub enum CommandEffect {
     /// 继续 REPL，并展示给定文本。
     Continue(String),
+    /// 压缩历史：需要发起流式请求，由 REPL 交给 `Session::compact`。
+    Compact,
+    /// 清空历史：由 REPL 交给 `Session::clear`（需要 Ui 报告写盘失败）。
+    Clear,
     /// 正常退出。
     Exit,
 }
@@ -88,10 +99,13 @@ pub fn execute(session: &mut Session, line: &str) -> Result<CommandEffect, Strin
         Command::Model => model(session, &arg),
         Command::Provider => provider(session, &arg),
         Command::Thinking => thinking(session, &arg),
-        Command::Clear => {
-            session.clear();
-            Ok(CommandEffect::Continue("已清空对话历史".into()))
+        Command::Compact => {
+            if !arg.is_empty() {
+                return Err("用法：/compact".into());
+            }
+            Ok(CommandEffect::Compact)
         }
+        Command::Clear => Ok(CommandEffect::Clear),
         Command::Exit => Ok(CommandEffect::Exit),
     }
 }
@@ -99,7 +113,7 @@ pub fn execute(session: &mut Session, line: &str) -> Result<CommandEffect, Strin
 fn help_text(session: &Session) -> String {
     let mut lines = vec!["命令：".to_string()];
     for spec in COMMANDS {
-        if spec.command == Command::Thinking && session.selection.model.thinking.is_empty() {
+        if spec.command == Command::Thinking && session.selection().model.thinking.is_empty() {
             continue;
         }
         lines.push(format!("  {:<16} {}", spec.usage, spec.description));
@@ -109,17 +123,14 @@ fn help_text(session: &Session) -> String {
 
 fn model(session: &mut Session, arg: &str) -> Result<CommandEffect, String> {
     if arg.is_empty() {
-        let provider_id = &session.selection.provider_id;
+        let selection = session.selection();
+        let provider_id = &selection.provider_id;
         let mut lines = vec![format!("供应商 {provider_id} 的可用模型：")];
-        for (id, _) in config::models_in_order(&session.cfg) {
+        for (id, _) in config::models_in_order(session.cfg()) {
             if config::model_provider_prefix(id) != Some(provider_id.as_str()) {
                 continue;
             }
-            let mark = if id == &session.selection.model_id {
-                "*"
-            } else {
-                " "
-            };
+            let mark = if id == &selection.model_id { "*" } else { " " };
             lines.push(format!("  {mark} {id}"));
         }
         return Ok(CommandEffect::Continue(lines.join("\n")));
@@ -128,20 +139,20 @@ fn model(session: &mut Session, arg: &str) -> Result<CommandEffect, String> {
     session.switch_model(arg)?;
     Ok(CommandEffect::Continue(format!(
         "已切换到模型 {}",
-        session.selection.model_id
+        session.selection().model_id
     )))
 }
 
 fn provider(session: &mut Session, arg: &str) -> Result<CommandEffect, String> {
     if arg.is_empty() {
         let mut lines = vec!["可用供应商：".to_string()];
-        for (id, _) in config::providers_in_order(&session.cfg) {
-            let mark = if id == &session.selection.provider_id {
+        for (id, _) in config::providers_in_order(session.cfg()) {
+            let mark = if id == &session.selection().provider_id {
                 "*"
             } else {
                 " "
             };
-            let status = match config::provider_availability(&session.cfg, id) {
+            let status = match config::provider_availability(session.cfg(), id) {
                 Ok(()) => String::new(),
                 Err(e) => format!("（不可用：{e}）"),
             };
@@ -153,12 +164,13 @@ fn provider(session: &mut Session, arg: &str) -> Result<CommandEffect, String> {
     session.switch_provider(arg)?;
     Ok(CommandEffect::Continue(format!(
         "已切换到供应商 {}，模型 {}",
-        session.selection.provider_id, session.selection.model_id
+        session.selection().provider_id,
+        session.selection().model_id
     )))
 }
 
 fn thinking(session: &mut Session, arg: &str) -> Result<CommandEffect, String> {
-    let levels: Vec<String> = session.selection.model.thinking.keys().cloned().collect();
+    let levels: Vec<String> = session.selection().model.thinking.keys().cloned().collect();
     if arg.is_empty() {
         if levels.is_empty() {
             return Ok(CommandEffect::Continue("当前模型未声明思考档位".into()));
@@ -166,7 +178,7 @@ fn thinking(session: &mut Session, arg: &str) -> Result<CommandEffect, String> {
 
         let mut lines = vec!["可用思考档位：".to_string()];
         for level in &levels {
-            let mark = if session.selection.thinking.as_deref() == Some(level.as_str()) {
+            let mark = if session.selection().thinking.as_deref() == Some(level.as_str()) {
                 "*"
             } else {
                 " "
@@ -194,23 +206,24 @@ struct CompletionData {
 
 impl CompletionData {
     fn from_session(session: &Session) -> Self {
-        let provider_id = session.selection.provider_id.clone();
-        let providers = config::providers_in_order(&session.cfg)
+        let selection = session.selection();
+        let provider_id = selection.provider_id.clone();
+        let providers = config::providers_in_order(session.cfg())
             .map(|(id, _)| id.clone())
             .collect();
-        let models = config::models_in_order(&session.cfg)
+        let models = config::models_in_order(session.cfg())
             .filter(|(id, _)| config::model_provider_prefix(id) == Some(provider_id.as_str()))
             .map(|(id, _)| id.clone())
             .collect();
-        let thinking = session.selection.model.thinking.keys().cloned().collect();
+        let thinking = selection.model.thinking.keys().cloned().collect();
 
         Self {
             providers,
             models,
             thinking,
             current_provider: provider_id,
-            current_model: session.selection.model_id.clone(),
-            current_thinking: session.selection.thinking.clone(),
+            current_model: selection.model_id.clone(),
+            current_thinking: selection.thinking.clone(),
         }
     }
 }
@@ -354,6 +367,7 @@ mod tests {
         let all = no_thinking.complete("/", 1);
         let commands = replacements(&all);
         assert!(commands.contains(&"/help "));
+        assert!(!commands.contains(&"/usage "));
         assert!(!commands.contains(&"/thinking "));
     }
 

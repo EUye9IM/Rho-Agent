@@ -89,13 +89,14 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 
 - `render.rs` 只提供纯格式化函数，不直接写终端。
 - `ui` 模块（`ui/mod.rs`）负责终端输出；生产实现 `TermUi`，测试用 `ScriptedUi`（`ui/scripted.rs`）。
-- 斜杠命令的元数据、解析、执行集中在 `commands.rs`；`repl` 只负责退出语义与把 `CommandEffect` 交给 Ui。
+- 斜杠命令的元数据、解析、执行集中在 `commands.rs`；`repl` 只负责退出语义与把 `CommandEffect` 交给 Ui。命令判定看原始行首字符：`/` 必须紧贴第 0 列，行首留空白就当普通输入发送。
 - 补全协议在 `completion.rs`（`CompletionProvider`）；`repl` 每次 `read_line` 前用 `commands::completion_provider(&session)` 注入当前快照。`ui/helper.rs` 只做 rustyline 适配，不持有命令知识。
 - 不要在 `render` / `chat` 里直接 `println!`。
 - `provider` 每轮请求在工作线程读取 HTTP 流，经 `mpsc` 回主线程；不要引入 tokio/reqwest。
 - `message::Msg` 是协议无关的内部消息模型；Chat Completions 字段映射留在 `provider/openai.rs`，Responses 映射留在 `provider/openai_responses.rs`。
 - 每个工具在 `src/tools/<tool>.rs` 自己维护 schema、`deny_unknown_fields` 参数结构、语义校验和执行；`src/tools/mod.rs` 只保留 Tool trait、通用结果类型和注册表。各 adapter 只负责把 `ToolSpec` 映射成自己的 wire format，不要复制 schema。
 - `ProviderAdapter::parse_chunk` 返回 `ChunkOutcome`；流结束标记与 `finish_reason` 的提交资格判定留在 provider worker。
+- 上下文压缩的纯函数在 `context.rs`（切点、预算裁剪、token 粗估、内置摘要指令）；`chat::Session::compact` 负责发请求与改写历史。切点只落在 `Msg::User` 之前，前缀换成一条 `Msg::Summary`，压缩请求复用 `build_body` + `StreamLauncher` 并以 `render = false` 收流；失败、空回复、取消都不改动历史。压缩是手动命令，触发点只有用户输入。
 - 工具循环必须保证历史协议合法：所有 `tool_calls` 都要有对应 `Tool` 消息占位。
 - 取消语义、进程组清理的行为以 `docs/architecture.md` 和现有代码为准，不要简化成“杀直接子进程”或“只 drop 连接”。`chat` 只做注册表查找、JSON object 校验、状态控制和历史配对；参数语义与执行归各工具。
 
@@ -106,6 +107,7 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 - 外部配置**完全替换**内置配置，不合并。
 - 严格校验：未知字段、悬空引用、缺失必填项都报错；语义错误一次收集全部，TOML 语法/反序列化错误按首个报告。
 - `${VAR}` 只用于 header 值展开；缺失变量报错；明文密钥要告警。
+- `[compact]` 是压缩参数：`prompt` 省略时用 `context::DEFAULT_COMPACT_PROMPT`（与内置 TOML 保持一致，有测试护栏），`keep_turns` 省略时为 2；两字段都参与严格校验。
 - 退出码：`0` 正常退出，`1` REPL 内部错误，`2` 参数/配置/供应商不可用等用法错误。
 - 不做隐式供应商分支；`protocol` 显式选择 `openai_chat` / `openai_responses`，同协议族新供应商只加配置，新增协议族才改 adapter。
 
@@ -115,7 +117,8 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 
 - 纯单元：`sse.rs`、`config`、`tools` 参数校验/截断/文件边界、`render`、`commands` 补全候选
 - 协议映射：`provider::openai`（Chat Completions）与 `provider::openai_responses`（Responses）
-- agent loop + 工具：`ScriptedUi` + `StreamLauncher` / `Session.tools` 注册表注入
+- agent loop + 工具：`ScriptedUi` + `StreamLauncher` / `Session::with_tools` 注册表注入
+- 上下文压缩：`context` 纯函数（切点、预算裁剪、估算）单测；`Session::compact` 用 `RecordingLauncher` 断言请求体与历史改写
 - HTTP/SSE：`tests/e2e_mock.rs` 的本地 mock 服务
 - REPL：`tests/repl_flow.rs`
 
@@ -130,7 +133,7 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 ## 终端/REPL 注意点
 
 - `rustyline` 每次 `readline` 前会清当前行（`\r\x1b[K`）。如果上一段输出没有换行，最后一行会被擦掉。
-- 正常回合结束后由 `repl.rs` 在 `TurnEnd::Done` 后补 `RenderEvent::LineBreak`；不要删掉，除非你同时换成等价的“确保行首”机制。
+- 每个对话回合结束时 `chat` 发一条 `RenderEvent::Status`；它由 `Renderer` 负责“收尾当前块 + 补换行 + 输出暗淡行 + 换行”，是唯一的“确保行首”机制。新增会结束回合的路径时必须让它经过这一层，否则半截输出会被提示符擦掉。
 - 流式输出中 `TextDelta` 原样写出；不要在每个 delta 上强制加换行。
 
 ## 工具与安全
@@ -143,11 +146,11 @@ completion 只定义补全协议；commands 生成候选，ui 只适配 rustylin
 
 ## 文档规则
 
-- `docs/` 只放当前实现文档（`docs/architecture.md`）；不要新增设计文档、功能清单、流程/工作流文档，除非用户明确要求。
+- `docs/` 只放当前实现文档（`docs/architecture.md`、`docs/providers.md`）；不要新增设计文档、功能清单、流程/工作流文档，除非用户明确要求。`docs/providers.md` 记录供应商协议与 OpenAI 标准的差异、`compat` 开关与上游文档地址。
 - 文档只描述当前代码的实际行为。用正向陈述；不要用“不支持 / 不使用 / 没有 / 不做”来定义功能。必要的错误条件（非 TTY、超限、非法输入等）可以直接写。
 - 不写版本历史、变更记录、里程碑、状态横幅或“已完成 / 待发布”之类的过程信息。
 - 产品愿景和定位写在 `README.md` / `README.zh-CN.md`；两份 README 保持同步，并只链接 `docs/architecture.md`。
-- 行为或配置语义变化时，同步更新 README 和 architecture；不要留下指向已删除文档的引用。
+- 行为或配置语义变化时，同步更新 README、architecture 与（涉及供应商协议时）providers；不要留下指向已删除文档的引用。
 
 ## 提交
 

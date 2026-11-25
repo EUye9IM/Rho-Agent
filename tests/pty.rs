@@ -14,8 +14,10 @@
 //! 人类敲键延迟（~100ms）撞不上该窗口；用例统一在提示符后稳定 50ms 再发输入。
 
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use rho::message::{AssistantMsg, Msg, ToolStatus};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -107,6 +109,49 @@ fn start_mock(respond: impl FnOnce(&mut TcpStream) + Send + 'static) -> MockServ
     MockServer { base_url, stop }
 }
 
+/// 文本响应：每个元素一个 content chunk，末尾补 finish_reason 与 [DONE]。
+fn text_response(chunks: &[&str]) -> impl FnOnce(&mut TcpStream) + Send + 'static {
+    let mut body = String::new();
+    for chunk in chunks {
+        let event = serde_json::json!({
+            "choices": [{ "delta": { "content": chunk } }]
+        });
+        body.push_str(&format!("data: {event}\n\n"));
+    }
+    let done = serde_json::json!({
+        "choices": [{ "delta": {}, "finish_reason": "stop" }]
+    });
+    body.push_str(&format!("data: {done}\n\ndata: [DONE]\n\n"));
+    move |stream: &mut TcpStream| {
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        );
+        let _ = stream.write_all(body.as_bytes());
+        let _ = stream.flush();
+    }
+}
+
+/// 思考 + 正文响应：reasoning_content 与 content 各一个 chunk。
+fn reasoning_response(reasoning: &str, text: &str) -> impl FnOnce(&mut TcpStream) + Send + 'static {
+    let think = serde_json::json!({
+        "choices": [{ "delta": { "reasoning_content": reasoning } }]
+    });
+    let answer = serde_json::json!({
+        "choices": [{ "delta": { "content": text } }]
+    });
+    let done = serde_json::json!({
+        "choices": [{ "delta": {}, "finish_reason": "stop" }]
+    });
+    let body = format!("data: {think}\n\ndata: {answer}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+    move |stream: &mut TcpStream| {
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        );
+        let _ = stream.write_all(body.as_bytes());
+        let _ = stream.flush();
+    }
+}
+
 /// tool_calls 响应（触发 bash 执行）：一条 bash 调用后 finish。
 fn tool_call_response(command: &str, timeout: u64) -> impl FnOnce(&mut TcpStream) + Send {
     let args = serde_json::json!({ "command": command, "timeout": timeout }).to_string();
@@ -194,6 +239,8 @@ max_output = 1000
 /// PTY 里运行的 rho：按键写入、屏幕断言、退出码。
 struct PtyRho {
     child: Box<dyn Child + Send + Sync>,
+    /// 本次运行独占的 XDG_STATE_HOME：会话文件写在这里，不碰真实主目录。
+    state_dir: PathBuf,
     _master: Box<dyn MasterPty + Send>,
     raw: Arc<Mutex<Vec<u8>>>,
     writer: Box<dyn std::io::Write + Send>,
@@ -204,7 +251,19 @@ struct PtyRho {
 
 impl PtyRho {
     /// 起一个挂 mock 配置的 rho（不依赖外部环境变量）。
+    /// 每次运行使用独立的 XDG_STATE_HOME，会话文件不会落到真实主目录。
     fn spawn(config_path: &str) -> Self {
+        let state = std::env::temp_dir().join(format!(
+            "rho-pty-state-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        Self::spawn_in_state(config_path, state, &[])
+    }
+
+    /// 指定状态目录与额外参数启动（`-c` 用例需要预置会话文件）。
+    fn spawn_in_state(config_path: &str, state_dir: PathBuf, extra_args: &[&str]) -> Self {
+        let _ = std::fs::create_dir_all(&state_dir);
         let pty = NativePtySystem::default()
             .openpty(PtySize {
                 rows: ROWS,
@@ -215,6 +274,10 @@ impl PtyRho {
         let mut cmd = CommandBuilder::new(RHO_BIN);
         cmd.arg("--config");
         cmd.arg(config_path);
+        for arg in extra_args {
+            cmd.arg(arg);
+        }
+        cmd.env("XDG_STATE_HOME", &state_dir);
         if std::env::var("RHO_PTY_TRACE").is_ok() {
             cmd.env("RHO_PTY_TRACE", "1");
         }
@@ -254,6 +317,7 @@ impl PtyRho {
         });
         PtyRho {
             child,
+            state_dir,
             _master: pty.master,
             writer,
             screen,
@@ -363,6 +427,7 @@ impl Drop for PtyRho {
         self.killed.store(true, Ordering::SeqCst);
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.state_dir);
     }
 }
 
@@ -525,7 +590,7 @@ fn prompt_input_tool_call_and_success_result_are_colored() {
         rho.raw_tail(3000)
     );
     assert!(rho.raw_contains("\x1b[35m→ bash: echo hi\x1b[0m"));
-    assert!(rho.raw_contains("\x1b[32m  │ [status] completed"));
+    assert!(rho.raw_contains("\x1b[32m[status] completed"));
     // 第二次请求会因 mock 单连接关闭而失败；回到提示符后正常退出。
     rho.expect_screen("rho>", Duration::from_secs(8));
     std::thread::sleep(SETTLE);
@@ -545,6 +610,188 @@ fn bash_timeout_shows_annotation_and_returns_to_prompt() {
     // timeout=2：SIGTERM→2s→SIGKILL，总等待 ≤ ~5s。
     rho.expect_screen("[status] timed_out", Duration::from_secs(8));
     // 超时结果喂回后继续请求（mock 单连接已关：第二次请求失败）——回提示符即收尾。
+    rho.expect_screen("rho>", Duration::from_secs(8));
+    std::thread::sleep(SETTLE);
+    rho.send_line("/exit");
+    assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 会话恢复：`-c` 读取会话文件并重放
+// ---------------------------------------------------------------------------
+
+/// 预置会话文件路径（`XDG_STATE_HOME/rho/session.json`）。
+fn session_file(state_dir: &Path) -> PathBuf {
+    state_dir.join("rho").join("session.json")
+}
+
+#[test]
+fn continue_replays_persisted_history() {
+    let config = write_config("http://127.0.0.1:1");
+    let state = std::env::temp_dir().join(format!(
+        "rho-pty-continue-{}-{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    let path = session_file(&state);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    rho::store::save(
+        &path,
+        &[
+            Msg::User("之前的问题".into()),
+            Msg::Assistant(AssistantMsg {
+                text: Some("之前的回答".into()),
+                reasoning: Some("旧思考".into()),
+                tool_calls: vec![],
+            }),
+            Msg::Tool {
+                tool_call_id: "c1".into(),
+                name: "bash".into(),
+                content: "工具输出".into(),
+                display: Some("工具输出".into()),
+                status: ToolStatus::Success,
+            },
+            Msg::Summary("更早的摘要".into()),
+        ],
+    )
+    .unwrap();
+
+    let mut rho = PtyRho::spawn_in_state(&config, state, &["-c"]);
+
+    // 用户输入行走重放路径（提示符 + 输入），不是 rustyline 的回显。
+    rho.expect_screen("rho> 之前的问题", SCREEN_TIMEOUT);
+    rho.expect_screen("之前的回答", SCREEN_TIMEOUT);
+    rho.expect_screen("旧思考", SCREEN_TIMEOUT);
+    rho.expect_screen("工具输出", SCREEN_TIMEOUT);
+    rho.expect_screen("上下文摘要", SCREEN_TIMEOUT);
+    rho.expect_screen("已恢复 4 条消息（1 轮）", SCREEN_TIMEOUT);
+
+    rho.send_line("/exit");
+    assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
+}
+
+#[test]
+fn continue_without_session_file_starts_fresh() {
+    let config = write_config("http://127.0.0.1:1");
+    let state = std::env::temp_dir().join(format!(
+        "rho-pty-nosession-{}-{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+
+    let mut rho = PtyRho::spawn_in_state(&config, state, &["-c"]);
+
+    rho.expect_screen("没有可恢复的会话", SCREEN_TIMEOUT);
+    rho.expect_screen("rho>", SCREEN_TIMEOUT);
+
+    rho.send_line("/exit");
+    assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
+}
+
+/// markdown 正文：行内样式与列表在真实终端上的表现。
+#[test]
+fn markdown_renders_inline_styles_and_lists() {
+    let server = start_mock(text_response(&[
+        "**加粗** 和 *斜体*\n\n- 项目一\n- 项目二\n",
+    ]));
+    let config = write_config(&server.base_url);
+    let mut rho = PtyRho::spawn(&config);
+
+    rho.expect_screen("rho>", SCREEN_TIMEOUT);
+    std::thread::sleep(SETTLE);
+    rho.send_line("go");
+
+    // 屏幕上是去掉标记后的正文。
+    rho.expect_screen("加粗 和 斜体", SCREEN_TIMEOUT);
+    rho.expect_screen("- 项目一", SCREEN_TIMEOUT);
+    rho.expect_screen("- 项目二", SCREEN_TIMEOUT);
+    // 原始输出里带着样式序列。
+    assert!(
+        rho.raw_contains("\x1b[1m加粗\x1b[22m"),
+        "raw tail:\n{}",
+        rho.raw_tail(3000)
+    );
+    assert!(
+        rho.raw_contains("\x1b[3m斜体\x1b[23m"),
+        "raw tail:\n{}",
+        rho.raw_tail(3000)
+    );
+
+    rho.expect_screen("rho>", Duration::from_secs(8));
+    std::thread::sleep(SETTLE);
+    rho.send_line("/exit");
+    assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
+}
+
+/// 跨 delta 切断的标记：一行分两次到达，渲染结果与整块到达一致。
+#[test]
+fn markdown_survives_split_deltas() {
+    let server = start_mock(text_response(&["**加", "粗**\n- 项", "目\n"]));
+    let config = write_config(&server.base_url);
+    let mut rho = PtyRho::spawn(&config);
+
+    rho.expect_screen("rho>", SCREEN_TIMEOUT);
+    std::thread::sleep(SETTLE);
+    rho.send_line("go");
+
+    rho.expect_screen("加粗", SCREEN_TIMEOUT);
+    rho.expect_screen("- 项目", SCREEN_TIMEOUT);
+    assert!(
+        rho.raw_contains("\x1b[1m加粗\x1b[22m"),
+        "raw tail:\n{}",
+        rho.raw_tail(3000)
+    );
+
+    rho.expect_screen("rho>", Duration::from_secs(8));
+    std::thread::sleep(SETTLE);
+    rho.send_line("/exit");
+    assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
+}
+
+/// 表格：整块对齐后输出，表头与分隔线可见。
+#[test]
+fn markdown_renders_tables() {
+    let server = start_mock(text_response(&[
+        "| 名称 | 大小 |\n|------|-----:|\n| rho | 1.9M |\n",
+    ]));
+    let config = write_config(&server.base_url);
+    let mut rho = PtyRho::spawn(&config);
+
+    rho.expect_screen("rho>", SCREEN_TIMEOUT);
+    std::thread::sleep(SETTLE);
+    rho.send_line("go");
+
+    rho.expect_screen("名称", SCREEN_TIMEOUT);
+    rho.expect_screen("rho", SCREEN_TIMEOUT);
+    rho.expect_screen("1.9M", SCREEN_TIMEOUT);
+    rho.expect_screen("├──", SCREEN_TIMEOUT);
+
+    rho.expect_screen("rho>", Duration::from_secs(8));
+    std::thread::sleep(SETTLE);
+    rho.send_line("/exit");
+    assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
+}
+
+/// 思考块也走 markdown：加粗结束后暗淡色要接回来（SGR 22 会同时关掉 dim）。
+#[test]
+fn reasoning_renders_markdown_and_stays_dim() {
+    let server = start_mock(reasoning_response("**重点**\n", "回答\n"));
+    let config = write_config(&server.base_url);
+    let mut rho = PtyRho::spawn(&config);
+
+    rho.expect_screen("rho>", SCREEN_TIMEOUT);
+    std::thread::sleep(SETTLE);
+    rho.send_line("go");
+
+    rho.expect_screen("重点", SCREEN_TIMEOUT);
+    rho.expect_screen("回答", SCREEN_TIMEOUT);
+    // 加粗关闭后重新开暗淡色。
+    assert!(
+        rho.raw_contains("\x1b[1m重点\x1b[22m\x1b[2m"),
+        "raw tail:\n{}",
+        rho.raw_tail(3000)
+    );
+
     rho.expect_screen("rho>", Duration::from_secs(8));
     std::thread::sleep(SETTLE);
     rho.send_line("/exit");

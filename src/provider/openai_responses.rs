@@ -3,7 +3,7 @@
 use super::common::{default_headers, merge_thinking, model_name};
 use super::{ChunkOutcome, FinishReason, ProviderAdapter, TurnAcc};
 use crate::config::{Model, Provider};
-use crate::message::Msg;
+use crate::message::{Msg, TokenUsage};
 use crate::tools::ToolSpec;
 use serde_json::{json, Value};
 
@@ -39,7 +39,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
 
         for msg in hist {
             match msg {
-                Msg::System(text) => instructions.push(text),
+                Msg::System(text) | Msg::Summary(text) => instructions.push(text),
                 Msg::User(text) => input.push(json!({ "role": "user", "content": text })),
                 Msg::Assistant(a) => {
                     if let Some(text) = &a.text {
@@ -58,6 +58,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                 Msg::Tool {
                     tool_call_id,
                     content,
+                    ..
                 } => input.push(json!({
                     "type": "function_call_output",
                     "call_id": tool_call_id,
@@ -237,6 +238,9 @@ fn record_function_call_item(chunk: &Value, acc: &mut TurnAcc) {
 /// 最终 response 对象可能携带完整 output；只补缺失，避免与增量重复。
 fn finalize_response(chunk: &Value, acc: &mut TurnAcc) {
     let response = chunk.get("response").unwrap_or(chunk);
+    if let Some(usage) = response.get("usage").and_then(parse_usage) {
+        acc.usage = Some(usage);
+    }
     if let Some(output) = response.get("output").and_then(Value::as_array) {
         for (fallback_index, item) in output.iter().enumerate() {
             match item.get("type").and_then(Value::as_str) {
@@ -337,6 +341,27 @@ fn fill_function_call(item: &Value, fallback_index: usize, acc: &mut TurnAcc) {
     }
 }
 
+/// Responses usage：input/output/total，缓存命中在 input_tokens_details 下。
+fn parse_usage(value: &Value) -> Option<TokenUsage> {
+    let input = value.get("input_tokens").and_then(Value::as_u64);
+    let output = value.get("output_tokens").and_then(Value::as_u64);
+    let total = value.get("total_tokens").and_then(Value::as_u64);
+    if input.is_none() && output.is_none() && total.is_none() {
+        return None;
+    }
+    let input = input.unwrap_or(0);
+    let output = output.unwrap_or(0);
+    let cached_input = value
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(Value::as_u64);
+    Some(TokenUsage {
+        input,
+        output,
+        total: total.unwrap_or_else(|| input.saturating_add(output)),
+        cached_input,
+    })
+}
+
 fn output_index(chunk: &Value) -> usize {
     chunk
         .get("output_index")
@@ -402,7 +427,10 @@ mod tests {
             }),
             Msg::Tool {
                 tool_call_id: "call_1".into(),
+                name: "bash".into(),
                 content: "ok".into(),
+                display: Some("ok".into()),
+                status: crate::message::ToolStatus::Success,
             },
         ];
         let thinking = json!({ "reasoning": { "effort": "low" } });
@@ -512,6 +540,34 @@ mod tests {
         assert!(matches!(a.parse_chunk(&done, &mut acc), ChunkOutcome::Done));
         assert_eq!(acc.finish_reason, Some(FinishReason::Stop));
         assert_eq!(acc.into_msg().text.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn parses_usage_from_completed_response() {
+        let a = OpenAiResponsesAdapter::new();
+        let mut acc = TurnAcc::default();
+        let done = json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 120,
+                    "output_tokens": 30,
+                    "total_tokens": 150,
+                    "input_tokens_details": { "cached_tokens": 64 }
+                }
+            }
+        });
+        assert!(matches!(a.parse_chunk(&done, &mut acc), ChunkOutcome::Done));
+        assert_eq!(
+            acc.usage,
+            Some(TokenUsage {
+                input: 120,
+                output: 30,
+                total: 150,
+                cached_input: Some(64),
+            })
+        );
     }
 
     #[test]

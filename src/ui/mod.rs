@@ -1,65 +1,26 @@
-//! 用户交互抽象：Ui trait + 生产实现 TermUi + 测试实现 ScriptedUi。
-//! Ui 不承载退出语义（退出由 REPL 层判定）；灰提示子系统在 `hint` 子模块。
+//! 生产实现：rustyline 后端的 `TermUi`。
+//!
+//! - `stdin 非 TTY 拒绝启动`的检查在 `TermUi::new` 里做
+//! - REPL 输入态 Ctrl-C 由 rustyline 返回 Interrupted（其原始模式清 ISIG，
+//!   信号线程只处理活动操作，不会双重计数）
+//! - 空行 Ctrl-C 的灰色双按提示由 helper 提供，到期由 `rho-hint` 线程擦掉
+//! - 每次 `readline` 收尾都会被 rustyline 的换行钉死一行（输入长时多行）：Ctrl-C 后
+//!   下一次读取前把这些行收回重用，输入过的内容也一并清掉，不另起新行
 
 mod helper;
 mod hint;
 mod scripted;
+mod term;
 
 pub use hint::CTRL_C_WINDOW;
 pub use scripted::ScriptedUi;
+pub use term::{TermUi, TermUiInitError};
 
 use crate::completion::CompletionProvider;
-use crate::render::{self, RenderEvent};
-use std::fmt;
-use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::render::RenderEvent;
+/// 提示符（定义在 `render`，与重放共用同一份文本）。
+pub(crate) use crate::render::PROMPT;
 use std::sync::Arc;
-use unicode_width::UnicodeWidthStr;
-
-use rustyline::error::ReadlineError;
-use rustyline::history::DefaultHistory;
-use rustyline::{
-    Cmd, ConditionalEventHandler, Event, EventContext, EventHandler, KeyEvent, Modifiers,
-    RepeatCount,
-};
-
-use helper::ReplHelper;
-use hint::HintArm;
-
-/// 提示符。宽度按字节数算（纯 ASCII）。
-const PROMPT: &str = "rho> ";
-
-/// 一行内容（提示符 + 输入）占的屏幕行数。
-/// 宽度正好是列数整数倍时，rustyline 的 `calculate_position` 会把位置归一成下一行
-/// （`tty/unix.rs` 里 `col == cols` 分支），`refresh` 再补一个 `\n`（“generate our own
-/// newline on line wrap”），实际比内容高度多一行 —— 所以这里用 `1 + width / cols`，
-/// 不能用向上取整。
-/// 宽字符或制表符正好落在换列边界时，实际需要上移的行数会比这里多一：`unicode-width`
-/// 不算宽字符不拆列的额外行，也不算 tab 展开到制表位的宽度。这里宁可少算（留残影，
-/// 下次按键重绘即消失），也不多算（多上移会擦掉历史输出）。
-fn prompt_rows(width: usize, cols: usize) -> usize {
-    if cols == 0 {
-        return 1;
-    }
-    1 + width / cols
-}
-
-/// 终端列数（取 stdout 窗口尺寸）；拿不到时按 80 列算。
-fn terminal_cols() -> usize {
-    let mut ws = libc::winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: ws 是合法的 winsize 可写缓冲区，fd 是常量 stdout。
-    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
-    {
-        usize::from(ws.ws_col)
-    } else {
-        80
-    }
-}
 
 /// 读取一行输入的结果。
 #[derive(Debug)]
@@ -73,6 +34,8 @@ pub enum ReadOutcome {
     Eof,
 }
 
+/// 用户交互抽象：读一行输入、渲染输出、Ctrl-C 双按提示开关与致命错误上报。
+/// 退出语义由 REPL 层负责，Ui 不承载。
 pub trait Ui {
     /// 读取一行输入。补全提供者按调用注入，生命周期仅限本次读取。
     fn read_line(&mut self, completer: Arc<dyn CompletionProvider>) -> ReadOutcome;
@@ -87,256 +50,5 @@ pub trait Ui {
     /// 默认实现无错误（测试 Ui 不必关心）。
     fn take_fatal(&mut self) -> Option<String> {
         None
-    }
-}
-
-/// TermUi 初始化错误：非 TTY 属用法错误（exit 2），其余属内部错误（exit 1）。
-#[derive(Debug)]
-pub enum TermUiInitError {
-    NotTty(String),
-    Init(String),
-}
-
-impl fmt::Display for TermUiInitError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotTty(msg) | Self::Init(msg) => f.write_str(msg),
-        }
-    }
-}
-
-/// Ctrl-C 按键处理器：记录被中断时输入行是否为空与其显示宽度（用于回收屏幕行），
-/// 再执行默认 Interrupt。
-struct CtrlCHandler {
-    line_empty: Arc<AtomicBool>,
-    line_width: Arc<AtomicUsize>,
-}
-
-impl ConditionalEventHandler for CtrlCHandler {
-    fn handle(
-        &self,
-        _evt: &Event,
-        _n: RepeatCount,
-        _positive: bool,
-        ctx: &EventContext,
-    ) -> Option<Cmd> {
-        let line = ctx.line();
-        self.line_empty.store(line.is_empty(), Ordering::SeqCst);
-        self.line_width.store(line.width(), Ordering::SeqCst);
-        Some(Cmd::Interrupt)
-    }
-}
-
-/// 生产实现：rustyline 后端。
-///
-/// - `stdin 非 TTY 拒绝启动`的检查在 `TermUi::new` 里做
-/// - REPL 输入态 Ctrl-C 由 rustyline 返回 Interrupted（其原始模式清 ISIG，
-///   信号线程只处理活动操作，不会双重计数）
-/// - 空行 Ctrl-C 的灰色双按提示由 helper 提供，到期由 `rho-hint` 线程擦掉
-/// - 每次 `readline` 收尾都会被 rustyline 的换行钉死一行（输入长时多行）：Ctrl-C 后
-///   下一次读取前把这些行收回重用，输入过的内容也一并清掉，不另起新行
-pub struct TermUi {
-    editor: Editor,
-    line_empty: Arc<AtomicBool>,
-    line_width: Arc<AtomicUsize>,
-    hint: Arc<HintArm>,
-    /// 渲染事件到终端文本的有状态格式化器（思考块样式成对开关）。
-    renderer: render::Renderer,
-    fatal: Option<String>,
-    /// 上一次 `readline` 被 Ctrl-C 中断时那一块内容的显示宽度：下一次读取前收回。
-    reclaim_width: Option<usize>,
-}
-
-type Editor = rustyline::Editor<ReplHelper, DefaultHistory>;
-
-impl TermUi {
-    pub fn new() -> Result<Self, TermUiInitError> {
-        if !std::io::stdin().is_terminal() {
-            return Err(TermUiInitError::NotTty(
-                "stdin 不是 TTY，rho 只支持交互式 REPL".into(),
-            ));
-        }
-        let config = rustyline::Config::builder()
-            .completion_type(rustyline::CompletionType::List)
-            .build();
-        let mut editor: Editor = rustyline::Editor::with_config(config)
-            .map_err(|e| TermUiInitError::Init(format!("初始化终端失败：{e}")))?;
-        let line_empty = Arc::new(AtomicBool::new(false));
-        let line_width = Arc::new(AtomicUsize::new(0));
-        let hint = Arc::new(HintArm::new(std::io::stdout().is_terminal()));
-        editor.set_helper(Some(ReplHelper::new(hint.clone())));
-        editor.bind_sequence(
-            KeyEvent::new('\x03', Modifiers::NONE),
-            EventHandler::Conditional(Box::new(CtrlCHandler {
-                line_empty: line_empty.clone(),
-                line_width: line_width.clone(),
-            })),
-        );
-        let thread_hint = hint.clone();
-        std::thread::Builder::new()
-            .name("rho-hint".into())
-            .spawn(move || hint::hint_timer(thread_hint))
-            .map_err(|e| TermUiInitError::Init(format!("启动提示期限线程失败：{e}")))?;
-        Ok(Self {
-            editor,
-            line_empty,
-            line_width,
-            hint,
-            renderer: render::Renderer::new(),
-            fatal: None,
-            reclaim_width: None,
-        })
-    }
-
-    /// rustyline 每次 `readline` 结束都会补一个换行（`Editor::readline_with` 里的
-    /// `term.writeln()`）。被 Ctrl-C 中断的输入不提交，那几行屏幕空间要还给下一次
-    /// 提示符：上移回块首并用 `\x1b[J` 擦到屏幕末尾，下一次 `readline` 就在原地重画。
-    /// 块宽度包含输入内容与（若最后一次布局里有）行尾灰提示的宽度。
-    ///
-    /// 不变式：提示符块永远是最后一段终端输出，所以 `\x1b[J` 不会误删其他输出；
-    /// 块高于屏幕时视口里全是块自己的行，此时 `\x1b[{rows}A` 被终端钳制到顶行，
-    /// 擦掉的也仍然只是块内容。
-    /// stdout 不是 TTY 时不动光标，以免污染重定向输出。
-    /// 前提：中断到真回收之间不能有其他输出（`repl` 在 `Interrupted` 分支不打印）。
-    fn reclaim_prompt_rows(&mut self) {
-        let Some(width) = self.reclaim_width.take() else {
-            return;
-        };
-        if !std::io::stdout().is_terminal() {
-            self.hint.take_layout_hint();
-            return;
-        }
-        let hint_width = if self.hint.take_layout_hint() {
-            hint::CTRL_C_HINT.width()
-        } else {
-            0
-        };
-        let rows = prompt_rows(width + hint_width, terminal_cols());
-        let mut out = std::io::stdout();
-        let seq = format!("\x1b[{rows}A\r\x1b[J");
-        if let Err(e) = out.write_all(seq.as_bytes()).and_then(|()| out.flush()) {
-            self.set_fatal(format!("渲染输出失败：{e}"));
-        }
-    }
-
-    /// 把上一轮可能开着的思考块收尾（写关闭序列），否则提示符会继承暗淡色。
-    /// 与思考增量一样不经 TTY 判定：开着的 `\x1b[2m` 写到了哪个流，就在哪个流补 `\x1b[0m`。
-    fn reset_style(&mut self) {
-        let reset = self.renderer.reset();
-        if reset.is_empty() {
-            return;
-        }
-        let mut out = std::io::stdout();
-        if let Err(e) = out.write_all(reset.as_bytes()).and_then(|()| out.flush()) {
-            self.set_fatal(format!("渲染输出失败：{e}"));
-        }
-    }
-
-    fn set_fatal(&mut self, msg: impl Into<String>) {
-        if self.fatal.is_none() {
-            self.fatal = Some(msg.into());
-        }
-    }
-}
-
-impl Ui for TermUi {
-    fn read_line(&mut self, completer: Arc<dyn CompletionProvider>) -> ReadOutcome {
-        if let Some(helper) = self.editor.helper_mut() {
-            helper.set_completer(completer);
-        }
-        // 交还终端画提示符前先收尾上一轮残留的思考块。
-        self.reset_style();
-        self.reclaim_prompt_rows();
-        self.hint.set_reading(true);
-        let outcome = match self.editor.readline(PROMPT) {
-            Ok(line) => ReadOutcome::Line(line),
-            Err(ReadlineError::Interrupted) => {
-                let line_empty = self.line_empty.load(Ordering::SeqCst);
-                let width = self.line_width.load(Ordering::SeqCst);
-                // 被中断的内容不提交：整块屏幕行留给下一次提示符。
-                self.reclaim_width = Some(PROMPT.len() + width);
-                ReadOutcome::Interrupted { line_empty }
-            }
-            Err(ReadlineError::Eof) => ReadOutcome::Eof,
-            Err(e) => {
-                self.set_fatal(format!("读取输入失败：{e}"));
-                ReadOutcome::Eof
-            }
-        };
-        self.hint.set_reading(false);
-        outcome
-    }
-
-    fn print(&mut self, ev: &RenderEvent) {
-        let result = (|| -> std::io::Result<()> {
-            let out = self.renderer.event(ev);
-            // 渲染流与错误流分开；先写并 flush stdout，保证错误出现在已输出的内容之后。
-            let mut stdout = std::io::stdout().lock();
-            stdout.write_all(out.stdout.as_bytes())?;
-            stdout.flush()?;
-            if !out.stderr.is_empty() {
-                // 错误走 stderr；写失败与渲染同路径进 fatal，不用可能 panic 的 eprintln!。
-                let mut stderr = std::io::stderr().lock();
-                stderr.write_all(out.stderr.as_bytes())?;
-                stderr.flush()?;
-            }
-            Ok(())
-        })();
-        if let Err(e) = result {
-            self.set_fatal(format!("渲染输出失败：{e}"));
-        }
-    }
-
-    fn set_ctrl_c_hint(&mut self, armed: bool) {
-        if armed {
-            self.hint.arm(CTRL_C_WINDOW);
-        } else {
-            self.hint.disarm();
-        }
-    }
-
-    fn take_fatal(&mut self) -> Option<String> {
-        self.fatal.take()
-    }
-}
-
-impl Drop for TermUi {
-    fn drop(&mut self) {
-        // 双按退出时最后一段是被放弃的提示符块，退出前收回。
-        // 前提：中断到 drop 之间没有其他输出，否则上移落点会比块首低一行，
-        // 既留下块首行、又擦掉中间那段输出。
-        self.reclaim_prompt_rows();
-        // Ctrl-C 中途退出等路径不会再调用 `read_line`：退出前再做一次收尾。
-        self.reset_style();
-        self.hint.stop();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prompt_rows_counts_wrapped_screen_rows() {
-        // 这里是“回收时要上移几行”，等价于 rustyline 的 `layout.end.row + 1`，
-        // 不是内容本身的高度（整倍数时多一行）。
-        assert_eq!(prompt_rows(0, 80), 1);
-        assert_eq!(prompt_rows(5, 80), 1);
-        assert_eq!(prompt_rows(79, 80), 1);
-        // 整倍数：rustyline 自己补了一个换行，比内容高度多一行。
-        assert_eq!(prompt_rows(80, 80), 2);
-        assert_eq!(prompt_rows(81, 80), 2);
-        assert_eq!(prompt_rows(205, 80), 3);
-        // 拿不到列数时退化为不换行，且不会除零。
-        assert_eq!(prompt_rows(200, 0), 1);
-    }
-
-    #[test]
-    fn prompt_rows_counts_hint_on_narrow_terminals() {
-        let with_hint = PROMPT.len() + hint::CTRL_C_HINT.width();
-        // 80 列下多出来的灰提示仍在一行内。
-        assert_eq!(prompt_rows(with_hint, 80), 1);
-        // 窄于提示 + 提示符总宽时占两行：回收必须上移两行，否则会留残影。
-        assert_eq!(prompt_rows(with_hint, with_hint - 1), 2);
     }
 }

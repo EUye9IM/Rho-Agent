@@ -287,6 +287,24 @@ fn text_response(text: &str) -> String {
     out
 }
 
+/// 带 usage 的文本响应：Chat Completions 把 usage 放在 choices 为空的末尾 chunk。
+fn text_response_with_usage(text: &str) -> String {
+    let mut out = text_response(text);
+    out.insert_str(
+        out.len() - "data: [DONE]\n\n".len(),
+        &sse(&json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+                "total_tokens": 150,
+                "prompt_cache_hit_tokens": 96
+            }
+        })),
+    );
+    out
+}
+
 /// 由 mock 服务器 base_url 组装完整 TOML（测试用，不再落盘）。
 fn config_toml_with_protocol(
     base_url: &str,
@@ -366,6 +384,7 @@ fn full_tool_loop_with_mock_sse() {
         Msg::Tool {
             tool_call_id,
             content,
+            ..
         } => {
             assert_eq!(tool_call_id, "call_1");
             assert!(content.contains("hi"));
@@ -431,6 +450,7 @@ fn responses_protocol_full_tool_loop() {
         Msg::Tool {
             tool_call_id,
             content,
+            ..
         } => {
             assert_eq!(tool_call_id, "call_1");
             assert!(content.contains("hi"));
@@ -708,10 +728,12 @@ fn multiple_tool_calls_are_paired_in_order() {
             Msg::Tool {
                 tool_call_id: a,
                 content: ca,
+                ..
             },
             Msg::Tool {
                 tool_call_id: b,
                 content: cb,
+                ..
             },
         ) => {
             assert_eq!(a, "call_a");
@@ -742,10 +764,12 @@ fn max_tool_steps_placeholders_remaining_calls() {
             Msg::Tool {
                 tool_call_id: a,
                 content: ca,
+                ..
             },
             Msg::Tool {
                 tool_call_id: b,
                 content: cb,
+                ..
             },
         ) => {
             assert_eq!(a, "call_a");
@@ -910,7 +934,7 @@ fn bash_large_output_is_truncated_once_with_accurate_count() {
 }
 
 #[test]
-fn repl_adds_line_break_after_done_response() {
+fn repl_ends_each_turn_with_a_status_line() {
     let server = start_server(vec![text_response("one line")]);
     let session = session_for(server.base_url(), "", "");
     let cancel = Cancel::new();
@@ -926,13 +950,44 @@ fn repl_adds_line_break_after_done_response() {
         .iter()
         .position(|e| matches!(e, RenderEvent::TextDelta(s) if s == "one line"))
         .unwrap();
-    let line_break = ui
+    let status = ui
         .rendered
         .iter()
-        .position(|e| matches!(e, RenderEvent::LineBreak))
+        .position(|e| matches!(e, RenderEvent::Status(_)))
         .unwrap();
-    assert!(text < line_break);
-    assert!(matches!(ui.rendered.last(), Some(RenderEvent::LineBreak)));
+    assert!(text < status);
+    // 斜杠命令不打状态栏，最后一个事件就是本回合的状态栏。
+    match ui.rendered.last() {
+        Some(RenderEvent::Status(s)) => {
+            assert_eq!(s.turn, 1);
+            assert_eq!(s.model, "mock/m");
+            // mock 没带 usage chunk：用量段显示未知，而不是沿用旧值。
+            assert_eq!(s.usage, None);
+        }
+        other => panic!("unexpected last event: {other:?}"),
+    }
+}
+
+#[test]
+fn status_line_carries_upstream_usage() {
+    let server = start_server(vec![text_response_with_usage("done")]);
+    let mut session = session_for(server.base_url(), "", "");
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(vec![ReadOutcome::Line("go".into())]);
+
+    session.turn(&mut ui, &cancel, "go").unwrap();
+
+    match ui.rendered.last() {
+        Some(RenderEvent::Status(s)) => {
+            let usage = s.usage.expect("usage from the final chunk");
+            assert_eq!(usage.input, 120);
+            assert_eq!(usage.output, 30);
+            assert_eq!(usage.total, 150);
+            assert_eq!(usage.cached_input, Some(96));
+            assert_eq!(s.context_window, 10_000);
+        }
+        other => panic!("unexpected last event: {other:?}"),
+    }
 }
 
 #[test]
@@ -969,4 +1024,53 @@ fn reasoning_delta_precedes_text_delta() {
         .position(|e| matches!(e, RenderEvent::TextDelta(s) if s == "answer"))
         .unwrap();
     assert!(reasoning < text);
+}
+
+/// `/compact` 走真实 HTTP：请求体是历史前缀 + 指令，改完历史后下一回合带摘要。
+#[test]
+fn compact_rewrites_history_and_next_request_carries_summary() {
+    let server = start_server(vec![
+        text_response("a1"),
+        text_response("a2"),
+        text_response("a3"),
+        text_response("CHECKPOINT"),
+        text_response("done"),
+    ]);
+    let mut session = session_for(server.base_url(), "[compact]\nkeep_turns = 2", "");
+    let cancel = Cancel::new();
+    let mut ui = ScriptedUi::new(vec![]);
+
+    for input in ["u1", "u2", "u3"] {
+        session.turn(&mut ui, &cancel, input).unwrap();
+    }
+    session.compact(&mut ui, &cancel).unwrap();
+    assert!(server.wait_served(4, Duration::from_secs(5)));
+
+    // 压缩请求：被压掉的一轮原文 + 末尾指令，tools 仍是四个内置工具。
+    let body: Value = serde_json::from_str(&server.body(3)).unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["content"], "u1");
+    assert_eq!(messages[1]["content"], "a1");
+    assert_eq!(messages[2]["content"], rho::context::DEFAULT_COMPACT_PROMPT);
+    assert_eq!(body["tools"].as_array().unwrap().len(), 4);
+
+    // 历史：一条摘要 + 保留的两轮。
+    assert!(matches!(&session.history()[0], Msg::Summary(s) if s == "CHECKPOINT"));
+    assert_eq!(session.history().len(), 5);
+    assert!(ui
+        .rendered
+        .iter()
+        .any(|e| matches!(e, RenderEvent::Notice(t) if t.contains("已压缩 2 条消息"))));
+
+    // 下一回合的请求体：摘要作为第一条 system 消息，早期内容不再发送。
+    session.turn(&mut ui, &cancel, "u4").unwrap();
+    assert!(server.wait_served(5, Duration::from_secs(5)));
+    let body: Value = serde_json::from_str(&server.body(4)).unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], "CHECKPOINT");
+    assert!(messages
+        .iter()
+        .all(|m| m["content"] != Value::String("u1".into())));
 }

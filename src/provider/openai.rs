@@ -2,20 +2,22 @@
 
 use super::common::{default_headers, merge_thinking, model_name};
 use super::{ChunkOutcome, FinishReason, ProviderAdapter, StreamEvent, TurnAcc};
-use crate::config::{Model, Provider};
-use crate::message::{AssistantMsg, Msg};
+use crate::config::{CompatConfig, Model, Provider};
+use crate::message::{AssistantMsg, Msg, TokenUsage};
 use crate::tools::ToolSpec;
 use serde_json::{json, Map, Value};
 
 pub struct OpenAiChatAdapter {
-    /// compat 开关在构造时注入（echo_reasoning 等）
-    pub echo_reasoning: bool,
+    /// compat 开关在构造时注入：非 OpenAI 标准的上线格式差异全在这里。
+    pub compat: CompatConfig,
 }
 
 impl OpenAiChatAdapter {
-    /// compat 开关注入：echo_reasoning=true 时 reasoning_content 随历史回传。
-    pub fn new(echo_reasoning: bool) -> Self {
-        Self { echo_reasoning }
+    /// echo_reasoning：`reasoning_content` 随历史回传；
+    /// stream_usage：请求 `stream_options.include_usage`；
+    /// legacy_max_tokens：输出上限用 `max_tokens` 而不是 `max_completion_tokens`。
+    pub fn new(compat: CompatConfig) -> Self {
+        Self { compat }
     }
 }
 
@@ -35,7 +37,9 @@ impl ProviderAdapter for OpenAiChatAdapter {
         let messages: Vec<Value> = hist
             .iter()
             .map(|m| match m {
-                Msg::System(text) => json!({ "role": "system", "content": text }),
+                Msg::System(text) | Msg::Summary(text) => {
+                    json!({ "role": "system", "content": text })
+                }
                 Msg::User(text) => json!({ "role": "user", "content": text }),
                 Msg::Assistant(a) => {
                     let AssistantMsg {
@@ -49,7 +53,7 @@ impl ProviderAdapter for OpenAiChatAdapter {
                         "content".into(),
                         text.as_ref().map(|t| json!(t)).unwrap_or(Value::Null),
                     );
-                    if self.echo_reasoning {
+                    if self.compat.echo_reasoning {
                         if let Some(r) = reasoning {
                             obj.insert("reasoning_content".into(), json!(r));
                         }
@@ -75,6 +79,7 @@ impl ProviderAdapter for OpenAiChatAdapter {
                 Msg::Tool {
                     tool_call_id,
                     content,
+                    ..
                 } => {
                     json!({ "role": "tool", "tool_call_id": tool_call_id, "content": content })
                 }
@@ -98,11 +103,19 @@ impl ProviderAdapter for OpenAiChatAdapter {
             "model": model_name(model, model_id),
             "messages": messages,
             "stream": true,
-            // 模型声明的输出上限直接编进请求，避免上游超长回复。
-            "max_tokens": model.max_output,
             "tools": tools,
         });
+        // 输出上限：标准字段是 max_completion_tokens；只认旧字段的供应商用
+        // compat.legacy_max_tokens 切回 max_tokens。
+        if self.compat.legacy_max_tokens {
+            body["max_tokens"] = json!(model.max_output);
+        } else {
+            body["max_completion_tokens"] = json!(model.max_output);
+        }
 
+        if self.compat.stream_usage {
+            body["stream_options"] = json!({ "include_usage": true });
+        }
         if let Some(fragment) = thinking {
             merge_thinking(&mut body, fragment);
         }
@@ -120,6 +133,10 @@ impl ProviderAdapter for OpenAiChatAdapter {
     /// 解析单个 chunk：累积进 acc；有 text/reasoning 增量时返回 Delta。
     /// tool_calls 的组装只进 acc（不产生事件）；请求从不设置 n，choices 实际只有一条。
     fn parse_chunk(&self, chunk: &Value, acc: &mut TurnAcc) -> ChunkOutcome {
+        // usage 可能出现在 choices 为空的末尾 chunk，必须在 choices 判空之前读取。
+        if let Some(usage) = chunk.get("usage").and_then(parse_usage) {
+            acc.usage = Some(usage);
+        }
         let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
             return ChunkOutcome::Continue;
         };
@@ -194,6 +211,28 @@ impl ProviderAdapter for OpenAiChatAdapter {
     }
 }
 
+/// Chat Completions usage：prompt/completion/total，兼容 DeepSeek 的缓存命中字段。
+fn parse_usage(value: &Value) -> Option<TokenUsage> {
+    let input = value.get("prompt_tokens").and_then(Value::as_u64);
+    let output = value.get("completion_tokens").and_then(Value::as_u64);
+    let total = value.get("total_tokens").and_then(Value::as_u64);
+    if input.is_none() && output.is_none() && total.is_none() {
+        return None;
+    }
+    let input = input.unwrap_or(0);
+    let output = output.unwrap_or(0);
+    let cached_input = value
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| value.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
+    Some(TokenUsage {
+        input,
+        output,
+        total: total.unwrap_or_else(|| input.saturating_add(output)),
+        cached_input,
+    })
+}
+
 fn finish_reason(reason: &str) -> FinishReason {
     match reason {
         "stop" => FinishReason::Stop,
@@ -207,7 +246,15 @@ fn finish_reason(reason: &str) -> FinishReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::CompatConfig;
+
+    /// 测试用 compat：只改需要覆盖的开关，其余保持 OpenAI 标准默认。
+    fn compat(echo_reasoning: bool, stream_usage: bool) -> CompatConfig {
+        CompatConfig {
+            echo_reasoning,
+            stream_usage,
+            ..CompatConfig::default()
+        }
+    }
 
     fn provider() -> Provider {
         Provider {
@@ -220,7 +267,7 @@ mod tests {
 
     #[test]
     fn endpoint_trims_slash() {
-        let a = OpenAiChatAdapter::new(false);
+        let a = OpenAiChatAdapter::new(compat(false, true));
         assert_eq!(
             a.endpoint(&provider()),
             "https://api.example.com/chat/completions"
@@ -228,8 +275,41 @@ mod tests {
     }
 
     #[test]
+    fn body_uses_standard_max_completion_tokens_by_default() {
+        let a = OpenAiChatAdapter::new(compat(false, true));
+        let model = Model {
+            api_model: None,
+            context_window: 1,
+            max_output: 4096,
+            thinking_default: None,
+            thinking: Default::default(),
+        };
+        let body = a.build_body(&[], &model, "p/m", None, &[]);
+        assert_eq!(body["max_completion_tokens"], 4096);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn legacy_max_tokens_switch_uses_old_field() {
+        let a = OpenAiChatAdapter::new(CompatConfig {
+            legacy_max_tokens: true,
+            ..CompatConfig::default()
+        });
+        let model = Model {
+            api_model: None,
+            context_window: 1,
+            max_output: 4096,
+            thinking_default: None,
+            thinking: Default::default(),
+        };
+        let body = a.build_body(&[], &model, "p/m", None, &[]);
+        assert_eq!(body["max_tokens"], 4096);
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
     fn body_maps_messages_and_thinking() {
-        let a = OpenAiChatAdapter::new(true);
+        let a = OpenAiChatAdapter::new(compat(true, true));
         let model = Model {
             api_model: None,
             context_window: 1,
@@ -247,7 +327,10 @@ mod tests {
             }),
             Msg::Tool {
                 tool_call_id: "id".into(),
+                name: "bash".into(),
                 content: "ok".into(),
+                display: Some("ok".into()),
+                status: crate::message::ToolStatus::Success,
             },
         ];
         let thinking = json!({ "thinking": { "type": "enabled" } });
@@ -255,7 +338,7 @@ mod tests {
         let body = a.build_body(&hist, &model, "p/m", Some(&thinking), &tools);
         assert_eq!(body["model"], "m");
         assert_eq!(body["stream"], true);
-        assert_eq!(body["max_tokens"], 1);
+        assert_eq!(body["max_completion_tokens"], 1);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["messages"][2]["reasoning_content"], "r");
         assert_eq!(body["tools"][0]["function"]["name"], "bash");
@@ -263,11 +346,72 @@ mod tests {
             body["tools"][0]["function"]["parameters"]["required"][0],
             "command"
         );
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn parses_usage_from_empty_choices_chunk() {
+        let a = OpenAiChatAdapter::new(compat(false, true));
+        let mut acc = TurnAcc::default();
+        let chunk = json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+                "total_tokens": 150,
+                "prompt_tokens_details": { "cached_tokens": 64 }
+            }
+        });
+        assert!(matches!(
+            a.parse_chunk(&chunk, &mut acc),
+            ChunkOutcome::Continue
+        ));
+        assert_eq!(
+            acc.usage,
+            Some(TokenUsage {
+                input: 120,
+                output: 30,
+                total: 150,
+                cached_input: Some(64),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_deepseek_cache_usage() {
+        assert_eq!(
+            parse_usage(&json!({
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 12,
+                "prompt_cache_hit_tokens": 7
+            })),
+            Some(TokenUsage {
+                input: 10,
+                output: 2,
+                total: 12,
+                cached_input: Some(7),
+            })
+        );
+    }
+
+    #[test]
+    fn stream_usage_can_be_disabled() {
+        let a = OpenAiChatAdapter::new(compat(false, false));
+        let model = Model {
+            api_model: None,
+            context_window: 1,
+            max_output: 1,
+            thinking_default: None,
+            thinking: Default::default(),
+        };
+        let body = a.build_body(&[], &model, "p/m", None, &[]);
+        assert!(body.get("stream_options").is_none());
     }
 
     #[test]
     fn parses_text_and_tool_calls() {
-        let a = OpenAiChatAdapter::new(false);
+        let a = OpenAiChatAdapter::new(compat(false, true));
         let mut acc = TurnAcc::default();
         let chunk = json!({
             "choices": [{

@@ -127,6 +127,14 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<ValidationError>> {
             errs.push(err("max_tool_steps", "必须大于 0"));
         }
     }
+    if let Some(prompt) = &cfg.compact.prompt {
+        if prompt.trim().is_empty() {
+            errs.push(err("compact.prompt", "必填字段不能为空"));
+        }
+    }
+    if cfg.compact.keep_turns == Some(0) {
+        errs.push(err("compact.keep_turns", "至少保留 1 轮"));
+    }
     for (i, endpoint) in cfg.dns.iter().enumerate() {
         if let Err(e) = parse_dns_endpoint(endpoint) {
             errs.push(err(format!("dns.{i}"), e));

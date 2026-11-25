@@ -50,6 +50,21 @@ pub struct Config {
     /// DoH 端点：配置后按声明顺序优先解析，全部失败才回退系统解析器。
     #[serde(default)]
     pub dns: Vec<String>,
+    #[serde(default)]
+    pub compact: CompactConfig,
+}
+
+/// 上下文压缩（`/compact`）的参数。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactConfig {
+    /// 压缩指令：作为压缩请求的最后一条 user 消息。
+    /// 省略时用内置文案（`context::DEFAULT_COMPACT_PROMPT`）。
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// 压缩时原样保留的最近轮数；省略时用 2。
+    #[serde(default)]
+    pub keep_turns: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -71,11 +86,37 @@ pub struct AuthConfig {
     pub headers: OrderedMap<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompatConfig {
+    /// 非标准：把 `reasoning_content` 随历史回传。
+    /// OpenAI 的推理模型不返回思维链文本，也没有该字段，因此默认关闭；
+    /// 内置 DeepSeek 配置打开它（带 tools 的请求按 DeepSeek 文档回传思考内容）。
     #[serde(default)]
     pub echo_reasoning: bool,
+    /// Chat Completions 请求 `stream_options.include_usage`；默认开启。
+    /// 不支持的供应商可设为 false，此时上游不返回用量，状态栏没有用量与命中率段。
+    #[serde(default = "default_true")]
+    pub stream_usage: bool,
+    /// 非标准：输出上限用旧字段 `max_tokens`。
+    /// 默认发 OpenAI 标准的 `max_completion_tokens`；只认旧字段的供应商
+    /// （如 DeepSeek）打开它。
+    #[serde(default)]
+    pub legacy_max_tokens: bool,
+}
+
+impl Default for CompatConfig {
+    fn default() -> Self {
+        Self {
+            echo_reasoning: false,
+            stream_usage: true,
+            legacy_max_tokens: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -275,6 +316,52 @@ pub fn selection_for_model(cfg: &Config, model_id: &str) -> Result<Selection, St
     selection_for(cfg, model_id, None)
 }
 
+/// 切换供应商（REPL /provider）后的选择：当前模型本来就属于目标供应商时
+/// 保留模型与思考档位；跨供应商时重置为该供应商声明顺序第一个模型。
+pub fn switch_provider_selection(
+    cfg: &Config,
+    current: &Selection,
+    provider_id: &str,
+) -> Result<Selection, String> {
+    let mut selection = selection_for_provider(cfg, provider_id)?;
+    if model_provider_prefix(&current.model_id) == Some(provider_id) {
+        selection.model_id = current.model_id.clone();
+        selection.model = current.model.clone();
+        selection.thinking = current.thinking.clone();
+    }
+    Ok(selection)
+}
+
+/// 切换模型（REPL /model）后的选择：模型须属当前供应商，跨供应商拒绝；
+/// 思考档位随目标模型重置。
+pub fn switch_model_selection(
+    cfg: &Config,
+    current_provider_id: &str,
+    model_id: &str,
+) -> Result<Selection, String> {
+    if find_model(cfg, model_id).is_none() {
+        return Err(format!("未声明的模型：{model_id}"));
+    }
+    let prefix = model_provider_prefix(model_id)
+        .ok_or_else(|| format!("模型 id 必须带供应商前缀：{model_id}"))?;
+    if prefix != current_provider_id {
+        return Err(format!(
+            "模型 {model_id} 不属于当前供应商 {current_provider_id}，请先 /provider {prefix}"
+        ));
+    }
+    selection_for_model(cfg, model_id)
+}
+
+/// 切换思考档位（REPL /thinking）后的选择：无效档位拒绝，其余字段保持不变。
+pub fn switch_thinking_selection(current: &Selection, level: &str) -> Result<Selection, String> {
+    if let Some(e) = thinking_level_err(&current.model, &current.model_id, level) {
+        return Err(e);
+    }
+    let mut next = current.clone();
+    next.thinking = Some(level.to_string());
+    Ok(next)
+}
+
 fn selection_for(
     cfg: &Config,
     model_id: &str,
@@ -429,6 +516,21 @@ mod tests {
     }
 
     #[test]
+    fn builtin_deepseek_enables_non_standard_compat() {
+        // 内置配置是 DeepSeek 专用：回传思考内容，且 OpenAI 标准默认值不被偷改。
+        let cfg = load_str(BUILTIN_TOML, "t").unwrap();
+        let deepseek = &cfg.providers["deepseek"];
+        assert!(deepseek.compat.echo_reasoning);
+        assert!(deepseek.compat.stream_usage);
+        assert!(deepseek.compat.legacy_max_tokens);
+        // CompatConfig 默认值保持 OpenAI 标准：不回传思考内容、带流式用量、
+        // 用 max_completion_tokens。
+        assert!(!CompatConfig::default().echo_reasoning);
+        assert!(CompatConfig::default().stream_usage);
+        assert!(!CompatConfig::default().legacy_max_tokens);
+    }
+
+    #[test]
     fn allowlist_config_is_rejected() {
         let src = format!("{BUILTIN_TOML}\nallow = []\n");
         let err = load_str(&src, "t").unwrap_err();
@@ -451,5 +553,90 @@ mod tests {
         assert!(err.contains("已存在"), "error was {err}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 供应商/模型/思考档位切换规则测试共用的配置：mock 有两个模型
+    /// （mock/m 带思考档位表，mock/n 无），other 有一个模型。
+    const SWITCH_TOML: &str = r#"
+[providers.mock]
+protocol = "openai_chat"
+base_url = "http://127.0.0.1:1"
+
+[providers.other]
+protocol = "openai_responses"
+base_url = "http://127.0.0.1:2"
+
+[models."mock/m"]
+context_window = 1000
+max_output = 100
+thinking_default = "high"
+
+[models."mock/m".thinking]
+low = { thinking = { type = "enabled" } }
+high = { thinking = { type = "enabled" } }
+
+[models."mock/n"]
+context_window = 1000
+max_output = 100
+
+[models."other/m2"]
+context_window = 1000
+max_output = 100
+"#;
+
+    #[test]
+    fn switch_provider_selection_keeps_model_within_same_provider() {
+        let cfg = load_str(SWITCH_TOML, "t").unwrap();
+        let mut current = resolve_selection(&cfg, None, Some("mock/m")).unwrap();
+        current = switch_thinking_selection(&current, "low").unwrap();
+
+        // 同供应商：保留模型与思考档位。
+        let same = switch_provider_selection(&cfg, &current, "mock").unwrap();
+        assert_eq!(same.model_id, "mock/m");
+        assert_eq!(same.thinking.as_deref(), Some("low"));
+
+        // 跨供应商：重置为声明顺序第一个模型，思考档位随新模型。
+        let cross = switch_provider_selection(&cfg, &current, "other").unwrap();
+        assert_eq!(cross.provider_id, "other");
+        assert_eq!(cross.model_id, "other/m2");
+        assert_eq!(cross.thinking, None);
+
+        // 未声明的供应商报错。
+        assert!(switch_provider_selection(&cfg, &current, "ghost").is_err());
+    }
+
+    #[test]
+    fn switch_model_selection_rejects_across_providers() {
+        let cfg = load_str(SWITCH_TOML, "t").unwrap();
+        let current = resolve_selection(&cfg, None, Some("mock/m")).unwrap();
+
+        // 同供应商：切换并把思考档位重置为目标模型默认。
+        let next = switch_model_selection(&cfg, &current.provider_id, "mock/n").unwrap();
+        assert_eq!(next.model_id, "mock/n");
+        assert_eq!(next.thinking, None);
+
+        // 跨供应商：拒绝并提示先切供应商。
+        let err = switch_model_selection(&cfg, &current.provider_id, "other/m2").unwrap_err();
+        assert!(err.contains("请先 /provider other"), "err was {err}");
+
+        // 未声明的模型报错。
+        assert!(switch_model_selection(&cfg, &current.provider_id, "mock/ghost").is_err());
+    }
+
+    #[test]
+    fn switch_thinking_selection_validates_level() {
+        let cfg = load_str(SWITCH_TOML, "t").unwrap();
+        let current = resolve_selection(&cfg, None, Some("mock/m")).unwrap();
+
+        let next = switch_thinking_selection(&current, "low").unwrap();
+        assert_eq!(next.model_id, "mock/m");
+        assert_eq!(next.thinking.as_deref(), Some("low"));
+
+        // 无效档位报错。
+        assert!(switch_thinking_selection(&current, "medium").is_err());
+
+        // 模型未声明档位表时报错。
+        let plain = resolve_selection(&cfg, None, Some("mock/n")).unwrap();
+        assert!(switch_thinking_selection(&plain, "low").is_err());
     }
 }

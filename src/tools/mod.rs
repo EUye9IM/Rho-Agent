@@ -15,23 +15,15 @@ use crate::term::Cancel;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+pub use crate::message::ToolStatus;
+pub(crate) use crate::text::truncate_chars;
+
 /// 与协议无关的工具定义；适配层负责映射成各自的 wire format。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub parameters: Value,
-}
-
-/// 工具执行状态：既决定 UI 样式，也决定 agent 控制流。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolStatus {
-    /// 工具完成，结果有效。
-    Success,
-    /// 参数错误、执行失败、超时、非零退出等；继续让模型自行纠正。
-    Failure,
-    /// 用户 Ctrl-C 打断；记录当前结果，剩余调用补占位并停止本轮。
-    Interrupted,
 }
 
 /// 工具执行的统一结果。
@@ -165,17 +157,6 @@ pub(crate) fn resolve_path(cwd: &Path, raw: &str) -> Result<PathBuf, String> {
 
 pub(crate) fn display_path(path: &Path) -> String {
     path.display().to_string()
-}
-
-/// 按 Unicode 字符截断，超出时补省略号。
-pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
-    let mut chars = text.chars();
-    let out: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{out}…")
-    } else {
-        out
-    }
 }
 
 #[cfg(test)]

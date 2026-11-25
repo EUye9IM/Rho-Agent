@@ -16,10 +16,14 @@ Implementation: [docs/architecture.md](docs/architecture.md).
 
 - **Small by design** — one crate, one binary, blocking I/O + threads; `strip` + LTO + `panic = "abort"` in release.
 - **Config-driven providers** — providers, models and thinking levels are declared as data. `openai_chat` and `openai_responses` are both supported; switching protocol is configuration only.
-- **Streaming with visible reasoning** — text streams as it arrives; the prompt and input are colored; tool calls have their own color, with successful results green, failures red, and interruptions yellow; `reasoning_content` is rendered dimmed and stays local unless the provider sets `compat.echo_reasoning = true`.
+- **Markdown in the terminal** — assistant text and reasoning both render inline bold, italic, strikethrough, inline code and links as ANSI, plus headings, lists, blockquotes, fenced code blocks and rules. Tables are buffered until the block ends and then rendered with aligned columns (CJK-aware widths, left/center/right from the delimiter row); images and HTML pass through as plain text. Output stays append-only: only the part of a line whose markers are closed is written, so nothing is ever redrawn. Command output and session notices are written verbatim.
+- **Streaming with visible reasoning** — text streams as it arrives; the prompt and input are colored; tool calls have their own color, with successful results green, failures red, and interruptions yellow; `reasoning_content` is rendered dimmed and is sent back with history only when the provider sets `compat.echo_reasoning = true` (the built-in DeepSeek config enables it, because DeepSeek asks for reasoning content to be returned alongside tool-enabled requests).
 - **Built-in tools** — `bash` runs in the foreground as `bash -c <command>` with a fresh shell, a per-call timeout, and process-group cleanup. `read` returns line-numbered text; `write` creates new files and parent directories; `edit` applies exact, sequential replacements and preserves the file's CRLF/LF style.
 - **Predictable Ctrl-C** — first Ctrl-C cancels the current stream/tool and returns you to the prompt (cancellation takes effect between chunks; if the connection stalls, the background reader ends once the next data arrives or the idle timeout hits), second one exits; at the idle prompt two empty-line Ctrl-C within two seconds exit (the first shows a gray hint). The conversation history is always left in a protocol-valid state.
 - **Tab completion** — slash command names and the arguments of `/model`, `/provider` and `/thinking` complete from the current session state; candidates refresh after a provider or model switch.
+- **Manual context compaction** — `/compact` asks the model for a structured checkpoint of the older turns and replaces them with it, keeping the most recent turns verbatim; the instruction is configurable.
+- **Per-turn status line** — each turn ends with one dim line showing the turn number, model, thinking level, prompt-cache hit rate and context usage.
+- **One resumable session** — every turn is snapshotted to `$XDG_STATE_HOME/rho/session.json`; `rho -c` reloads it and replays the history (prompt/input lines, dimmed reasoning, colored tool results) before the first prompt.
 - **Strict config validation** — unknown fields, dangling references and missing required fields fail loudly with the config path (TOML syntax errors also include a line number), exit code 2.
 
 ## Requirements
@@ -71,6 +75,7 @@ cargo build --release --locked --target armv7-unknown-linux-musleabihf
 ```sh
 export DEEPSEEK_API_KEY=sk-...
 rho
+rho -c     # continue the last session
 ```
 
 ```
@@ -94,10 +99,13 @@ rho --init           # write the default config to ~/.config/rho/config.toml
 | `--provider <id>` | Initial provider (overrides config default). |
 | `--model <id>` | Initial model (must be `provider/model`, overrides config default). |
 | `--thinking <level>` | Initial thinking level (must exist for the chosen model). |
-| `--init` | Write the built-in config to the `--config` path or the default path; refuses to overwrite an existing file. |
+| `-c`, `--continue` | Load the saved session and replay it before the first prompt. Missing file or unreadable JSON starts a fresh session; a corrupt file is renamed to `session.json.bad` first. |
+| `--init` | Write the built-in config to the `--config` path or the default path; refuses to overwrite an existing file. Mutually exclusive with `-c`. |
 | `--version`, `-V` | Print the rho version and exit. |
 
 Config source priority: `--config <path>` > the default path `$XDG_CONFIG_HOME/rho/config.toml` (or `$HOME/.config/rho/config.toml` when unset) > the built-in config. A missing default-path file falls back to the built-in config; an existing one that fails to parse or validate is an error (exit code 2). `rho --init` writes the full built-in config for you to edit incrementally. `${VAR}` in auth headers is expanded from the environment. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` control proxy routing. The working directory is fixed to the directory `rho` was started in.
+
+The session file lives at `$XDG_STATE_HOME/rho/session.json` (`$HOME/.local/state/rho/session.json` when unset). It holds the whole history, including reasoning and tool output, and is rewritten as a single snapshot after each turn; SQLite-style append-only logs are not used. One session exists at a time: starting rho without `-c` begins a fresh one and the first write replaces the old file, as does `/clear`.
 
 ### REPL commands
 
@@ -106,11 +114,32 @@ Config source priority: `--config <path>` > the default path `$XDG_CONFIG_HOME/r
 | `/model [id]` | Switch model, or list models of the current provider with the active one marked. |
 | `/provider [id]` | Switch provider, or list providers (unavailable ones are annotated with the missing variables). |
 | `/thinking [level]` | Switch thinking level, or list levels for the current model. Omitted from `/help` when the model declares none. |
+| `/compact` | Replace the older turns with a checkpoint summary; the most recent `compact.keep_turns` turns stay verbatim. |
 | `/clear` | Reset history to the configured `system_prompt` (or empty if none). |
 | `/help` | Show help. |
 | `/exit` | Quit (Ctrl-D also exits; at the prompt press Ctrl-C twice within two seconds — the first shows a gray hint). |
 
 Switching only affects subsequent requests; earlier history stays as recorded. If a `/provider` switch leaves the current model outside the new provider, the model resets to the first model declared by that provider and thinking resets to that model's `thinking_default`.
+
+A line is parsed as a command only when `/` sits in the very first column. Leave one space in front and the whole line is sent to the model as an ordinary message (leading and trailing whitespace is stripped before sending), so `/home/user/file` can be passed literally.
+
+### Status line
+
+Every turn ends with one dim line:
+
+```
+── #3 · deepseek/deepseek-flash · high · 53% · 12.4k/1M (1.2%)
+```
+
+| Field | Meaning |
+|---|---|
+| `#3` | The turn number: how many user inputs this session has handled. `/clear` resets the history, so the next turn is `#1` again. |
+| model id | The active model (`/model` switch applies to the next turn). |
+| thinking level | The active level; omitted when the model declares no levels. |
+| `53%` | Prompt-cache hit rate: cached input tokens over input tokens. Omitted when the provider reports no cache statistics (`compat.stream_usage = false`, or a gateway that does not send `usage`). |
+| `12.4k/1M (1.2%)` | Tokens used by the last completed request of the turn over the model's `context_window`. `上下文 —` when the turn produced no completed request. |
+
+Failed and cancelled turns also end with a status line, using the last completed request of that turn (or `上下文 —` if the turn was cancelled before any request finished). Slash commands, `/exit`, Ctrl-D and the second Ctrl-C do not print one. Token counts use `k`/`M` units above a thousand.
 
 ## Configuration
 
@@ -123,6 +152,10 @@ system_prompt    = "You are rho, a lightweight local ops assistant."  # omit to 
 max_tool_steps   = 100
 dns              = ["https://223.5.5.5/dns-query"]  # optional: preferred DoH resolver
 
+[compact]
+keep_turns = 2                                   # verbatim turns kept when /compact runs
+# prompt = "..."                                 # checkpoint instruction; the built-in one is used when omitted
+
 [providers.deepseek]
 protocol = "openai_chat"                        # openai_chat or openai_responses
 base_url = "https://api.deepseek.com"
@@ -131,7 +164,11 @@ base_url = "https://api.deepseek.com"
 headers = { Authorization = "Bearer ${DEEPSEEK_API_KEY}" }
 
 [providers.deepseek.compat]
-echo_reasoning = false
+# Non-standard behavior of this provider. Everything here defaults to the OpenAI
+# standard; the built-in config turns on what DeepSeek needs.
+legacy_max_tokens = true                         # send max_tokens instead of max_completion_tokens
+echo_reasoning    = true                         # echo reasoning_content back with tool-enabled requests
+stream_usage      = true                         # send stream_options.include_usage (default true)
 
 [models."deepseek/deepseek-v4-pro"]
 context_window   = 1000000
@@ -151,7 +188,9 @@ Rules worth knowing:
 - Model ids are global and must carry a provider prefix (`deepseek/deepseek-v4-pro`); the prefix must match a declared provider. The upstream `model` field defaults to the part after the first `/`.
 - `protocol` accepts `openai_chat` (Chat Completions, `/chat/completions`) or `openai_responses` (Responses, `/responses`). The Responses adapter maps history to `input` items and uses `max_output_tokens`.
 - `${VAR}` in auth headers is expanded per provider. A missing variable marks that provider unavailable; other providers keep working, unless that provider was explicitly requested.
+- `compat` holds wire-format differences from the OpenAI standard, per provider: `legacy_max_tokens` sends the old `max_tokens` field instead of `max_completion_tokens`, `echo_reasoning` sends `reasoning_content` back with history (OpenAI reasoning models return no chain-of-thought and have no such field), `stream_usage` requests `stream_options.include_usage` so the status line has usage data. Omitting the section means OpenAI-standard behavior; the built-in DeepSeek config enables the first two.
 - Thinking levels are JSON object fragments merged into the top level of the request body. Level names are yours to choose.
+- `/compact` replaces every turn older than `compact.keep_turns` with one checkpoint message, produced by a request shaped like a normal turn: a copy of that history slice plus `compact.prompt` as the final user message. Tool results and assistant text are trimmed in that copy so the request fits the window; the history itself changes only when a summary comes back. A failed, empty or cancelled compaction leaves the history untouched.
 - `dns` lists optional DoH endpoints used first, in order; the system resolver takes over only when every endpoint fails. The endpoint host must be an IP literal (`https://223.5.5.5/dns-query`; IPv6 uses `https://[2400:3200::1]/dns-query`). Answers are cached for their TTL. Android/Termux has no `/etc/resolv.conf`, so musl static builds rely on this entry to resolve names.
 - Validation is strict: unknown fields, dangling references and missing required fields abort startup with exit code 2 and the config path; TOML syntax errors also include a line number.
 
