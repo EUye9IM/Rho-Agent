@@ -64,6 +64,8 @@ pub struct Markdown {
     table: Option<TableState>,
     /// 块级公式：`$$ ... $$` 跨行时置位。
     display_math: bool,
+    /// 当前行已经有内容写出：后续片段按续行处理，不再 trim 行首。
+    line_started: bool,
 }
 
 impl Default for Markdown {
@@ -86,6 +88,7 @@ impl Markdown {
             fence: None,
             table: None,
             display_math: false,
+            line_started: false,
         }
     }
 
@@ -98,18 +101,18 @@ impl Markdown {
             let line: String = self.pending[..pos].to_string();
             self.pending.drain(..=pos);
             self.render_line(&line, true, &mut out);
+            self.line_started = false;
         }
         // 未完成行：把行内标记都已闭合的部分立刻渲染出来，剩下的等换行。
         if !self.pending.is_empty() && !self.in_open_block() && self.table.is_none() {
             let stable = stable_prefix_len(&self.pending);
             if stable > 0 {
                 let part: String = self.pending[..stable].to_string();
-                // pulldown-cmark 会吃掉段落尾随空白；逐段输出时要原样补回，
-                // 否则下一次到达的文本会和这里粘在一起。
-                let body = part.trim_end();
-                render_inline(body, self.base, &mut out);
-                out.push_str(&part[body.len()..]);
+                // pulldown-cmark 会吃掉段落首尾空白；逐段输出时要原样补回，
+                // 否则相邻 delta 会粘在一起（"Hello" + " world"）。
+                render_plain(&part, self.base, &mut out);
                 self.pending.drain(..stable);
+                self.line_started = true;
             }
         }
         out
@@ -132,6 +135,7 @@ impl Markdown {
             Some(TableState::Collecting(rows)) => render_table(&rows, self.base, &mut out),
             None => {}
         }
+        self.line_started = false;
         out
     }
 
@@ -141,6 +145,15 @@ impl Markdown {
     }
 
     fn render_line(&mut self, line: &str, newline: bool, out: &mut String) {
+        // 续行：这一行前半截已经写过，只能是行内内容的延续。
+        if std::mem::take(&mut self.line_started) {
+            render_plain(line, self.base, out);
+            if newline {
+                out.push('\n');
+            }
+            return;
+        }
+
         // 代码块内：内容原样，不做行内解析。
         if let Some(fence) = self.fence {
             if closes_fence(line, fence) {
@@ -295,6 +308,20 @@ fn raw_quote_prefix(depth: usize, base: &str) -> String {
         return String::new();
     }
     format!("{DIM}{}{RESET}{base}", "│ ".repeat(depth))
+}
+
+/// 行内渲染并保留首尾空白：pulldown-cmark 会把段落两端的空白当作缩进吃掉，
+/// 而流式片段之间的空白正是相邻单词的分隔符。
+fn render_plain(text: &str, base: &str, out: &mut String) {
+    if text.trim().is_empty() {
+        out.push_str(text);
+        return;
+    }
+    let start = text.len() - text.trim_start().len();
+    let end = text.trim_end().len();
+    out.push_str(&text[..start]);
+    render_inline(&text[start..end], base, out);
+    out.push_str(&text[end..]);
 }
 
 /// 关闭一段样式后重新应用基础样式。
@@ -594,19 +621,50 @@ fn stable_prefix_len(line: &str) -> usize {
     open.first().map(|&(pos, _, _)| pos).unwrap_or(bytes.len())
 }
 
-/// 行首是否已经确定不是块标记（标题、列表、引用、围栏、分隔线、表格）。
+/// 行首是否已经确定不是块标记（标题、列表、引用、围栏、分隔线、表格、公式）。
+/// 只对确定的分支返回 false：`**加粗**`、`#tag`、`--flag` 都按段落处理。
 fn head_settled(line: &str) -> bool {
     let trimmed = line.trim_start();
     let Some(first) = trimmed.chars().next() else {
         return true;
     };
-    if first.is_ascii_digit() {
+
+    if trimmed.starts_with('>') || trimmed.starts_with('|') {
         return false;
     }
-    !matches!(
-        first,
-        '#' | '>' | '-' | '+' | '*' | '_' | '`' | '~' | '|' | '$'
-    )
+    if trimmed.starts_with("```") || trimmed.starts_with("~~~") || trimmed.starts_with("$$") {
+        return false;
+    }
+
+    // 标题：`#`×n 后必须是空格。
+    let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+    if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
+        return false;
+    }
+
+    // 无序列表：标记后必须是空格。
+    if trimmed.starts_with("- ") || trimmed.starts_with("+ ") || trimmed.starts_with("* ") {
+        return false;
+    }
+
+    // 分隔线：三个及以上同一种 `-` / `*` / `_`，且后面没有别的内容。
+    if matches!(first, '-' | '*' | '_') {
+        let run = trimmed.chars().take_while(|&c| c == first).count();
+        if run >= 3 && trimmed[run..].trim().is_empty() {
+            return false;
+        }
+    }
+
+    // 有序列表：数字后必须是 `. ` 或 `) `。
+    let digits = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 {
+        let after = &trimmed[digits..];
+        if after.starts_with(". ") || after.starts_with(") ") {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// 从 `start` 开始连续 `byte` 的个数。
@@ -825,6 +883,26 @@ mod tests {
     }
 
     #[test]
+    fn leading_space_of_a_chunk_is_preserved() {
+        let mut md = Markdown::new();
+        let mut out = String::new();
+        out.push_str(&md.push("Hello"));
+        out.push_str(&md.push(" world"));
+        out.push_str(&md.push(", again"));
+        out.push_str(&md.flush());
+        assert_eq!(out, "Hello world, again");
+    }
+
+    #[test]
+    fn whitespace_only_chunks_pass_through() {
+        let mut md = Markdown::new();
+        assert_eq!(md.push("a"), "a");
+        assert_eq!(md.push(" "), " ");
+        assert_eq!(md.push(" "), " ");
+        assert_eq!(md.push("b\n"), "b\n");
+    }
+
+    #[test]
     fn closed_inline_marks_stream_before_the_line_ends() {
         let mut md = Markdown::new();
         assert_eq!(md.push("这是 **重点**"), "这是 \x1b[1m重点\x1b[22m");
@@ -849,8 +927,9 @@ mod tests {
     fn marked_text_waits_for_the_newline() {
         let mut md = Markdown::new();
         assert_eq!(md.push("**bo"), "");
-        assert_eq!(md.push("ld**"), "");
-        assert_eq!(md.push("\n"), "\x1b[1mbold\x1b[22m\n");
+        // 标记一闭合就立即输出，不必等换行。
+        assert_eq!(md.push("ld**"), "\x1b[1mbold\x1b[22m");
+        assert_eq!(md.push("\n"), "\n");
     }
 
     #[test]
@@ -860,8 +939,8 @@ mod tests {
         assert_eq!(md.flush(), "");
 
         let mut md = Markdown::new();
-        assert_eq!(md.push("**tail**"), "");
-        assert_eq!(md.flush(), "\x1b[1mtail\x1b[22m");
+        assert_eq!(md.push("**tail"), "");
+        assert_eq!(md.flush(), "**tail");
     }
 
     #[test]
