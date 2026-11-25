@@ -797,3 +797,31 @@ fn reasoning_renders_markdown_and_stays_dim() {
     rho.send_line("/exit");
     assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
 }
+
+/// 英文逐词流式：delta 边界上的空格必须保留，不能粘连。
+#[test]
+fn english_spaces_survive_streaming() {
+    let server = start_mock(text_response(&[
+        "The quick",
+        " brown fox",
+        " jumps over",
+        " the lazy dog.",
+        " **Bold** follows.\n",
+    ]));
+    let config = write_config(&server.base_url);
+    let mut rho = PtyRho::spawn(&config);
+
+    rho.expect_screen("rho>", SCREEN_TIMEOUT);
+    std::thread::sleep(SETTLE);
+    rho.send_line("go");
+
+    rho.expect_screen(
+        "The quick brown fox jumps over the lazy dog. Bold follows.",
+        SCREEN_TIMEOUT,
+    );
+
+    rho.expect_screen("rho>", Duration::from_secs(8));
+    std::thread::sleep(SETTLE);
+    rho.send_line("/exit");
+    assert_eq!(rho.expect_exit(Duration::from_secs(5)), 0);
+}
